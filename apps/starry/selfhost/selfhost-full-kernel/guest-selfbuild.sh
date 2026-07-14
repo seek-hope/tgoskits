@@ -4,7 +4,7 @@ set -eu
 
 TOOLCHAIN="nightly-2026-05-28"
 HOST_TRIPLE="x86_64-unknown-linux-musl"
-RUSTUP_TOOLCHAIN="${TOOLCHAIN}-${HOST_TRIPLE}"
+RUSTUP_TOOLCHAIN="starry-selfhost"
 SOURCE_TAR="${SELFHOST_SOURCE_TAR:-/opt/tgoskits-src.tar}"
 SOURCE_META="${SELFHOST_SOURCE_META:-/opt/tgoskits-src.meta}"
 SOURCE_DIR="${SELFHOST_SOURCE_DIR:-/tmp/tgoskits-src}"
@@ -168,11 +168,14 @@ install_rust() {
     fi
 
     # Point rustup at the pre-extracted toolchain on ext4.
+    # rustup reserves channel-date-triple names for official toolchains;
+    # custom (linked) toolchains must use a different name.
+    local link_name="starry-selfhost"
     if [ -d "/root/.rustup/toolchains/$toolchain_name/bin" ]; then
-        rustup toolchain link "$toolchain_name" \
+        rustup toolchain link "$link_name" \
             "/root/.rustup/toolchains/$toolchain_name" \
             || fail "rustup toolchain link failed"
-        rustup default "$RUSTUP_TOOLCHAIN" \
+        rustup default "$link_name" \
             || fail "rustup default failed"
     else
         fail "pre-extracted toolchain not found: /root/.rustup/toolchains/$toolchain_name/bin"
