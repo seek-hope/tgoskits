@@ -145,10 +145,14 @@ install_rust() {
     rm -f "$toolchain_tar"
 
     # Install rustup to tmpfs (rsext4 is too slow for rustup's many small
-    # writes during installation of cargo-binutils / ksym).
+    # writes during cargo install of cargo-binutils / ksym).
     local tmp_rustup=/tmp/rustup-home
     local tmp_cargo=/tmp/cargo-home
     mkdir -p "$tmp_rustup" "$tmp_cargo"
+
+    # Prevent rustup-init from finding a stale settings file on ext4 that
+    # would trigger an unwanted toolchain download.
+    rm -f /root/.rustup/settings.toml 2>/dev/null || true
 
     export RUSTUP_HOME="$tmp_rustup"
     export CARGO_HOME="$tmp_cargo"
@@ -159,18 +163,30 @@ install_rust() {
     if [ ! -x "$tmp_cargo/bin/rustup" ]; then
         curl --fail --silent --show-error --location https://sh.rustup.rs \
             -o /tmp/rustup-init.sh
-        sh /tmp/rustup-init.sh -y --profile minimal --default-host "$HOST_TRIPLE" \
-            --no-modify-path
+        sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none \
+            || fail "rustup-init failed"
     fi
 
-    # Point rustup at the pre-staged toolchain on ext4.
-    rustup toolchain link "$toolchain_name" \
-        "/root/.rustup/toolchains/$toolchain_name" 2>/dev/null || true
-    rustup default "$RUSTUP_TOOLCHAIN" 2>/dev/null || true
+    # Point rustup at the pre-extracted toolchain on ext4.
+    if [ -d "/root/.rustup/toolchains/$toolchain_name/bin" ]; then
+        rustup toolchain link "$toolchain_name" \
+            "/root/.rustup/toolchains/$toolchain_name" \
+            || fail "rustup toolchain link failed"
+        rustup default "$RUSTUP_TOOLCHAIN" \
+            || fail "rustup default failed"
+    else
+        fail "pre-extracted toolchain not found: /root/.rustup/toolchains/$toolchain_name/bin"
+    fi
+
+    # Verify the toolchain works before proceeding.
+    command -v rustc >/dev/null 2>&1 || fail "rustc not found after install"
+    command -v cargo >/dev/null 2>&1 || fail "cargo not found after install"
+    rustc --version || fail "rustc --version failed"
+    cargo --version || fail "cargo --version failed"
 
     echo "[self-compile] Rust toolchain ready."
-    echo "[self-compile] $(rustc --version 2>/dev/null || echo 'rustc version unknown')"
-    echo "[self-compile] $(cargo --version 2>/dev/null || echo 'cargo version unknown')"
+    echo "[self-compile] $(rustc --version)"
+    echo "[self-compile] $(cargo --version)"
 }
 
 install_kallsyms_tools() {
