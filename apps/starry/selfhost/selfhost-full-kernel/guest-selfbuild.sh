@@ -161,10 +161,18 @@ install_rust() {
     export RUSTUP_MAX_RETRIES="${SELFHOST_RUSTUP_MAX_RETRIES:-5}"
 
     if [ ! -x "$tmp_cargo/bin/rustup" ]; then
-        curl --fail --silent --show-error --location https://sh.rustup.rs \
-            -o /tmp/rustup-init.sh
-        sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none \
-            || fail "rustup-init failed"
+        local rustup_init="/opt/rustup-init.sh"
+        [ -f "$rustup_init" ] || rustup_init="https://sh.rustup.rs"
+        if [ -f "$rustup_init" ]; then
+            sh "$rustup_init" -y --no-modify-path --default-toolchain none \
+                || fail "rustup-init failed"
+        else
+            curl --fail --silent --show-error --location "$rustup_init" \
+                -o /tmp/rustup-init.sh \
+                || fail "rustup-init download failed"
+            sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none \
+                || fail "rustup-init failed"
+        fi
     fi
 
     # Point rustup at the pre-extracted toolchain on ext4.

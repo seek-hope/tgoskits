@@ -149,6 +149,20 @@ stage_rust_toolchain() {
     echo "[prebuild] rust toolchain tar built ($(du -h "$output_tar" | cut -f1))"
 
     install -m 0644 "$output_tar" "$overlay_dir/opt/rust-toolchain.tar"
+
+    # Also pre-download rustup-init.sh on the host so the guest doesn't
+    # need QEMU slirp networking for this ~10 MB download.
+    local rustup_init="$output_dir/rustup-init.sh"
+    if [ ! -f "$rustup_init" ] || [ "$(stat -c%s "$rustup_init" 2>/dev/null)" -lt 1000000 ]; then
+        echo "[prebuild] downloading rustup-init.sh..."
+        curl -fsSL --retry 3 --connect-timeout 30 --max-time 120 \
+            https://sh.rustup.rs -o "$rustup_init" || {
+            echo "[prebuild] WARNING: failed to download rustup-init.sh" >&2
+            return
+        }
+    fi
+    install -m 0755 "$rustup_init" "$overlay_dir/opt/rustup-init.sh"
+    echo "[prebuild] rustup-init.sh staged"
 }
 
 require_x86_64
