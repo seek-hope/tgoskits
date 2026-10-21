@@ -61,9 +61,14 @@ __pycache__/
 .direnv/
 .ci-cache/
 .codex
+.codegraph/
 /.agents/*
 !/.agents/skills/
 !/.agents/skills/**
+!/.agents/tgoskits-plugin/
+!/.agents/tgoskits-plugin/**
+# Keep Python bytecode from the plugin self-tests out of version control.
+/.agents/tgoskits-plugin/**/__pycache__/
 .image.toml
 coverage/
 third_party/
