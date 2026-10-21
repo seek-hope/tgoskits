@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import tomllib
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ci_impact import ARCH_TARGETS
+
+KTEST_QEMU_KIND = "ktest-qemu"
+KTEST_BOARD_KIND = "ktest-board"
+KTEST_SUITE_KINDS = frozenset({KTEST_QEMU_KIND, KTEST_BOARD_KIND})
+# Manifest directories that never declare a workspace package.
+IGNORED_MANIFEST_DIRS = frozenset({".git", "node_modules", "target"})
+SUPPORTED_SUITE_KINDS = {
+    "arceos-qemu",
+    "arceos-board",
+    "starry-qemu",
+    "starry-board",
+    "starry-app-qemu",
+    "starry-app-board",
+    "axvisor-qemu",
+    "axvisor-board",
+    KTEST_QEMU_KIND,
+    KTEST_BOARD_KIND,
+}
+# The ktest fields describe one `cargo xtask ktest` execution unit: the package
+# and `harness = false` test target plus the config files the runner consumes.
+SUITE_FIELDS = {
+    "kind",
+    "arch",
+    "board",
+    "cases",
+    "group",
+    "package",
+    "test",
+    "config",
+    "qemu_config",
+    "board_config",
+}
+ARCEOS_GENERIC_QEMU_GROUPS = {"cpu", "drivers"}
+SUITE_ROOTS = {
+    "arceos": Path("test-suit/arceos"),
+    "starry": Path("test-suit/starryos"),
+    "axvisor": Path("test-suit/axvisor"),
+}
+EXTRA_SUITE_ROOTS = {
+    # AxVisor nightly cases were migrated out of `test-suit/axvisor` into
+    # `apps/axvisor`; both trees (plus the benchmark tree) are registered
+    # AxVisor suites and must be discovered together.
+    "axvisor": (Path("benchmarks/axvisor"), Path("apps/axvisor")),
+}
+# Starry board/QEMU nightly measurements live under `benchmarks/starry` and are
+# selected through `cargo xtask starry app ...`, so they need their own suite
+# kind instead of the `starry test` runtime discovery.
+STARRY_APP_SUITE_ROOT = Path("benchmarks/starry")
+STARRY_APP_SUITE_KINDS = frozenset({"starry-app-qemu", "starry-app-board"})
+
+
+class SuiteRouteError(ValueError):
+    """Raised when a changed test suite cannot map to one registered CI row."""
+
+
+@dataclass(frozen=True)
+class SuiteSelection:
+    template_id: str
+    row_id: str
+    leaf_name: str
+    command: str
+    source_path: str
+    batch_key: tuple[str, str | None, Path] | None = None
+    batch_cases: tuple[str, ...] = ()
+    batch_command: str | None = None
+
+
+@dataclass(frozen=True)
+class _RuntimeCase:
+    kind: str
+    arch: str | None
+    board: str | None
+    case: str
+    case_dir: Path
+    wrapper_dir: Path
+    runtime_config: Path
+    build_config: Path
+
+
+def resolve_suite_selections(
+    workspace_root: Path,
+    checks: Sequence[dict[str, Any]],
+    changed_paths: Iterable[str],
+) -> list[SuiteSelection]:
+    registrations = _suite_registrations(checks)
+    selections: dict[tuple[str, str, str], SuiteSelection] = {}
+    batches: dict[tuple[str, tuple[str, str | None, Path]], tuple[SuiteSelection, list[str]]] = {}
+    check_order = {check["id"]: index for index, check in enumerate(checks)}
+
+    for rendered_path in sorted(set(changed_paths)):
+        path = Path(rendered_path)
+        path_selections = _selections_for_path(
+            workspace_root,
+            registrations,
+            path,
+        )
+        if not path_selections:
+            raise SuiteRouteError(
+                f"test suite path `{rendered_path}` is not registered in CI"
+            )
+        for selection in path_selections:
+            if selection.batch_key is not None:
+                key = (selection.template_id, selection.batch_key)
+                if key not in batches:
+                    batches[key] = (selection, list(selection.batch_cases))
+                else:
+                    _, cases = batches[key]
+                    for case in selection.batch_cases:
+                        if case not in cases:
+                            cases.append(case)
+                continue
+            key = (selection.template_id, selection.leaf_name, selection.command)
+            selections.setdefault(key, selection)
+
+    for selection, cases in batches.values():
+        case_list = ",".join(cases)
+        platform, _, _ = selection.leaf_name.partition(" · ")
+        assert selection.batch_command is not None
+        command = selection.batch_command.format(cases=case_list)
+        leaf_name = f"{platform} · {case_list}"
+        row_id = _slugify(f"suite-{selection.template_id}-{case_list}")
+        selections[(selection.template_id, leaf_name, command)] = SuiteSelection(
+            template_id=selection.template_id,
+            row_id=row_id,
+            leaf_name=leaf_name,
+            command=command,
+            source_path=selection.source_path,
+        )
+
+    return sorted(
+        selections.values(),
+        key=lambda selection: (
+            check_order[selection.template_id],
+            selection.leaf_name,
+            selection.command,
+        ),
+    )
+
+
+def validate_suite_catalog(
+    workspace_root: Path,
+    checks: Sequence[dict[str, Any]],
+) -> None:
+    registrations = _suite_registrations(checks)
+    _validate_starry_app_registrations(workspace_root, registrations)
+    discovered = {
+        "arceos": [case for case in _discover_runtime_cases(workspace_root / SUITE_ROOTS["arceos"], "arceos") if case.kind == "arceos-board"],
+        "starry": _discover_runtime_cases(
+            workspace_root / SUITE_ROOTS["starry"],
+            "starry",
+        ),
+        "axvisor": _discover_os_runtime_cases(workspace_root, "axvisor"),
+    }
+    for check, registration in registrations:
+        kind = registration["kind"]
+        if kind in STARRY_APP_SUITE_KINDS:
+            continue
+        if kind in KTEST_SUITE_KINDS:
+            _validate_ktest_registration(workspace_root, check, registration)
+            continue
+        if kind == "arceos-qemu":
+            arch = registration["arch"]
+            group = registration.get("group")
+            if group in ARCEOS_GENERIC_QEMU_GROUPS:
+                cases = _discover_runtime_cases(workspace_root / SUITE_ROOTS["arceos"] / group, "arceos")
+                present = {case.case for case in cases if case.arch == arch}
+                required = set(registration.get("cases", present))
+                if not required or required - present:
+                    raise SuiteRouteError(f"check '{check['id']}' registers missing {group} cases: {sorted(required - present)}")
+                continue
+            runtime = (
+                workspace_root / SUITE_ROOTS["arceos"] / "rust" / f"qemu-{arch}.toml"
+            )
+            build = (
+                workspace_root
+                / SUITE_ROOTS["arceos"]
+                / "rust"
+                / f"build-{ARCH_TARGETS[arch]}.toml"
+            )
+            if runtime.is_file() and build.is_file():
+                continue
+            raise SuiteRouteError(
+                f"check '{check['id']}' registers missing ArceOS QEMU capability {arch}"
+            )
+
+        candidates = [
+            runtime_case
+            for runtime_case in discovered[_kind_os(kind)]
+            if runtime_case.kind == kind
+            and (
+                registration.get("arch") is None
+                or runtime_case.arch == registration["arch"]
+            )
+            and (
+                registration.get("board") is None
+                or runtime_case.board == registration["board"]
+            )
+        ]
+        registered_cases = registration.get("cases")
+        if registered_cases:
+            missing = set(registered_cases) - {
+                runtime_case.case for runtime_case in candidates
+            }
+            if missing:
+                raise SuiteRouteError(
+                    f"check '{check['id']}' registers missing suite cases: {sorted(missing)}"
+                )
+        elif not candidates:
+            raise SuiteRouteError(
+                f"check '{check['id']}' registers a suite capability with no runtime cases"
+            )
+
+    for runtime_cases in discovered.values():
+        for runtime_case in runtime_cases:
+            _registered_template(
+                registrations,
+                kind=runtime_case.kind,
+                arch=runtime_case.arch,
+                board=runtime_case.board,
+                case=runtime_case.case,
+            )
+
+
+def check_matches_input(check: dict[str, Any], selection: str) -> bool:
+    os_name, separator, remainder = selection.partition(":")
+    if not separator:
+        return False
+    registrations = check.get("suite", ())
+    if remainder == "all":
+        return any(
+            _kind_os(registration["kind"]) == os_name
+            and registration["kind"] not in STARRY_APP_SUITE_KINDS
+            for registration in registrations
+        )
+
+    platform, separator, value = remainder.partition(":")
+    if not separator:
+        return False
+    for registration in registrations:
+        kind = registration["kind"]
+        if kind in STARRY_APP_SUITE_KINDS or _kind_os(kind) != os_name:
+            continue
+        if (
+            platform == "qemu"
+            and kind.endswith("-qemu")
+            and registration.get("arch") == value
+        ):
+            return True
+        if platform == "board" and kind.endswith("-board"):
+            board = registration.get("board", "")
+            if (
+                board == value
+                or board.startswith(f"{value}-")
+                or value.startswith(f"{board}-")
+            ):
+                return True
+    return False
+
+
+def _selections_for_path(
+    workspace_root: Path,
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+) -> list[SuiteSelection]:
+    ktest = _ktest_selections(registrations, path)
+    if ktest:
+        return ktest
+    if _is_prefix(path, SUITE_ROOTS["arceos"]):
+        relative = path.relative_to(SUITE_ROOTS["arceos"])
+        if relative.parts and relative.parts[0] in ARCEOS_GENERIC_QEMU_GROUPS:
+            group = relative.parts[0]
+            root = workspace_root / SUITE_ROOTS["arceos"] / group
+            cases = _discover_runtime_cases(root, "arceos")
+            return _runtime_selections(registrations, path,
+                _matching_runtime_cases(cases, workspace_root / path), suite_group=group)
+        if relative.parts and relative.parts[0].startswith("board-"):
+            return _discovered_selections(workspace_root, registrations, path, "arceos")
+        return _arceos_selections(registrations, path)
+    if _is_prefix(path, STARRY_APP_SUITE_ROOT):
+        return _starry_app_selections(registrations, path)
+    for os_name in ("starry", "axvisor"):
+        if any(_is_prefix(path, root) for root in _suite_roots(os_name)):
+            return _discovered_selections(
+                workspace_root,
+                registrations,
+                path,
+                os_name,
+            )
+    return []
+
+
+def _starry_app_selections(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+) -> list[SuiteSelection]:
+    """Route a `benchmarks/starry` change to its registered nightly check.
+
+    Starry benchmark cases run through `cargo xtask starry app ...`, so the
+    registration names the case directory relative to `benchmarks/starry`
+    and the owning check contributes its own command unchanged.
+    """
+    selections = []
+    for check, registration in registrations:
+        if registration["kind"] not in STARRY_APP_SUITE_KINDS:
+            continue
+        for case in registration.get("cases", ()):
+            if not _is_prefix(path, STARRY_APP_SUITE_ROOT / case):
+                continue
+            selections.append(
+                SuiteSelection(
+                    template_id=check["id"],
+                    row_id=_slugify(f"suite-{check['id']}-{case}"),
+                    leaf_name=f"benchmark/{case}",
+                    command=check["command"].strip(),
+                    source_path=path.as_posix(),
+                )
+            )
+    return selections
+
+
+def _arceos_selections(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+) -> list[SuiteSelection]:
+    root = SUITE_ROOTS["arceos"]
+    relative = path.relative_to(root)
+    if not relative.parts:
+        return _arceos_all_selections(registrations, path)
+
+    group = relative.parts[0]
+    if group not in {"rust", "c", "loongarch"}:
+        return []
+
+    case = None
+    display_case = group
+    if group == "rust" and len(relative.parts) >= 3 and relative.parts[1] == "cases":
+        case = relative.parts[2]
+        display_case = f"rust/{case}"
+    elif group == "loongarch" and len(relative.parts) >= 2:
+        case = relative.parts[1]
+        display_case = f"loongarch/{case}"
+
+    arches = _arches_for_path(path)
+    if not arches and group == "loongarch":
+        arches = {"loongarch64"}
+    if not arches:
+        arches = {
+            registration["arch"]
+            for _, registration in registrations
+            if registration["kind"] == "arceos-qemu" and registration.get("group") is None
+        }
+
+    selections = []
+    for arch in sorted(arches, key=_arch_sort_key):
+        template = _registered_template(
+            registrations,
+            kind="arceos-qemu",
+            arch=arch,
+            case=case,
+        )
+        if template is None:
+            continue
+        command = f"cargo xtask arceos test qemu --arch {arch} --test-group {group}"
+        if case is not None:
+            command += f" --test-case {case}"
+        selections.append(
+            _selection(
+                template,
+                f"QEMU {arch}",
+                display_case,
+                command,
+                path,
+            )
+        )
+    return selections
+
+
+def _arceos_all_selections(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+) -> list[SuiteSelection]:
+    selections = []
+    for check, registration in registrations:
+        if registration["kind"] != "arceos-qemu":
+            continue
+        arch = registration["arch"]
+        selections.append(
+            _selection(
+                check,
+                f"QEMU {arch}",
+                "all",
+                check["command"],
+                path,
+            )
+        )
+    return selections
+
+
+def _discovered_selections(
+    workspace_root: Path,
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+    os_name: str,
+) -> list[SuiteSelection]:
+    absolute_path = workspace_root / path
+    absolute_root = workspace_root / _owning_suite_root(path, os_name)
+    cases = _discover_os_runtime_cases(workspace_root, os_name)
+
+    grouped = _starry_grouped_subcase(absolute_root, absolute_path, cases)
+    if grouped is not None:
+        matching_cases, selector = grouped
+        return _runtime_selections(
+            registrations,
+            path,
+            matching_cases,
+            selector_override=selector,
+        )
+
+    matching_cases = _matching_runtime_cases(cases, absolute_path)
+    return _runtime_selections(registrations, path, matching_cases)
+
+
+def _owning_suite_root(path: Path, os_name: str) -> Path:
+    for root in _suite_roots(os_name):
+        if _is_prefix(path, root):
+            return root
+    return SUITE_ROOTS[os_name]
+
+
+def _suite_roots(os_name: str) -> tuple[Path, ...]:
+    return (SUITE_ROOTS[os_name], *EXTRA_SUITE_ROOTS.get(os_name, ()))
+
+
+def _discover_os_runtime_cases(
+    workspace_root: Path,
+    os_name: str,
+) -> list[_RuntimeCase]:
+    cases: list[_RuntimeCase] = []
+    for root in _suite_roots(os_name):
+        cases.extend(_discover_runtime_cases(workspace_root / root, os_name))
+    return cases
+
+
+def _axvisor_app_case(runtime_case: _RuntimeCase) -> bool:
+    return runtime_case.kind.startswith("axvisor-") and any(
+        parent.name == "axvisor" and parent.parent.name == "apps"
+        for parent in runtime_case.runtime_config.parents
+    )
+
+
+def _runtime_selections(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+    cases: Sequence[_RuntimeCase],
+    *,
+    selector_override: str | None = None,
+    suite_group: str | None = None,
+) -> list[SuiteSelection]:
+    selections = []
+    board_batches: dict[
+        tuple[str, str | None, Path], list[tuple[str, _RuntimeCase, dict[str, Any]]]
+    ] = {}
+    for runtime_case in cases:
+        selector = selector_override or runtime_case.case
+        app_case = _axvisor_app_case(runtime_case)
+        entry = "app" if app_case else "test"
+        selector_option = "--app" if app_case else "--test-case"
+        template = _registered_template(
+            registrations,
+            kind=runtime_case.kind,
+            arch=runtime_case.arch,
+            board=runtime_case.board,
+            case=runtime_case.case,
+            group=suite_group,
+        )
+        if template is None:
+            continue
+
+        if runtime_case.kind in {"starry-board", "axvisor-board"}:
+            key = (template["id"], runtime_case.board, runtime_case.build_config)
+            board_batches.setdefault(key, []).append((selector, runtime_case, template))
+            continue
+
+        if runtime_case.kind == "arceos-qemu":
+            platform = f"QEMU {runtime_case.arch}"
+            command = (f"cargo xtask arceos test qemu --arch {runtime_case.arch} "
+                f"--test-group {suite_group} --test-case {selector}")
+        elif runtime_case.kind == "starry-qemu":
+            platform = f"QEMU {runtime_case.arch}"
+            command = (
+                f"cargo xtask starry test qemu --arch {runtime_case.arch} "
+                f"--test-case {selector}"
+            )
+        elif runtime_case.kind == "axvisor-qemu":
+            variant = _case_variant(runtime_case.case)
+            platform = (
+                f"{variant.upper()} {runtime_case.arch}"
+                if variant in {"vmx", "svm"}
+                else f"QEMU {runtime_case.arch}"
+            )
+            command = (
+                f"cargo xtask axvisor {entry} qemu --arch {runtime_case.arch} "
+                f"{'--group' if app_case else '--test-group'} normal {selector_option} {selector}"
+            )
+        else:
+            platform = _platform_label(template)
+            os_cli = _kind_os(runtime_case.kind)
+            command = (
+                f"cargo xtask {os_cli} test board --test-case {selector} "
+                f"--board {runtime_case.board}"
+            )
+            if runtime_case.kind == "axvisor-board":
+                command = command.replace(
+                    " test board",
+                    " test board --test-group normal",
+                    1,
+                )
+
+        selections.append(_selection(template, platform, selector, command, path))
+
+    for batch in board_batches.values():
+        selectors = [selector for selector, _, _ in batch]
+        runtime_case = batch[0][1]
+        template = batch[0][2]
+        selector_list = ",".join(selectors)
+        platform = _platform_label(template)
+        os_cli = _kind_os(runtime_case.kind)
+        app_case = _axvisor_app_case(runtime_case)
+        entry = "app" if app_case else "test"
+        selector_option = "--app" if app_case else "--test-case"
+        group_option = (" --group normal" if app_case else " --test-group normal") if runtime_case.kind == "axvisor-board" else ""
+        command = (
+            f"cargo xtask {os_cli} {entry} board{group_option} "
+            f"{selector_option} {selector_list} --board {runtime_case.board}"
+        )
+        batch_command = (
+            f"cargo xtask {os_cli} {entry} board{group_option} "
+            f"{selector_option} {{cases}} --board {runtime_case.board}"
+        )
+        selections.append(
+            _selection(
+                template,
+                platform,
+                selector_list,
+                command,
+                path,
+                batch_key=(template["id"], runtime_case.board, runtime_case.build_config),
+                batch_cases=tuple(selectors),
+                batch_command=batch_command,
+            )
+        )
+    return selections
+
+
+def _discover_runtime_cases(root: Path, os_name: str) -> list[_RuntimeCase]:
+    cases = []
+    qemu_kind = f"{os_name}-qemu"
+    board_kind = f"{os_name}-board"
+    for runtime_config in sorted(root.rglob("qemu-*.toml")):
+        parsed = _parse_qemu_config_name(runtime_config.stem)
+        if parsed is None:
+            continue
+        arch, variant = parsed
+        build_config = _nearest_qemu_build_config(
+            runtime_config.parent,
+            root,
+            arch,
+            variant,
+        )
+        if build_config is None:
+            continue
+        wrapper_dir = build_config.parent
+        if os_name == "starry":
+            case = runtime_config.parent.relative_to(root).as_posix()
+        else:
+            base_case = (
+                wrapper_dir.name
+                if runtime_config.parent == wrapper_dir
+                else runtime_config.parent.name
+            )
+            case = f"{base_case}-{variant}" if variant else base_case
+        if os_name == "axvisor" and root.parent.name == "apps":
+            group_root = root / runtime_config.relative_to(root).parts[0]
+            case = runtime_config.parent.relative_to(group_root).as_posix()
+        cases.append(
+            _RuntimeCase(
+                kind=qemu_kind,
+                arch=arch,
+                board=None,
+                case=case,
+                case_dir=runtime_config.parent,
+                wrapper_dir=wrapper_dir,
+                runtime_config=runtime_config,
+                build_config=build_config,
+            )
+        )
+
+    for runtime_config in sorted(root.rglob("board-*.toml")):
+        build_config = _nearest_board_build_config(runtime_config.parent, root)
+        if build_config is None:
+            continue
+        wrapper_dir = build_config.parent
+        relative_case = runtime_config.parent.relative_to(wrapper_dir)
+        # AxVisor selectors are relative to the selected test group when the
+        # runtime and build configurations share a directory, as in axbuild.
+        # Benchmarks already use the suite root as their normal group root.
+        case_root = root
+        if os_name == "axvisor" and root.parent.name != "benchmarks":
+            case_root = root / runtime_config.relative_to(root).parts[0]
+        case = (
+            relative_case.as_posix()
+            if relative_case.parts
+            else wrapper_dir.relative_to(case_root).as_posix()
+        )
+        if os_name == "axvisor" and root.parent.name == "apps":
+            case = runtime_config.parent.relative_to(case_root).as_posix()
+        if os_name == "arceos":
+            case = runtime_config.parent.name
+        cases.append(
+            _RuntimeCase(
+                kind=board_kind,
+                arch=None,
+                board=runtime_config.stem.removeprefix("board-"),
+                case=case,
+                case_dir=runtime_config.parent,
+                wrapper_dir=wrapper_dir,
+                runtime_config=runtime_config,
+                build_config=build_config,
+            )
+        )
+    return cases
+
+
+def _matching_runtime_cases(
+    cases: Sequence[_RuntimeCase], path: Path
+) -> list[_RuntimeCase]:
+    exact = [
+        runtime_case
+        for runtime_case in cases
+        if path in {runtime_case.runtime_config, runtime_case.build_config}
+    ]
+    if exact:
+        return exact
+
+    case_matches = [
+        runtime_case
+        for runtime_case in cases
+        if _is_prefix(path, runtime_case.case_dir)
+    ]
+    if case_matches:
+        deepest = max(len(runtime_case.case_dir.parts) for runtime_case in case_matches)
+        return [
+            runtime_case
+            for runtime_case in case_matches
+            if len(runtime_case.case_dir.parts) == deepest
+        ]
+
+    wrapper_matches = [
+        runtime_case
+        for runtime_case in cases
+        if _is_prefix(path, runtime_case.wrapper_dir)
+    ]
+    if wrapper_matches:
+        deepest = max(
+            len(runtime_case.wrapper_dir.parts) for runtime_case in wrapper_matches
+        )
+        return [
+            runtime_case
+            for runtime_case in wrapper_matches
+            if len(runtime_case.wrapper_dir.parts) == deepest
+        ]
+    return []
+
+
+def _starry_grouped_subcase(
+    root: Path,
+    path: Path,
+    cases: Sequence[_RuntimeCase],
+) -> tuple[list[_RuntimeCase], str] | None:
+    system_root = root / "qemu/system"
+    if not _is_prefix(path, system_root):
+        return None
+    relative = path.relative_to(system_root)
+    if len(relative.parts) < 2:
+        return None
+    subcase = relative.parts[0]
+    if not (system_root / subcase).is_dir():
+        return None
+    matching = [
+        runtime_case
+        for runtime_case in cases
+        if runtime_case.kind == "starry-qemu" and runtime_case.case == "qemu/system"
+    ]
+    return matching, f"qemu/{subcase}"
+
+
+def _nearest_qemu_build_config(
+    start: Path,
+    root: Path,
+    arch: str,
+    variant: str | None,
+) -> Path | None:
+    suffix = f"-{variant}" if variant else ""
+    filename = f"build-{ARCH_TARGETS[arch]}{suffix}.toml"
+    for directory in (start, *start.parents):
+        if directory == root.parent:
+            break
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate
+        if directory == root:
+            break
+    return None
+
+
+def _nearest_board_build_config(start: Path, root: Path) -> Path | None:
+    for directory in (start, *start.parents):
+        if directory == root.parent:
+            break
+        candidates = sorted(directory.glob("build-*.toml"))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return None
+        if directory == root:
+            break
+    return None
+
+
+def _registered_template(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    kind: str,
+    arch: str | None = None,
+    board: str | None = None,
+    case: str | None = None,
+    group: str | None = None,
+) -> dict[str, Any] | None:
+    matches = []
+    for check, registration in registrations:
+        if registration["kind"] != kind:
+            continue
+        if registration.get("group") != group:
+            continue
+        if arch is not None and registration.get("arch") != arch:
+            continue
+        if board is not None and registration.get("board") != board:
+            continue
+        registered_cases = registration.get("cases")
+        if registered_cases and case not in registered_cases:
+            continue
+        matches.append(check)
+    if len(matches) > 1:
+        ids = ", ".join(sorted(check["id"] for check in matches))
+        raise SuiteRouteError(
+            f"suite capability kind={kind} arch={arch} board={board} case={case} "
+            f"is registered by multiple checks: {ids}"
+        )
+    return matches[0] if matches else None
+
+
+def _suite_registrations(
+    checks: Sequence[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (check, registration)
+        for check in checks
+        for registration in check.get("suite", ())
+    ]
+
+
+def _validate_starry_app_registrations(
+    workspace_root: Path,
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
+    for check, registration in registrations:
+        if registration["kind"] not in STARRY_APP_SUITE_KINDS:
+            continue
+        cases = registration.get("cases")
+        if not cases:
+            raise SuiteRouteError(
+                f"check '{check['id']}' starry app registration must declare cases"
+            )
+        for case in cases:
+            case_dir = workspace_root / STARRY_APP_SUITE_ROOT / case
+            if not case_dir.is_dir():
+                raise SuiteRouteError(
+                    f"check '{check['id']}' registers missing Starry app case "
+                    f"`{case}` under {STARRY_APP_SUITE_ROOT}"
+                )
+
+
+def _ktest_config_fields(kind: str) -> tuple[str, ...]:
+    """Config files one ktest execution unit declares besides package and test."""
+    if kind == KTEST_QEMU_KIND:
+        return ("config", "qemu_config")
+    return ("config", "board_config")
+
+
+def _ktest_declared_paths(registration: dict[str, Any]) -> tuple[Path, ...]:
+    return tuple(
+        Path(value)
+        for value in (
+            registration.get(field)
+            for field in _ktest_config_fields(registration["kind"])
+        )
+        if isinstance(value, str) and value
+    )
+
+
+def _ktest_selections(
+    registrations: Sequence[tuple[dict[str, Any], dict[str, Any]]],
+    path: Path,
+) -> list[SuiteSelection]:
+    """Route a changed path to the ktest execution unit that owns it.
+
+    A registration owns its declared config files and the directories holding
+    them, which is where the generated guest resources, the board run config and
+    the adjacent `guest-builds.toml` live. This branch runs before the runtime
+    discovery, so a migrated case that still keeps its `board-*.toml` layout is
+    routed here instead of being reported as a legacy `*-board` case. The routed
+    run reuses the owning check's command, so an incremental pull request
+    executes exactly the job CI already runs.
+    """
+    selections = []
+    for check, registration in registrations:
+        if registration["kind"] not in KTEST_SUITE_KINDS:
+            continue
+        declared = _ktest_declared_paths(registration)
+        if not any(
+            path == config or _is_prefix(path, config.parent) for config in declared
+        ):
+            continue
+        test = registration["test"]
+        selections.append(
+            SuiteSelection(
+                template_id=check["id"],
+                row_id=_slugify(f"suite-{check['id']}-{test}"),
+                leaf_name=f"{_platform_label(check)} · {test}",
+                command=check["command"].strip(),
+                source_path=path.as_posix(),
+            )
+        )
+    return selections
+
+
+def _validate_ktest_registration(
+    workspace_root: Path,
+    check: dict[str, Any],
+    registration: dict[str, Any],
+) -> None:
+    """Validate one ktest execution unit against the framework contract.
+
+    `cargo xtask ktest` only accepts a workspace package that declares a
+    `harness = false` `[[test]]` target of the given name together with explicit
+    config files, so the catalog checks those facts instead of trusting the
+    registration.
+    """
+    kind = registration["kind"]
+    package = _require_ktest_string(check, registration, "package")
+    test = _require_ktest_string(check, registration, "test")
+    manifest = _package_manifest(workspace_root, package)
+    if manifest is None:
+        raise SuiteRouteError(
+            f"check '{check['id']}' registers unknown workspace package `{package}`"
+        )
+    if not _declares_harness_false_test(manifest, test):
+        raise SuiteRouteError(
+            f"check '{check['id']}' registers ktest target `{test}`, but "
+            f"{manifest.relative_to(workspace_root).as_posix()} declares no "
+            f"harness=false [[test]] target with that name"
+        )
+    for field in _ktest_config_fields(kind):
+        rendered = _require_ktest_string(check, registration, field)
+        if not (workspace_root / rendered).is_file():
+            raise SuiteRouteError(
+                f"check '{check['id']}' registers missing ktest {field} `{rendered}`"
+            )
+    if kind == KTEST_QEMU_KIND:
+        _validate_ktest_qemu_target(workspace_root, check, registration)
+
+
+def _validate_ktest_qemu_target(
+    workspace_root: Path,
+    check: dict[str, Any],
+    registration: dict[str, Any],
+) -> None:
+    """Require the qemu registration arch to match its build config target."""
+    rendered = registration["config"]
+    target = _toml_document(workspace_root / rendered).get("target")
+    expected = ARCH_TARGETS.get(registration.get("arch"))
+    if target != expected:
+        raise SuiteRouteError(
+            f"check '{check['id']}' registers arch `{registration.get('arch')}` "
+            f"but {rendered} builds target `{target}`"
+        )
+
+
+def _require_ktest_string(
+    check: dict[str, Any],
+    registration: dict[str, Any],
+    field: str,
+) -> str:
+    value = registration.get(field)
+    if not isinstance(value, str) or not value:
+        raise SuiteRouteError(
+            f"check '{check['id']}' {registration['kind']} registration must "
+            f"declare a non-empty `{field}`"
+        )
+    return value
+
+
+def _package_manifest(workspace_root: Path, package: str) -> Path | None:
+    """Find the workspace manifest that declares `package`."""
+    for manifest in _workspace_manifests(workspace_root):
+        table = _toml_document(manifest).get("package")
+        if isinstance(table, dict) and table.get("name") == package:
+            return manifest
+    return None
+
+
+def _workspace_manifests(workspace_root: Path) -> list[Path]:
+    """Every `Cargo.toml` in the workspace, skipping build and vendor trees."""
+    manifests = []
+    for directory, subdirectories, files in os.walk(workspace_root):
+        subdirectories[:] = sorted(
+            name for name in subdirectories if name not in IGNORED_MANIFEST_DIRS
+        )
+        if "Cargo.toml" in files:
+            manifests.append(Path(directory) / "Cargo.toml")
+    return manifests
+
+
+def _declares_harness_false_test(manifest: Path, test: str) -> bool:
+    """Report whether `manifest` declares `test` as a `harness = false` target."""
+    entries = _toml_document(manifest).get("test")
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and entry.get("name") == test
+        and entry.get("harness") is False
+        for entry in entries
+    )
+
+
+def _toml_document(path: Path) -> dict[str, Any]:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise SuiteRouteError(f"cannot read {path.as_posix()}: {error}") from error
+
+
+def _selection(
+    template: dict[str, Any],
+    platform: str,
+    case: str,
+    command: str,
+    path: Path,
+    *,
+    batch_key: tuple[str, str | None, Path] | None = None,
+    batch_cases: tuple[str, ...] = (),
+    batch_command: str | None = None,
+) -> SuiteSelection:
+    row_id = _slugify(f"suite-{template['id']}-{case}")
+    return SuiteSelection(
+        template_id=template["id"],
+        row_id=row_id,
+        leaf_name=f"{platform} · {case}",
+        command=command,
+        source_path=path.as_posix(),
+        batch_key=batch_key,
+        batch_cases=batch_cases,
+        batch_command=batch_command,
+    )
+
+
+def _platform_label(template: dict[str, Any]) -> str:
+    return template["name"].split(" · ", maxsplit=1)[0]
+
+
+def _kind_os(kind: str) -> str:
+    return kind.split("-", maxsplit=1)[0]
+
+
+def _case_variant(case: str) -> str | None:
+    suffix = case.rsplit("-", maxsplit=1)[-1]
+    return suffix if suffix in {"vmx", "svm"} else None
+
+
+def _parse_qemu_config_name(stem: str) -> tuple[str, str | None] | None:
+    if not stem.startswith("qemu-"):
+        return None
+    value = stem.removeprefix("qemu-")
+    for arch in ARCH_TARGETS:
+        if value == arch:
+            return arch, None
+        if value.startswith(f"{arch}-"):
+            return arch, value.removeprefix(f"{arch}-")
+    return None
+
+
+def _arches_for_path(path: Path) -> set[str]:
+    rendered = path.as_posix().casefold()
+    arches = set()
+    for arch, target in ARCH_TARGETS.items():
+        if re.search(rf"(^|[^a-z0-9]){re.escape(arch)}([^a-z0-9]|$)", rendered):
+            arches.add(arch)
+        if target.casefold() in rendered:
+            arches.add(arch)
+    if "riscv64gc" in rendered:
+        arches.add("riscv64")
+    return arches
+
+
+def _arch_sort_key(arch: str) -> int:
+    return list(ARCH_TARGETS).index(arch)
+
+
+def _slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+
+
+def _is_prefix(path: Path, prefix: Path) -> bool:
+    return path == prefix or prefix in path.parents

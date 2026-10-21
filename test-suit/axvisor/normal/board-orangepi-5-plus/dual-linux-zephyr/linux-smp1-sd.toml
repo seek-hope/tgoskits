@@ -1,0 +1,65 @@
+[base]
+id = 1
+name = "linux"
+guest_type = "passthrough"
+cpu_num = 1
+# Keep perception on A55 CPU0; the controller owns A55 CPU2.
+phys_cpu_ids = [0x00]
+
+[kernel]
+entry_point = 0x2_4008_0000
+kernel_load_addr = 0x2_4008_0000
+kernel_path = "/guest/linux/orangepi-5-plus-6.1.99-axivc"
+cmdline = "root=/dev/mmcblk1p2 rw console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000 cpuidle.off=1 rodata=off rootwait rootfstype=ext4 loglevel=3 cma=128M clk_ignore_unused pd_ignore_unused"
+ramdisk_path = "/guest/linux/initramfs.cpio"
+ramdisk_load_addr = 0xc000_0000
+
+memory_regions = [
+  [0xb000_0000, 0x1000_0000, 0x7, 2],
+  [0xc000_0000, 0x3000_0000, 0x7, 2],
+  [0x2_4000_0000, 0x8000_0000, 0x7, 1],
+]
+
+[devices]
+passthrough = []
+disabled = [
+  # UART6 belongs exclusively to the Zephyr controller.
+  { path = "/serial@feb90000" },
+  # Keep thermal sensing available to guest peripheral drivers. The host
+  # maintains its verified TSADC shutdown ceiling and samples fresh data;
+  # physical CPU DVFS remains host-owned.
+  # Axvisor owns the PCIe fabric used by the RTL8125 management interface.
+  # Keep every PCIe PHY outside Linux even though the PCIe bridges themselves
+  # are already filtered from an implicit root passthrough guest.
+  { path = "/phy@fee00000" },
+  { path = "/phy@fee10000" },
+  { path = "/phy@fee20000" },
+  { path = "/phy@fee80000" },
+  # Keep this unused USB controller and its PHY out of Linux; guest activation
+  # was observed to drop the host management link. The robot camera remains
+  # available through /usbdrd3_1.
+  { path = "/usbdrd3_0" },
+  { path = "/phy@fed80000" },
+  # The FUSB302 connector's remote-endpoint refers to the disabled USB0 PHY
+  # above, which AxVisor keeps for the host; the guest must not parse it.
+  { path = "/i2c@fec80000/fusb302@22" },
+  # The guest does not use this DisplayPort node, so keep it out to avoid its
+  # references to the AxVisor-owned /phy@fed80000/dp-port.
+  { path = "/dp@fde50000" },
+  # The guest does not use the VOP display pipeline, so keep it out to avoid
+  # its references to the AxVisor-owned DisplayPort provider above.
+  { path = "/vop@fdd90000" },
+  # The guest does not use this HDMI output node, so keep it out to avoid its
+  # references to the AxVisor-owned VOP provider above.
+  { path = "/hdmi@fdea0000" },
+  # The guest does not use this HDMI output node, so keep it out to avoid its
+  # references to the AxVisor-owned VOP provider above.
+  { path = "/hdmi@fde80000" },
+  # The guest does not use the host IOMMU, so keep it out to avoid the
+  # passthrough sharing an AxVisor-owned interrupt source.
+  { path = "/iommu@fdd97e00" },
+]
+
+[[devices.virtual]]
+id = "robot-ivc"
+model = "ivc-channel"

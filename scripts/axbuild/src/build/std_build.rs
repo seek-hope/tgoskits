@@ -91,6 +91,30 @@ pub(super) fn std_build_target_for(target: &str) -> anyhow::Result<StdBuildTarge
     })
 }
 
+/// Resolves explicit kernel standard-library targets for static checking.
+pub(crate) fn std_check_target_for(target: &str) -> Option<super::bare_build::CargoBuildTarget> {
+    if !matches!(
+        target,
+        "x86_64-unknown-linux-musl"
+            | "aarch64-unknown-linux-musl"
+            | "riscv64gc-unknown-linux-musl"
+            | "loongarch64-unknown-linux-musl"
+    ) {
+        return None;
+    }
+    let mut resolved = std_build_target_for(target)
+        .expect("the four workspace standard-library targets are supported");
+    resolved
+        .cargo_args
+        .extend(["-Z".into(), "build-std=std,panic_abort".into()]);
+    Some(super::bare_build::CargoBuildTarget {
+        target: resolved.target,
+        cargo_args: resolved.cargo_args,
+        rustflags: Vec::new(),
+        env: resolved.env,
+    })
+}
+
 pub(super) fn std_c_toolchain_env(target_name: &str, tool_prefix: &str) -> HashMap<String, String> {
     let mut env = HashMap::new();
     let target_env = target_name.replace('-', "_");
@@ -233,29 +257,7 @@ pub(super) fn std_target_json_path(target: &str) -> PathBuf {
     path.join(PIE_TARGET_DIR).join(format!("{target}.json"))
 }
 
-pub(crate) fn prepare_std_build_env(
-    envs: &mut HashMap<String, String>,
-    target: &str,
-    metadata: &Metadata,
-) -> anyhow::Result<()> {
-    prepare_std_build_env_for_package(envs, AXSTD_STD_PACKAGE, target, &[], metadata)
-}
-
-pub(super) fn prepare_std_build_env_for_package(
-    envs: &mut HashMap<String, String>,
-    package: &str,
-    target: &str,
-    features: &[String],
-    metadata: &Metadata,
-) -> anyhow::Result<()> {
-    envs.insert("AX_TARGET".to_string(), target.to_string());
-
-    let _ = (package, features, metadata);
-    Ok(())
-}
-
 pub(super) fn pass_std_build_nested_features(
-    _envs: &mut HashMap<String, String>,
     features: &mut Vec<String>,
     app_features: &[String],
     axstd_features: &[String],
@@ -264,9 +266,6 @@ pub(super) fn pass_std_build_nested_features(
 
     for feature in features.drain(..) {
         let feature = normalize_std_feature(&feature);
-        if is_removed_dynamic_platform_feature(&feature) {
-            continue;
-        }
         if matches!(feature.as_str(), "ax-std") {
             continue;
         }
@@ -288,25 +287,10 @@ pub(super) fn pass_std_build_nested_features(
         }
     }
 
-    if axstd_feature_is_available("std-compat", axstd_features) {
-        cargo_features.push("ax-std/std-compat".to_string());
-    }
-
     cargo_features.sort();
     cargo_features.dedup();
 
     *features = cargo_features;
-}
-
-pub(super) fn inject_arceos_feature_for_std_build(
-    features: &mut Vec<String>,
-    app_features: &[String],
-) {
-    if app_features.iter().any(|feature| feature == "arceos")
-        && !features.iter().any(|feature| feature == "arceos")
-    {
-        features.push("arceos".to_string());
-    }
 }
 
 pub(super) fn axstd_feature_name(feature: &str) -> &str {
@@ -334,44 +318,49 @@ pub(super) fn axstd_feature_is_available(feature: &str, axstd_features: &[String
 }
 
 pub(super) fn std_cargo_config_path(
+    axbuild_dir: &Path,
     target: &str,
     linker: &Path,
     extra_rustflags: &[String],
 ) -> anyhow::Result<PathBuf> {
-    let path = std_build_dir()?.join(format!("config-{target}-dynamic.toml"));
     let config = toml::to_string_pretty(&StdCargoConfig::new(target, linker, extra_rustflags))?;
+    // A prepared Cargo invocation must keep its own flags even when another
+    // build for the same target is prepared before it runs.
+    let path = std_build_dir(axbuild_dir)?
+        .join("config")
+        .join(short_content_hash(&config))
+        .join(format!("config-{target}-dynamic.toml"));
     write_if_changed(&path, &config)?;
     Ok(path)
 }
 
-pub(super) fn std_fake_lib_dir(target: &str) -> anyhow::Result<PathBuf> {
-    let dir = axbuild_tmp_dir(&crate::context::workspace_root_path()?)
-        .join("std-libs")
-        .join(target)
-        .join("release");
+pub(super) fn std_fake_lib_dir(axbuild_dir: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    let dir = axbuild_dir.join("std-libs").join(target).join("release");
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create std fake lib dir {}", dir.display()))?;
     Ok(dir)
 }
 
 pub(super) fn std_linker_wrapper_path(
+    axbuild_dir: &Path,
     target: &str,
     fake_lib_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
-    let path = std_build_dir()?.join(format!("linker-{target}-dynamic.sh"));
+    let path = std_build_dir(axbuild_dir)?.join(format!("linker-{target}-dynamic.sh"));
     write_if_changed(&path, &std_linker_wrapper_script(target, fake_lib_dir)?)?;
     set_executable(&path)?;
     Ok(path)
 }
 
 pub(super) fn std_fake_lib_prebuild_script_path(
+    axbuild_dir: &Path,
     target_name: &str,
     fake_lib_dir: &Path,
     envs: &HashMap<String, String>,
 ) -> anyhow::Result<PathBuf> {
     let contents = std_fake_lib_prebuild_script(target_name, fake_lib_dir, envs);
     let hash = short_content_hash(&contents);
-    let path = std_build_dir()?
+    let path = std_build_dir(axbuild_dir)?
         .join("prebuild")
         .join(format!("prebuild-{target_name}-{hash}.sh"));
     write_if_changed(&path, &contents)?;
@@ -633,8 +622,8 @@ pub(super) fn set_executable(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn std_build_dir() -> anyhow::Result<PathBuf> {
-    let dir = axbuild_tmp_dir(&crate::context::workspace_root_path()?).join("std");
+pub(super) fn std_build_dir(axbuild_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = axbuild_dir.join("std");
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create std build dir {}", dir.display()))?;
     Ok(dir)

@@ -2,8 +2,9 @@ extern crate alloc;
 
 use alloc::{format, vec::Vec};
 
-use fdt_edit::{Fdt, NodeType, PciInterruptMap, PciRange, PciSpace};
+use fdt_edit::{Fdt, NodeType, PciInterruptMap, PciRange, PciSpace, Phandle};
 use log::{debug, trace, warn};
+use rdif_pcie::{PciIommuMap, PciIommuMapEntry};
 use rdrive::{
     probe::{
         OnProbeError,
@@ -12,7 +13,7 @@ use rdrive::{
     register::{FdtInfo, ProbeFdt},
 };
 
-use crate::BindingIrq;
+use crate::{BindingIrq, binding_resolver::dma_coherency_from_fdt};
 
 #[cfg(feature = "rk3588-pcie")]
 mod rk3588;
@@ -50,6 +51,13 @@ fn probe_generic_ecam(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let mmio_size = reg.size.unwrap_or(0x1000) as usize;
     let mut drv = new_driver_generic(mmio_base, mmio_size, axklib::mmio::op())
         .map_err(|e| OnProbeError::other(format!("failed to create PCIe controller: {e:?}")))?;
+    drv.set_dma_coherent(matches!(
+        dma_coherency_from_fdt(&info),
+        dma_api::DmaCoherency::Coherent
+    ));
+    if let Some(map) = pci_iommu_map(&info)? {
+        drv.set_iommu_map(map);
+    }
 
     for range in node.ranges().unwrap_or_default() {
         debug!("pcie range {range:?}");
@@ -65,6 +73,70 @@ fn probe_generic_ecam(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     plat_dev.register_pcie(drv);
 
     Ok(())
+}
+
+fn pci_iommu_map(info: &FdtInfo<'_>) -> Result<Option<PciIommuMap>, OnProbeError> {
+    let node = info.node.as_node();
+    let Some(property) = node.get_property("iommu-map") else {
+        if node.get_property("iommu-map-mask").is_some() {
+            return Err(OnProbeError::other(
+                "PCIe iommu-map-mask is present without iommu-map",
+            ));
+        }
+        return Ok(None);
+    };
+
+    if property.data.is_empty() || property.data.len() % 16 != 0 {
+        return Err(OnProbeError::other("invalid PCIe iommu-map length"));
+    }
+    let mask = match node.get_property("iommu-map-mask") {
+        Some(property) => property
+            .get_u32()
+            .ok_or_else(|| OnProbeError::other("invalid PCIe iommu-map-mask length"))?,
+        None => u32::MAX,
+    };
+
+    let mut entries = Vec::with_capacity(property.data.len() / 16);
+    for cells in property.data.as_chunks::<16>().0 {
+        let read_cell = |offset: usize| {
+            u32::from_be_bytes([
+                cells[offset],
+                cells[offset + 1],
+                cells[offset + 2],
+                cells[offset + 3],
+            ])
+        };
+        let rid_base = read_cell(0);
+        let provider_phandle = read_cell(4);
+        let stream_base = read_cell(8);
+        let length = read_cell(12);
+        let provider = info
+            .get_by_phandle(Phandle::from(provider_phandle))
+            .ok_or_else(|| {
+                OnProbeError::other(format!(
+                    "PCIe iommu-map references unknown phandle {provider_phandle:#x}"
+                ))
+            })?;
+        if provider
+            .as_node()
+            .get_property("#iommu-cells")
+            .and_then(|prop| prop.get_u32())
+            != Some(1)
+        {
+            return Err(OnProbeError::other(format!(
+                "PCIe iommu-map provider {provider_phandle:#x} must have #iommu-cells = 1"
+            )));
+        }
+        entries.push(PciIommuMapEntry {
+            rid_base,
+            iommu_phandle: provider_phandle,
+            stream_base,
+            length,
+        });
+    }
+    PciIommuMap::new(mask, entries)
+        .map(Some)
+        .map_err(|error| OnProbeError::other(format!("invalid PCIe iommu-map: {error:?}")))
 }
 
 pub(super) fn set_pcie_mem_range(drv: &mut PcieController, range: &PciRange) {
@@ -202,10 +274,7 @@ fn resolve_pci_irq_from_fdt(fdt: &Fdt, info: PciInfo) -> Result<BindingIrq, OnPr
             interrupt.interrupt_parent, info.address
         ))
     })?;
-    Ok(BindingIrq::fdt_interrupt_with_controller(
-        parent,
-        interrupt.parent_irq,
-    ))
+    crate::binding_resolver::binding_irq_from_fdt_interrupt(parent, interrupt.parent_irq)
 }
 
 fn pci_interrupt_map_entry(

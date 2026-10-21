@@ -1,13 +1,13 @@
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 
-use ax_kspin::{SpinRaw as SpinMutex, SpinRawGuard as SpinMutexGuard, SpinRwLock as RwLock};
+use ax_sync::{RawSpinLock, RawSpinLockUnpinnedGuard, RawSpinRwLock};
 
 use super::reg::{DisableIrqGuard, XhciRegisters};
 
 pub(crate) struct IrqLock<T> {
-    inner: SpinMutex<()>,
-    reg: Arc<RwLock<XhciRegisters>>,
+    inner: RawSpinLock<()>,
+    reg: Arc<RawSpinRwLock<XhciRegisters>>,
     data: UnsafeCell<T>,
 }
 
@@ -15,9 +15,9 @@ unsafe impl<T> Sync for IrqLock<T> where T: Send {}
 unsafe impl<T> Send for IrqLock<T> where T: Send {}
 
 impl<T> IrqLock<T> {
-    pub fn new(data: T, reg: Arc<RwLock<XhciRegisters>>) -> Self {
+    pub fn new(data: T, reg: Arc<RawSpinRwLock<XhciRegisters>>) -> Self {
         Self {
-            inner: SpinMutex::new(()),
+            inner: RawSpinLock::new(()),
             reg,
             data: UnsafeCell::new(data),
         }
@@ -25,7 +25,9 @@ impl<T> IrqLock<T> {
 
     pub fn lock(&self) -> IrqLockGuard<'_, T> {
         let _disable_guard = self.reg.write().disable_irq_guard();
-        let guard = self.inner.lock();
+        // SAFETY: the controller interrupter is disabled before acquisition,
+        // excluding same-CPU event-handler re-entry.
+        let guard = unsafe { self.inner.lock_raw() };
         IrqLockGuard {
             _guard: guard,
             data: unsafe { &mut *self.data.get() },
@@ -47,7 +49,7 @@ impl<T> IrqLock<T> {
 }
 
 pub(crate) struct IrqLockGuard<'a, T> {
-    _guard: SpinMutexGuard<'a, ()>,
+    _guard: RawSpinLockUnpinnedGuard<'a, ()>,
     data: &'a mut T,
     _disable_guard: DisableIrqGuard,
 }

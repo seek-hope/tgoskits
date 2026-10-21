@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use fdt_edit::Property;
 
@@ -13,6 +13,12 @@ pub(crate) fn prop_u32(name: &str, value: u32) -> Property {
 pub(crate) fn prop_u32_array(name: &str, values: &[u32]) -> Property {
     let mut prop = Property::new(name, Vec::new());
     prop.set_u32_ls(values);
+    prop
+}
+
+pub(crate) fn prop_u64(name: &str, value: u64) -> Property {
+    let mut prop = Property::new(name, Vec::new());
+    prop.set_u64(value);
     prop
 }
 

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use core::{num::NonZeroUsize, ptr::NonNull};
 
 mod op;
@@ -25,98 +26,135 @@ pub use streaming::*;
 
 #[derive(Clone)]
 pub struct DeviceDma {
-    op: &'static dyn DmaOp,
-    constraints: DmaConstraints,
-    domain: DmaDomainId,
+    backend: DmaBackend,
+    info: DmaDeviceInfo,
+}
+
+#[derive(Clone)]
+enum DmaBackend {
+    Static(&'static dyn DmaOp),
+    Shared(Arc<dyn DmaOp>),
 }
 
 impl DeviceDma {
-    pub fn new(domain: DmaDomainId, dma_mask: u64, op: &'static dyn DmaOp) -> Self {
+    /// Creates a direct DMA capability backed by a static kernel allocator.
+    ///
+    /// Translated devices must use `new_shared` so the bound domain remains
+    /// alive for all cloned capabilities and outstanding DMA handles.
+    pub fn new(info: DmaDeviceInfo, op: &'static dyn DmaOp) -> Self {
+        assert!(matches!(info.domain(), DmaDomainId::Direct));
+        assert!(matches!(op.domain_id(), DmaDomainId::Direct));
         Self {
-            constraints: DmaConstraints::new(dma_mask),
-            domain,
-            op,
+            info,
+            backend: DmaBackend::Static(op),
         }
     }
 
-    pub fn new_legacy(dma_mask: u64, op: &'static dyn DmaOp) -> Self {
-        Self::new(DmaDomainId::legacy_global(), dma_mask, op)
+    /// Creates a device capability owning its backend and IOMMU domain.
+    pub fn new_shared(info: DmaDeviceInfo, op: Arc<dyn DmaOp>) -> Result<Self, DmaError> {
+        let backend = op.domain_id();
+        let requested = info.domain();
+        if requested != backend {
+            return Err(DmaError::DomainMismatch { requested, backend });
+        }
+        Ok(Self {
+            info,
+            backend: DmaBackend::Shared(op),
+        })
+    }
+
+    fn op(&self) -> &dyn DmaOp {
+        match &self.backend {
+            DmaBackend::Static(op) => *op,
+            DmaBackend::Shared(op) => op.as_ref(),
+        }
     }
 
     pub fn with_constraints(&self, constraints: DmaConstraints) -> Self {
         Self {
-            op: self.op,
-            constraints,
-            domain: self.domain,
+            backend: self.backend.clone(),
+            info: self.info.with_constraints(constraints),
         }
     }
 
-    pub fn constraints(&self) -> DmaConstraints {
-        self.constraints
-    }
-
-    pub fn dma_mask(&self) -> u64 {
-        self.constraints.addr_mask
-    }
-
-    pub fn domain_id(&self) -> DmaDomainId {
-        self.domain
-    }
-
-    pub fn flush(&self, addr: NonNull<u8>, size: usize) {
-        self.op.flush(addr, size)
-    }
-
-    pub fn invalidate(&self, addr: NonNull<u8>, size: usize) {
-        self.op.invalidate(addr, size)
-    }
-
-    pub fn flush_invalidate(&self, addr: NonNull<u8>, size: usize) {
-        self.op.flush_invalidate(addr, size)
+    pub const fn info(&self) -> DmaDeviceInfo {
+        self.info
     }
 
     pub fn page_size(&self) -> usize {
-        self.op.page_size()
+        self.op().page_size()
     }
 
     pub(crate) unsafe fn alloc_contiguous(
         &self,
         layout: core::alloc::Layout,
     ) -> Result<DmaAllocHandle, DmaError> {
-        let constraints = self.constraints.with_align(layout.align());
-        let res =
-            unsafe { self.op.alloc_contiguous(constraints, layout) }.ok_or(DmaError::NoMemory)?;
+        let mut constraints = self.info.constraints();
+        constraints.align = constraints.align.max(layout.align());
+        let res = unsafe { self.op().try_alloc_contiguous(constraints, layout) }?;
         match self.check_alloc_handle(&res, constraints) {
             Ok(()) => Ok(res),
             Err(e) => {
-                unsafe { self.op.dealloc_contiguous(res) };
+                if let Err(release_err) = unsafe { self.op().try_dealloc_contiguous(res) } {
+                    log::error!(
+                        "failed to release invalid DMA allocation; allocation quarantined: \
+                         {release_err}"
+                    );
+                }
                 Err(e)
             }
         }
     }
 
-    pub(crate) unsafe fn dealloc_contiguous(&self, handle: DmaAllocHandle) {
-        unsafe { self.op.dealloc_contiguous(handle) }
+    pub(crate) unsafe fn dealloc_contiguous(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
+        unsafe { self.op().try_dealloc_contiguous(handle) }
     }
 
     pub(crate) unsafe fn alloc_coherent(
         &self,
         layout: core::alloc::Layout,
     ) -> Result<DmaAllocHandle, DmaError> {
-        let constraints = self.constraints.with_align(layout.align());
-        let res =
-            unsafe { self.op.alloc_coherent(constraints, layout) }.ok_or(DmaError::NoMemory)?;
+        let mut constraints = self.info.constraints();
+        constraints.align = constraints.align.max(layout.align());
+        let res = match self.info.coherency() {
+            DmaCoherency::Coherent => unsafe {
+                self.op().try_alloc_contiguous(constraints, layout)
+            },
+            DmaCoherency::NonCoherent => unsafe {
+                self.op().try_alloc_coherent(constraints, layout)
+            },
+        }?;
         match self.check_alloc_handle(&res, constraints) {
             Ok(()) => Ok(res),
             Err(e) => {
-                unsafe { self.op.dealloc_coherent(res) };
+                match self.info.coherency() {
+                    DmaCoherency::Coherent => {
+                        if let Err(release_err) = unsafe { self.op().try_dealloc_contiguous(res) } {
+                            log::error!(
+                                "failed to release invalid DMA allocation; allocation \
+                                 quarantined: {release_err}"
+                            );
+                        }
+                    }
+                    DmaCoherency::NonCoherent => {
+                        if let Err(release_err) = unsafe { self.op().dealloc_coherent(res) } {
+                            log::error!(
+                                "failed to release invalid coherent DMA allocation; allocation \
+                                 quarantined: {release_err}"
+                            );
+                        }
+                    }
+                }
                 Err(e)
             }
         }
     }
 
-    pub(crate) unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) {
-        unsafe { self.op.dealloc_coherent(handle) }
+    pub(crate) unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
+        match self.info.coherency() {
+            DmaCoherency::Coherent => unsafe { self.op().try_dealloc_contiguous(handle) },
+            DmaCoherency::NonCoherent => unsafe { self.op().dealloc_coherent(handle) },
+        }
     }
 
     pub(crate) unsafe fn map_streaming(
@@ -126,19 +164,24 @@ impl DeviceDma {
         align: usize,
         direction: DmaDirection,
     ) -> Result<DmaMapHandle, DmaError> {
-        let constraints = self.constraints.with_align(align);
-        let res = unsafe { self.op.map_streaming(constraints, addr, size, direction) }?;
+        let mut constraints = self.info.constraints();
+        constraints.align = constraints.align.max(align);
+        let res = unsafe { self.op().map_streaming(constraints, addr, size, direction) }?;
         match self.check_map_handle(&res, constraints) {
             Ok(()) => Ok(res),
             Err(e) => {
-                unsafe { self.op.unmap_streaming(res) };
+                if let Err(release_err) = unsafe { self.op().try_unmap_streaming(res) } {
+                    log::error!(
+                        "failed to release invalid DMA mapping; mapping quarantined: {release_err}"
+                    );
+                }
                 Err(e)
             }
         }
     }
 
-    pub(crate) unsafe fn unmap_streaming(&self, handle: DmaMapHandle) {
-        unsafe { self.op.unmap_streaming(handle) }
+    pub(crate) unsafe fn unmap_streaming(&self, handle: DmaMapHandle) -> Result<(), DmaError> {
+        unsafe { self.op().try_unmap_streaming(handle) }
     }
 
     pub(crate) fn sync_alloc_for_device(
@@ -148,8 +191,10 @@ impl DeviceDma {
         size: usize,
         direction: DmaDirection,
     ) {
-        self.op
-            .sync_alloc_for_device(handle, offset, size, direction);
+        if self.info.coherency() == DmaCoherency::NonCoherent {
+            self.op()
+                .sync_alloc_for_device(handle, offset, size, direction);
+        }
     }
 
     pub(crate) fn sync_alloc_for_cpu(
@@ -159,7 +204,10 @@ impl DeviceDma {
         size: usize,
         direction: DmaDirection,
     ) {
-        self.op.sync_alloc_for_cpu(handle, offset, size, direction);
+        if self.info.coherency() == DmaCoherency::NonCoherent {
+            self.op()
+                .sync_alloc_for_cpu(handle, offset, size, direction);
+        }
     }
 
     pub(crate) fn sync_map_for_device(
@@ -169,7 +217,8 @@ impl DeviceDma {
         size: usize,
         direction: DmaDirection,
     ) {
-        self.op.sync_map_for_device(handle, offset, size, direction);
+        self.op()
+            .sync_map_for_device(handle, offset, size, direction, self.info.coherency());
     }
 
     pub(crate) fn sync_map_for_cpu(
@@ -179,7 +228,8 @@ impl DeviceDma {
         size: usize,
         direction: DmaDirection,
     ) {
-        self.op.sync_map_for_cpu(handle, offset, size, direction);
+        self.op()
+            .sync_map_for_cpu(handle, offset, size, direction, self.info.coherency());
     }
 
     pub fn coherent_array_zero<T: DmaPod>(&self, len: usize) -> Result<CoherentArray<T>, DmaError> {
@@ -237,26 +287,49 @@ impl DeviceDma {
         ContiguousBox::new_zero_with_align(self, align, direction)
     }
 
-    pub fn map_streaming_slice<T: DmaPod>(
+    pub fn map_streaming_slice<'a, T: DmaPod>(
         &self,
-        buff: &mut [T],
+        buff: &'a mut [T],
         align: usize,
         direction: DmaDirection,
-    ) -> Result<StreamingMap<T>, DmaError> {
+    ) -> Result<StreamingMap<'a, T>, DmaError> {
         StreamingMap::map(self, buff, align, direction)
     }
 
-    pub fn map_streaming_slice_for_device<T: DmaPod>(
+    pub fn map_streaming_slice_for_device<'a, T: DmaPod>(
         &self,
-        buff: &mut [T],
+        buff: &'a mut [T],
         align: usize,
         direction: DmaDirection,
-    ) -> Result<StreamingMap<T>, DmaError> {
+    ) -> Result<StreamingMap<'a, T>, DmaError> {
         let map = self.map_streaming_slice(buff, align, direction)?;
-        map.prepare_for_device_all();
+        map.prepare_for_device(0..map.bytes_len());
         Ok(map)
     }
 
+    /// Maps a caller-owned buffer whose lifetime is managed outside Rust's
+    /// borrow checker, such as an asynchronous request stored by a bus driver.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be aligned and valid for `len` initialized `T` values,
+    /// with exclusive CPU ownership for the mapping lifetime. The allocation
+    /// must remain live and at a stable address until the returned map is
+    /// dropped, including cancellation and error paths. The device must stop
+    /// accessing the buffer before that drop. A translated backend must not
+    /// retain access to these borrowed physical pages after unmap failure;
+    /// use backend-owned bounce pages when invalidation can fail.
+    pub unsafe fn map_streaming_raw<T: DmaPod>(
+        &self,
+        ptr: NonNull<T>,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Result<StreamingMap<'static, T>, DmaError> {
+        unsafe { StreamingMap::map_raw(self, ptr, len, align, direction) }
+    }
+
+    #[cfg(feature = "pool")]
     pub fn contiguous_buffer_pool(
         &self,
         layout: core::alloc::Layout,

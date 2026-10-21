@@ -13,20 +13,21 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-#[cfg(feature = "fs")]
 use std::fs::{self, File, FileType};
-#[cfg(all(feature = "fs", target_os = "none"))]
+#[cfg(target_os = "none")]
 use std::fs::{FileTypeExt, PermissionsExt};
-#[cfg(feature = "fs")]
 use std::io::{self, Read, Write};
-#[cfg(all(feature = "fs", unix))]
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::println;
 use std::string::{String, ToString};
 
-use crate::shell::command::{CommandNode, FlagDef, ParsedCommand};
+use super::HISTORY_USAGE;
+use crate::shell::command::{CommandNode, FlagDef, OptionDef, ParsedCommand};
+use axvisor::shell_fs::{
+    CopyMode, RemoveOptions, collect_directory_entry_names, copy_operands, copy_path,
+    move_file_or_dir, path_basename, remove_path, touch_file,
+};
 
-#[cfg(feature = "fs")]
 macro_rules! print_err {
     ($cmd: literal, $msg: expr) => {
         println!("{}: {}", $cmd, $msg);
@@ -37,7 +38,6 @@ macro_rules! print_err {
 }
 
 // Helper function: split whitespace
-#[cfg(feature = "fs")]
 fn split_whitespace(s: &str) -> (&str, &str) {
     let s = s.trim();
     if let Some(pos) = s.find(char::is_whitespace) {
@@ -48,55 +48,53 @@ fn split_whitespace(s: &str) -> (&str, &str) {
     }
 }
 
-#[cfg(feature = "fs")]
+fn show_ls_entry(path: &str, entry: &str, show_long: bool) -> io::Result<()> {
+    if show_long {
+        let metadata = fs::metadata(path)?;
+        let rwx = file_perm_to_rwx(metadata.permissions().mode());
+        let rwx = unsafe { core::str::from_utf8_unchecked(&rwx) };
+        println!(
+            "{}{} {:>8} {}",
+            file_type_to_char(metadata.file_type()),
+            rwx,
+            metadata.len(),
+            entry
+        );
+    } else {
+        println!("{}", entry);
+    }
+    Ok(())
+}
+
+fn list_one(name: &str, print_name: bool, show_long: bool, show_all: bool) -> io::Result<()> {
+    if !fs::metadata(name)?.is_dir() {
+        return show_ls_entry(name, name, show_long);
+    }
+    let entries = fs::read_dir(name)?;
+
+    if print_name {
+        println!("{}:", name);
+    }
+
+    let entries = collect_directory_entry_names(
+        entries.map(|entry| entry.map(|entry| entry.file_name())),
+        show_all,
+    )?;
+
+    for entry in entries {
+        let entry = entry.to_string_lossy();
+        let path = format!("{name}/{entry}");
+        if let Err(e) = show_ls_entry(&path, &entry, show_long) {
+            print_err!("ls", path, e);
+        }
+    }
+    Ok(())
+}
+
 fn do_ls(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
     let show_long = cmd.flags.contains("long");
     let show_all = cmd.flags.contains("all");
-
-    fn show_entry_info(path: &str, entry: &str, show_long: bool) -> io::Result<()> {
-        if show_long {
-            let metadata = fs::metadata(path)?;
-            let size = metadata.len();
-            let file_type = metadata.file_type();
-            let file_type_char = file_type_to_char(file_type);
-            let rwx = file_perm_to_rwx(metadata.permissions().mode());
-            let rwx = unsafe { core::str::from_utf8_unchecked(&rwx) };
-            println!("{}{} {:>8} {}", file_type_char, rwx, size, entry);
-        } else {
-            println!("{}", entry);
-        }
-        Ok(())
-    }
-
-    fn list_one(name: &str, print_name: bool, show_long: bool, show_all: bool) -> io::Result<()> {
-        use std::vec::Vec;
-
-        let is_dir = fs::metadata(name)?.is_dir();
-        if !is_dir {
-            return show_entry_info(name, name, show_long);
-        }
-
-        if print_name {
-            println!("{}:", name);
-        }
-
-        let mut entries = fs::read_dir(name)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .filter(|name| show_all || !name.to_string_lossy().starts_with('.'))
-            .collect::<Vec<_>>();
-        entries.sort();
-
-        for entry in entries {
-            let entry = entry.to_string_lossy();
-            let path = format!("{name}/{entry}");
-            if let Err(e) = show_entry_info(&path, &entry, show_long) {
-                print_err!("ls", path, e);
-            }
-        }
-        Ok(())
-    }
 
     let targets = if args.is_empty() {
         vec![".".to_string()]
@@ -114,7 +112,6 @@ fn do_ls(cmd: &ParsedCommand) {
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_cat(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
 
@@ -129,7 +126,7 @@ fn do_cat(cmd: &ParsedCommand) {
         loop {
             let n = file.read(&mut buf)?;
             if n > 0 {
-                io::stdout().write_all(&buf[..n])?;
+                crate::shell::submit_shell_bytes(&buf[..n]);
             } else {
                 return Ok(());
             }
@@ -143,7 +140,6 @@ fn do_cat(cmd: &ParsedCommand) {
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_echo(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
     let no_newline = cmd.flags.contains("no-newline");
@@ -176,15 +172,12 @@ fn do_echo(cmd: &ParsedCommand) {
             print_err!("echo", fname, e);
         }
     } else if no_newline {
-        use std::print;
-
         print!("{}", args_str);
     } else {
         println!("{}", args_str);
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_mkdir(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
     let create_parents = cmd.flags.contains("parents");
@@ -209,7 +202,6 @@ fn do_mkdir(cmd: &ParsedCommand) {
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_rm(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
     let rm_dir = cmd.flags.contains("dir");
@@ -221,64 +213,18 @@ fn do_rm(cmd: &ParsedCommand) {
         return;
     }
 
-    fn rm_one(path: &str, rm_dir: bool, recursive: bool, force: bool) -> io::Result<()> {
-        let metadata = fs::metadata(path);
-
-        if force && metadata.is_err() {
-            return Ok(()); // Ignore non-existent files when in force mode
-        }
-
-        let metadata = metadata?;
-
-        if metadata.is_dir() {
-            if recursive {
-                remove_dir_recursive(path, force)
-            } else if rm_dir {
-                fs::remove_dir(path)
-            } else {
-                Err(io::Error::from(io::ErrorKind::Unsupported))
-            }
-        } else {
-            fs::remove_file(path)
-        }
-    }
-
+    let options = RemoveOptions {
+        directory: rm_dir,
+        recursive,
+        force,
+    };
     for path in args {
-        if let Err(e) = rm_one(path, rm_dir, recursive, force)
-            && !force
-        {
+        if let Err(e) = remove_path(path, options) {
             print_err!("rm", format_args!("cannot remove '{path}'"), e);
         }
     }
 }
 
-// Implementation of recursively deleting directories (manual recursion)
-#[cfg(feature = "fs")]
-fn remove_dir_recursive(path: &str, _force: bool) -> io::Result<()> {
-    // Read directory contents
-    let entries = fs::read_dir(path)?;
-
-    // Remove all child items
-    for entry_result in entries {
-        let entry = entry_result?;
-        let entry_name = entry.file_name();
-        let entry_path = format!("{}/{}", path, entry_name.to_string_lossy());
-        let metadata = entry.file_type()?;
-
-        if metadata.is_dir() {
-            // Recursively delete subdirectory
-            remove_dir_recursive(&entry_path, _force)?;
-        } else {
-            // Delete file
-            fs::remove_file(&entry_path)?;
-        }
-    }
-
-    // Delete empty directory
-    fs::remove_dir(path)
-}
-
-#[cfg(feature = "fs")]
 fn do_cd(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
 
@@ -296,7 +242,6 @@ fn do_cd(cmd: &ParsedCommand) {
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_pwd(cmd: &ParsedCommand) {
     let _logical = cmd.flags.contains("logical");
 
@@ -353,7 +298,7 @@ fn do_exit(cmd: &ParsedCommand) {
     };
 
     println!("Bye~");
-    std::process::exit(exit_code);
+    super::shutdown(exit_code);
 }
 
 fn do_log(cmd: &ParsedCommand) {
@@ -381,7 +326,6 @@ fn do_log(cmd: &ParsedCommand) {
     println!("Log level set to: {:?}", log::max_level());
 }
 
-#[cfg(feature = "fs")]
 fn do_mv(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
 
@@ -400,7 +344,13 @@ fn do_mv(cmd: &ParsedCommand) {
             && dest_meta.is_dir()
         {
             // Move source into destination directory
-            let source_name = path_basename(source);
+            let source_name = match path_basename(source) {
+                Ok(source_name) => source_name,
+                Err(e) => {
+                    print_err!("mv", format_args!("cannot access '{source}'"), e);
+                    return;
+                }
+            };
             let dest_path = format!("{dest}/{source_name}");
             if let Err(e) = move_file_or_dir(source, &dest_path) {
                 print_err!(
@@ -426,7 +376,13 @@ fn do_mv(cmd: &ParsedCommand) {
             Ok(meta) if meta.is_dir() => {
                 // Move each source into destination directory
                 for source in sources {
-                    let source_name = path_basename(source);
+                    let source_name = match path_basename(source) {
+                        Ok(source_name) => source_name,
+                        Err(e) => {
+                            print_err!("mv", format_args!("cannot access '{source}'"), e);
+                            continue;
+                        }
+                    };
                     let dest_path = format!("{dest}/{source_name}");
                     if let Err(e) = move_file_or_dir(source, &dest_path) {
                         print_err!(
@@ -447,40 +403,6 @@ fn do_mv(cmd: &ParsedCommand) {
     }
 }
 
-#[cfg(feature = "fs")]
-fn path_basename(path: &str) -> &str {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(path)
-}
-
-// Helper function to move file or directory (handles cross-filesystem moves)
-#[cfg(feature = "fs")]
-fn move_file_or_dir(source: &str, dest: &str) -> io::Result<()> {
-    // Try simple rename first (works within same filesystem)
-    match fs::rename(source, dest) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // If rename fails, try copy + delete (for cross-filesystem moves)
-            let src_meta = fs::metadata(source)?;
-
-            if src_meta.is_dir() {
-                // For directories, use recursive copy then remove
-                copy_dir_recursive(source, dest)?;
-                remove_dir_recursive(source, false)?;
-            } else {
-                // For files, copy then remove
-                copy_file(source, dest)?;
-                fs::remove_file(source)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-#[cfg(feature = "fs")]
 fn do_touch(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
 
@@ -490,93 +412,34 @@ fn do_touch(cmd: &ParsedCommand) {
     }
 
     for filename in args {
-        if let Err(e) = File::create(filename) {
+        if let Err(e) = touch_file(filename) {
             print_err!("touch", filename, e);
         }
     }
 }
 
-#[cfg(feature = "fs")]
 fn do_cp(cmd: &ParsedCommand) {
     let args = &cmd.positional_args;
     let recursive = cmd.flags.contains("recursive");
 
-    if args.len() < 2 {
-        print_err!("cp", "missing operand");
-        return;
-    }
-
-    let source = &args[0];
-    let dest = &args[1];
-
-    // Check if source file/directory exists
-    let src_metadata = match fs::metadata(source) {
-        Ok(metadata) => metadata,
+    let (source, dest) = match copy_operands(args) {
+        Ok(operands) => operands,
         Err(e) => {
-            print_err!("cp", format_args!("cannot access '{source}'"), e);
+            print_err!("cp", e);
             return;
         }
     };
-
-    let result = if src_metadata.is_dir() {
-        if recursive {
-            copy_dir_recursive(source, dest)
-        } else {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
-        }
+    let mode = if recursive {
+        CopyMode::Recursive
     } else {
-        copy_file(source, dest)
+        CopyMode::File
     };
 
-    if let Err(e) = result {
+    if let Err(e) = copy_path(source, dest, mode) {
         print_err!("cp", format_args!("cannot copy '{source}' to '{dest}'"), e);
     }
 }
 
-// Manually implement file copy
-#[cfg(feature = "fs")]
-fn copy_file(src: &str, dst: &str) -> io::Result<()> {
-    let mut src_file = File::open(src)?;
-    let mut dst_file = File::create(dst)?;
-
-    let mut buffer = [0; 4096];
-    loop {
-        let bytes_read = src_file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        dst_file.write_all(&buffer[..bytes_read])?;
-    }
-    Ok(())
-}
-
-// Recursively copy directory
-#[cfg(feature = "fs")]
-fn copy_dir_recursive(src: &str, dst: &str) -> io::Result<()> {
-    // Create target directory
-    fs::create_dir(dst)?;
-
-    // Read source directory contents
-    let entries = fs::read_dir(src)?;
-
-    for entry_result in entries {
-        let entry = entry_result?;
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        let src_path = format!("{src}/{file_name}");
-        let dst_path = format!("{dst}/{file_name}");
-
-        let metadata = entry.file_type()?;
-        if metadata.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            copy_file(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "fs")]
 fn file_type_to_char(ty: FileType) -> char {
     if ty.is_char_device() {
         'c'
@@ -598,7 +461,6 @@ fn file_type_to_char(ty: FileType) -> char {
 }
 
 #[rustfmt::skip]
-#[cfg(feature = "fs")]
 const fn file_perm_to_rwx(mode: u32) -> [u8; 9] {
     let mut perm = [b'-'; 9];
     macro_rules! set {
@@ -617,7 +479,6 @@ const fn file_perm_to_rwx(mode: u32) -> [u8; 9] {
 
 pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     // ls Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "ls".to_string(),
         CommandNode::new("List directory contents")
@@ -636,7 +497,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // cat Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "cat".to_string(),
         CommandNode::new("Display file contents")
@@ -645,7 +505,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // echo Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "echo".to_string(),
         CommandNode::new("Display text")
@@ -659,7 +518,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // mkdir Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "mkdir".to_string(),
         CommandNode::new("Create directories")
@@ -673,7 +531,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // rm Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "rm".to_string(),
         CommandNode::new("Remove files and directories")
@@ -697,7 +554,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // cd Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "cd".to_string(),
         CommandNode::new("Change directory")
@@ -706,7 +562,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // pwd Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "pwd".to_string(),
         CommandNode::new("Print working directory")
@@ -750,6 +605,23 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
             .with_usage("exit [EXIT_CODE]"),
     );
 
+    // The handler lives in the built-in dispatcher because it needs mutable
+    // access to the console-local command history.
+    tree.insert(
+        "history".to_string(),
+        CommandNode::new("Show command history")
+            .with_usage(HISTORY_USAGE)
+            .with_flag(FlagDef::new("clear", "Clear command history").with_short('c'))
+            .with_option(OptionDef::new(
+                "-N",
+                "Show only the last N entries; N is a positive decimal integer",
+            ))
+            .with_option(OptionDef::new(
+                "| grep PATTERN",
+                "Filter entries by a case-sensitive literal substring",
+            )),
+    );
+
     // log Command
     tree.insert(
         "log".to_string(),
@@ -759,7 +631,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // touch Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "touch".to_string(),
         CommandNode::new("Create empty files")
@@ -768,7 +639,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // cp Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "cp".to_string(),
         CommandNode::new("Copy files")
@@ -782,7 +652,6 @@ pub fn build_base_cmd(tree: &mut BTreeMap<String, CommandNode>) {
     );
 
     // mv Command
-    #[cfg(feature = "fs")]
     tree.insert(
         "mv".to_string(),
         CommandNode::new("Move/rename files")

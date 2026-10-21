@@ -1,8 +1,34 @@
 use alloc::format;
-#[cfg(virtio_dev)]
+#[cfg(any(virtio_dev, feature = "arm-smmu-v3"))]
 use alloc::sync::Arc;
+#[cfg(feature = "arm-smmu-v3")]
+use alloc::{collections::BTreeMap, vec::Vec};
 
-use ax_kspin::SpinRaw as Mutex;
+use ax_sync::{RawSpinLock, RawSpinLockUnpinnedGuard};
+#[cfg(any(
+    feature = "arm-smmu-v3",
+    feature = "ahci",
+    feature = "intel-net",
+    feature = "nvme",
+    feature = "intel-hda",
+    feature = "realtek-rtl8125",
+    feature = "xhci-pci",
+    all(feature = "net", feature = "pci")
+))]
+use dma_api::DeviceDma;
+#[cfg(any(
+    feature = "arm-smmu-v3",
+    feature = "ahci",
+    feature = "intel-net",
+    feature = "nvme",
+    feature = "intel-hda",
+    feature = "realtek-rtl8125",
+    feature = "xhci-pci",
+    all(feature = "net", feature = "pci")
+))]
+use dma_api::DmaCoherency;
+#[cfg(feature = "arm-smmu-v3")]
+use dma_api::DmaOp;
 use heapless::Vec as ArrayVec;
 use mmio_api::MmioOp;
 #[cfg(any(test, virtio_dev))]
@@ -32,15 +58,177 @@ use crate::virtio::VirtIoHalImpl;
 
 mod acpi;
 mod fdt;
+#[cfg(feature = "arm-smmu-v3")]
+mod iommu_dma;
 pub mod msi;
+#[cfg(feature = "arm-smmu-v3")]
+mod smmu;
+#[cfg(feature = "arm-smmu-v3")]
+mod testdev;
 pub(crate) use acpi::acpi_irq_for_endpoint;
 pub(crate) use fdt::fdt_irq_for_endpoint;
+#[cfg(feature = "iommu-dma-test")]
+pub use iommu_dma::verify_failure_paths as verify_iommu_dma_failure_paths;
 pub use msi::{PciIrqLease, PciMsiTarget, PciMsixAllocation};
 
 const MAX_PCIE_LEGACY_IRQS: usize = 8;
 #[cfg(virtio_dev)]
 const MAX_TAKEN_ENDPOINT_CONFIGS: usize = 16;
+
+fn raw_lock<T>(lock: &RawSpinLock<T>) -> RawSpinLockUnpinnedGuard<'_, T> {
+    // SAFETY: PCI discovery/configuration excludes same-CPU re-entry around
+    // each transaction; the raw lock serializes concurrent CPUs.
+    unsafe { lock.lock_raw() }
+}
 const PCI_INTX_LINES: usize = 4;
+
+#[cfg(any(
+    feature = "ahci",
+    feature = "intel-net",
+    feature = "nvme",
+    feature = "intel-hda",
+    feature = "realtek-rtl8125",
+    feature = "xhci-pci",
+    all(feature = "net", feature = "pci")
+))]
+pub(crate) fn device_dma(info: PciInfo, dma_mask: u64) -> Result<DeviceDma, OnProbeError> {
+    #[cfg(feature = "arm-smmu-v3")]
+    if info.iommu.is_some() {
+        return bound_dma_with_coherency(info.address, dma_mask, dma_coherency(info));
+    }
+    if info.iommu.is_some() {
+        return Err(OnProbeError::other(format!(
+            "PCI endpoint {} requires an IOMMU, but no DMA backend is available",
+            info.address
+        )));
+    }
+    Ok(axklib::dma::device(dma_api::DmaDeviceInfo::new(
+        dma_api::DmaDomainId::Direct,
+        dma_coherency(info),
+        dma_api::DmaConstraints::new(dma_mask),
+    )))
+}
+
+#[cfg(feature = "arm-smmu-v3")]
+static IOMMU_DMA: RawSpinLock<BTreeMap<PciAddress, Arc<iommu_dma::IommuDma>>> =
+    RawSpinLock::new(BTreeMap::new());
+
+#[cfg(feature = "arm-smmu-v3")]
+fn iommu_backend(address: PciAddress) -> Result<Arc<iommu_dma::IommuDma>, OnProbeError> {
+    let mut backends = raw_lock(&IOMMU_DMA);
+    if let Some(backend) = backends.get(&address) {
+        return Ok(backend.clone());
+    }
+    let domain = rdrive::probe::pci::bound_iommu_domain(address).ok_or_else(|| {
+        OnProbeError::other(format!("PCI endpoint {address} has no bound IOMMU domain"))
+    })?;
+    let backend = Arc::new(iommu_dma::IommuDma::new(domain));
+    backends.insert(address, backend.clone());
+    Ok(backend)
+}
+
+#[cfg(feature = "arm-smmu-v3")]
+fn bound_dma_with_coherency(
+    address: PciAddress,
+    mask: u64,
+    coherency: DmaCoherency,
+) -> Result<DeviceDma, OnProbeError> {
+    let backend = iommu_backend(address)?;
+    let info = dma_api::DmaDeviceInfo::new(
+        backend.domain_id(),
+        coherency,
+        dma_api::DmaConstraints::new(mask),
+    );
+    backend
+        .device(info)
+        .map_err(|err| OnProbeError::other(format!("PCI DMA backend failed: {err}")))
+}
+
+/// Returns the DMA capability already bound to a PCI requester.
+#[cfg(feature = "arm-smmu-v3")]
+pub fn bound_dma(address: PciAddress, mask: u64) -> Result<DeviceDma, OnProbeError> {
+    bound_dma_with_coherency(address, mask, DmaCoherency::Coherent)
+}
+
+#[cfg(feature = "arm-smmu-v3")]
+pub(crate) fn dma_for_info(info: dma_api::DmaDeviceInfo) -> Result<DeviceDma, dma_api::DmaError> {
+    let backend = raw_lock(&IOMMU_DMA)
+        .values()
+        .find(|backend| backend.domain_id() == info.domain())
+        .cloned()
+        .ok_or(dma_api::DmaError::DomainMismatch {
+            requested: info.domain(),
+            backend: dma_api::DmaDomainId::Direct,
+        })?;
+    backend.device(info)
+}
+
+/// Diagnostics for translated PCI requesters that have acquired a DMA backend.
+#[cfg(feature = "arm-smmu-v3")]
+pub fn bound_pci_endpoints() -> Vec<(PciAddress, dma_api::DmaDomainId)> {
+    raw_lock(&IOMMU_DMA)
+        .iter()
+        .map(|(address, backend)| (*address, backend.domain_id()))
+        .collect()
+}
+
+/// Drains the controller event queue and returns its cumulative fault count.
+#[cfg(feature = "arm-smmu-v3")]
+pub fn iommu_fault_count(address: PciAddress) -> Result<u64, OnProbeError> {
+    if rdrive::probe::pci::bound_iommu_domain(address).is_none() {
+        return Err(OnProbeError::other(format!(
+            "PCI endpoint {address} has no IOMMU domain"
+        )));
+    }
+    smmu::fault_count()
+}
+
+/// One decoded SMMU event queue entry for PCI diagnostics.
+#[cfg(feature = "arm-smmu-v3")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciIommuFault {
+    pub stream_id: u32,
+    pub address: u64,
+    pub event_id: u8,
+}
+
+/// Drains fault records for the controller serving a bound PCI requester.
+#[cfg(feature = "arm-smmu-v3")]
+pub fn iommu_drain_faults(address: PciAddress) -> Result<Vec<PciIommuFault>, OnProbeError> {
+    if rdrive::probe::pci::bound_iommu_domain(address).is_none() {
+        return Err(OnProbeError::other(format!(
+            "PCI endpoint {address} has no IOMMU domain"
+        )));
+    }
+    Ok(smmu::drain_faults()?
+        .into_iter()
+        .map(|fault| PciIommuFault {
+            stream_id: fault.stream.0,
+            address: fault.address,
+            event_id: fault.event_id,
+        })
+        .collect())
+}
+
+#[cfg(feature = "arm-smmu-v3")]
+pub use testdev::iommu_testdev_endpoint;
+
+#[cfg(any(
+    feature = "ahci",
+    feature = "intel-net",
+    feature = "nvme",
+    feature = "intel-hda",
+    feature = "realtek-rtl8125",
+    feature = "xhci-pci",
+    all(feature = "net", feature = "pci")
+))]
+pub(crate) const fn dma_coherency(info: PciInfo) -> DmaCoherency {
+    if info.dma_coherent {
+        DmaCoherency::Coherent
+    } else {
+        DmaCoherency::NonCoherent
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LegacyIrq {
@@ -163,11 +351,12 @@ impl LegacyIrqRoute {
     }
 }
 
-static LEGACY_IRQ_ROUTES: Mutex<ArrayVec<LegacyIrqRoute, MAX_PCIE_LEGACY_IRQS>> =
-    Mutex::new(ArrayVec::new());
+static LEGACY_IRQ_ROUTES: RawSpinLock<ArrayVec<LegacyIrqRoute, MAX_PCIE_LEGACY_IRQS>> =
+    RawSpinLock::new(ArrayVec::new());
 #[cfg(virtio_dev)]
-static TAKEN_ENDPOINT_CONFIGS: Mutex<ArrayVec<TakenEndpointConfig, MAX_TAKEN_ENDPOINT_CONFIGS>> =
-    Mutex::new(ArrayVec::new());
+static TAKEN_ENDPOINT_CONFIGS: RawSpinLock<
+    ArrayVec<TakenEndpointConfig, MAX_TAKEN_ENDPOINT_CONFIGS>,
+> = RawSpinLock::new(ArrayVec::new());
 
 pub const DEVICE_NAME: &str = "pci-ecam";
 
@@ -183,8 +372,8 @@ pub const fn has_pci_endpoint_drivers() -> bool {
         feature = "intel-net",
         feature = "realtek-rtl8125",
         feature = "nvme",
+        feature = "intel-hda",
         feature = "xhci-pci",
-        feature = "virtio-blk",
         feature = "virtio-net",
         feature = "virtio-gpu",
         feature = "virtio-input",
@@ -231,6 +420,7 @@ pub fn register_ecam_controller(
     ecam_size: usize,
     mem32: Option<PciMem32>,
     mem64: Option<PciMem64>,
+    dma_coherent: bool,
 ) -> Result<(), OnProbeError> {
     register_ecam_controller_with_mmio_op(
         plat_dev,
@@ -238,6 +428,7 @@ pub fn register_ecam_controller(
         ecam_size,
         mem32,
         mem64,
+        dma_coherent,
         axklib::mmio::op(),
     )
 }
@@ -248,6 +439,7 @@ pub fn register_ecam_controller_with_mmio_op(
     ecam_size: usize,
     mem32: Option<PciMem32>,
     mem64: Option<PciMem64>,
+    dma_coherent: bool,
     mmio_op: &'static dyn MmioOp,
 ) -> Result<(), OnProbeError> {
     if !has_pci_endpoint_drivers() {
@@ -260,6 +452,7 @@ pub fn register_ecam_controller_with_mmio_op(
 
     let mut controller = rdrive::probe::pci::new_driver_generic(ecam_base, ecam_size, mmio_op)
         .map_err(|err| OnProbeError::other(format!("failed to create PCIe controller: {err:?}")))?;
+    controller.set_dma_coherent(dma_coherent);
 
     if let Some(mem32) = mem32 {
         controller.set_mem32(mem32, false);
@@ -296,7 +489,7 @@ pub fn prepare_intx_passthrough(info: PciInfo) -> Result<(), OnProbeError> {
         }
 
         let bdf = as_device_function(info.address);
-        let configs = TAKEN_ENDPOINT_CONFIGS.lock();
+        let configs = raw_lock(&TAKEN_ENDPOINT_CONFIGS);
         let config = configs
             .iter()
             .find(|config| config.bdf == bdf)
@@ -329,7 +522,7 @@ pub fn unmask_intx_passthrough(info: PciInfo) -> Result<(), OnProbeError> {
         }
 
         let bdf = as_device_function(info.address);
-        let configs = TAKEN_ENDPOINT_CONFIGS.lock();
+        let configs = raw_lock(&TAKEN_ENDPOINT_CONFIGS);
         let config = configs
             .iter()
             .find(|config| config.bdf == bdf)
@@ -458,15 +651,13 @@ fn select_dynamic_pci_irq_source(has_acpi: bool, has_fdt: bool) -> Option<Dynami
 }
 
 pub fn legacy_irq_for_endpoint(info: PciInfo) -> Option<usize> {
-    LEGACY_IRQ_ROUTES
-        .lock()
+    raw_lock(&LEGACY_IRQ_ROUTES)
         .iter()
         .find_map(|route| route.irq_for(info))
 }
 
 fn native_legacy_binding_for_endpoint(info: PciInfo) -> Option<BindingIrq> {
-    LEGACY_IRQ_ROUTES
-        .lock()
+    raw_lock(&LEGACY_IRQ_ROUTES)
         .iter()
         .find_map(|route| route.native_binding_for(info))
 }
@@ -476,6 +667,8 @@ pub fn legacy_irq_for_address(address: PciAddress) -> Option<usize> {
         address,
         interrupt_pin: 1,
         interrupt_line: 0,
+        dma_coherent: false,
+        iommu: None,
         intx_route: Some(rdrive::probe::pci::PciIntxRoute {
             root_device: address.device(),
             root_function: address.function(),
@@ -506,10 +699,6 @@ mod tests {
     use alloc::string::ToString;
     use core::cell::Cell;
 
-    use axklib::{
-        AxError, AxResult, BoxedIrqHandler, ConcurrentBoxedIrqHandler, IrqCpuMask, IrqHandle,
-        IrqId, Klib, PhysAddr, VirtAddr, impl_trait,
-    };
     use rdrive::probe::{
         OnProbeError,
         pci::{PciAddress, PciInfo, PciIntxRoute},
@@ -522,85 +711,6 @@ mod tests {
         unmask_intx_passthrough_command,
     };
     use crate::{BindingIrq, BindingIrqSource};
-    struct KlibImpl;
-    impl_trait! {
-        impl Klib for KlibImpl {
-            fn mem_iomap(_addr: PhysAddr, _size: usize) -> AxResult<VirtAddr> {
-                Err(AxError::Unsupported)
-            }
-
-            fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr {
-                PhysAddr::from_usize(addr.as_usize())
-            }
-
-            fn mem_make_dma_coherent_uncached(_addr: VirtAddr, _size: usize) -> AxResult {
-                Err(AxError::Unsupported)
-            }
-
-            fn mem_restore_dma_cached(_addr: VirtAddr, _size: usize) -> AxResult {
-                Err(AxError::Unsupported)
-            }
-
-            fn dma_alloc_pages(
-                _dma_mask: u64,
-                _num_pages: usize,
-                _align: usize,
-            ) -> AxResult<VirtAddr> {
-                Err(AxError::Unsupported)
-            }
-
-            fn dma_dealloc_pages(_addr: VirtAddr, _num_pages: usize) {}
-
-            fn time_busy_wait(_dur: core::time::Duration) {}
-
-            fn time_monotonic_nanos() -> u64 {
-                0
-            }
-
-            fn time_try_init_epoch_offset(_epoch_time_nanos: u64) -> bool {
-                false
-            }
-
-            fn irq_set_enable(_irq: IrqId, _enabled: bool) -> axklib::AxResult {
-                Ok(())
-            }
-
-            fn irq_request_shared(
-                _irq: IrqId,
-                _handler: BoxedIrqHandler,
-            ) -> AxResult<IrqHandle> {
-                Err(AxError::Unsupported)
-            }
-
-            fn irq_request_shared_disabled(
-                _irq: IrqId,
-                _handler: BoxedIrqHandler,
-            ) -> AxResult<IrqHandle> {
-                Err(AxError::Unsupported)
-            }
-
-            fn irq_request_percpu(
-                _irq: IrqId,
-                _cpus: IrqCpuMask,
-                _handler: ConcurrentBoxedIrqHandler,
-            ) -> AxResult<IrqHandle> {
-                Err(AxError::Unsupported)
-            }
-
-            fn irq_free(_handle: IrqHandle) -> AxResult {
-                Err(AxError::Unsupported)
-            }
-
-            fn irq_enable(_handle: IrqHandle) -> AxResult {
-                Err(AxError::Unsupported)
-            }
-
-            fn irq_disable(_handle: IrqHandle) -> AxResult {
-                Err(AxError::Unsupported)
-            }
-        }
-    }
-
     #[test]
     fn x86_64_legacy_line_uses_dynamic_ioapic_base() {
         assert_eq!(legacy_line_to_irq_for_platform(9, true), 0x39);
@@ -618,6 +728,8 @@ mod tests {
             address: PciAddress::new(0, 2, 7, 0),
             interrupt_pin: 1,
             interrupt_line: 0,
+            dma_coherent: false,
+            iommu: None,
             intx_route: Some(PciIntxRoute {
                 root_device: 2,
                 root_function: 0,
@@ -635,6 +747,8 @@ mod tests {
             address: PciAddress::new(0, 2, 7, 0),
             interrupt_pin: 1,
             interrupt_line: 0,
+            dma_coherent: false,
+            iommu: None,
             intx_route: None,
         };
 
@@ -1023,6 +1137,8 @@ mod tests {
             address: PciAddress::new(0, 2, 7, 0),
             interrupt_pin: 1,
             interrupt_line: 9,
+            dma_coherent: false,
+            iommu: None,
             intx_route: Some(PciIntxRoute {
                 root_device: 2,
                 root_function: 0,
@@ -1040,7 +1156,7 @@ pub fn register_legacy_irq_routes(bus_start: u8, bus_end: u8, irqs: &[usize]) {
         return;
     };
 
-    let mut routes = LEGACY_IRQ_ROUTES.lock();
+    let mut routes = raw_lock(&LEGACY_IRQ_ROUTES);
     if routes
         .iter()
         .any(|route| route.matches_irqs(bus_start, bus_end, irqs))
@@ -1067,7 +1183,7 @@ pub fn register_native_legacy_irq_route(
         return;
     };
 
-    let mut routes = LEGACY_IRQ_ROUTES.lock();
+    let mut routes = raw_lock(&LEGACY_IRQ_ROUTES);
     if routes
         .iter()
         .any(|route| route.matches_legacy_irqs(bus_start, bus_end, core::slice::from_ref(&irq)))
@@ -1087,6 +1203,7 @@ pub fn take_virtio_transport(
     expected: DeviceType,
 ) -> Result<impl Transport + 'static, OnProbeError> {
     take_virtio_transport_with_intx_policy(endpoint, expected, false)
+        .map(|(transport, _)| transport)
 }
 
 #[cfg(virtio_dev)]
@@ -1094,7 +1211,45 @@ pub fn take_virtio_transport_masked(
     endpoint: &mut EndpointRc,
     expected: DeviceType,
 ) -> Result<impl Transport + 'static, OnProbeError> {
-    take_virtio_transport_with_intx_policy(endpoint, expected, true)
+    take_virtio_transport_with_intx_policy(endpoint, expected, true).map(|(transport, _)| transport)
+}
+
+/// Transfers the masked input function together with its INTx ownership.
+#[cfg(feature = "virtio-input")]
+pub(crate) fn take_virtio_input_transport(
+    endpoint: &mut EndpointRc,
+) -> Result<(impl Transport + 'static, InputIntxControl), OnProbeError> {
+    let (transport, access) =
+        take_virtio_transport_with_intx_policy(endpoint, DeviceType::Input, true)?;
+    Ok((transport, InputIntxControl(access)))
+}
+
+/// Keeps PCI input interrupts masked until the consumer installs its action.
+#[cfg(feature = "virtio-input")]
+pub(crate) struct InputIntxControl(EndpointConfigAccess);
+
+#[cfg(feature = "virtio-input")]
+impl InputIntxControl {
+    pub(crate) fn enable(&mut self) {
+        self.0.update_command(|mut command| {
+            command.remove(CommandRegister::INTERRUPT_DISABLE);
+            command
+        });
+    }
+
+    pub(crate) fn disable(&mut self) {
+        self.0.update_command(|mut command| {
+            command.insert(CommandRegister::INTERRUPT_DISABLE);
+            command
+        });
+    }
+}
+
+#[cfg(feature = "virtio-input")]
+impl Drop for InputIntxControl {
+    fn drop(&mut self) {
+        self.disable();
+    }
 }
 
 #[cfg(virtio_dev)]
@@ -1102,7 +1257,7 @@ fn take_virtio_transport_with_intx_policy(
     endpoint: &mut EndpointRc,
     expected: DeviceType,
     mask_intx_after_match: bool,
-) -> Result<impl Transport + 'static, OnProbeError> {
+) -> Result<(PciTransport, EndpointConfigAccess), OnProbeError> {
     match (endpoint.vendor_id(), endpoint.device_id()) {
         (0x1af4, 0x1000..=0x107f) => {}
         _ => return Err(OnProbeError::NotMatch),
@@ -1115,6 +1270,13 @@ fn take_virtio_transport_with_intx_policy(
         return Err(OnProbeError::NotMatch);
     }
 
+    if rdrive::probe::pci::bound_iommu_domain(endpoint.address()).is_some() {
+        return Err(OnProbeError::other(format!(
+            "VirtIO PCI endpoint {bdf} requires translated DMA, which VirtIoHalImpl does not \
+             support"
+        )));
+    }
+
     if mask_intx_after_match {
         mask_intx(endpoint);
     }
@@ -1123,17 +1285,18 @@ fn take_virtio_transport_with_intx_policy(
     let config_access = EndpointConfigAccess::new(bdf, endpoint.take());
     remember_taken_endpoint_config(&config_access);
 
-    let mut root = PciRoot::new(config_access);
-    PciTransport::new::<VirtIoHalImpl, _>(&mut root, bdf).map_err(|err| {
+    let mut root = PciRoot::new(config_access.clone_for_handoff());
+    let transport = PciTransport::new::<VirtIoHalImpl, _>(&mut root, bdf).map_err(|err| {
         OnProbeError::other(format!(
             "failed to create VirtIO PCI transport at {bdf}: {err:?}"
         ))
-    })
+    })?;
+    Ok((transport, config_access))
 }
 
 #[cfg(virtio_dev)]
 fn remember_taken_endpoint_config(access: &EndpointConfigAccess) {
-    let mut configs = TAKEN_ENDPOINT_CONFIGS.lock();
+    let mut configs = raw_lock(&TAKEN_ENDPOINT_CONFIGS);
     if let Some(config) = configs.iter_mut().find(|config| config.bdf == access.bdf) {
         config.access = access.clone_for_handoff();
         return;
@@ -1206,7 +1369,7 @@ struct TakenEndpointConfig {
 #[cfg(virtio_dev)]
 struct EndpointConfigAccess {
     bdf: DeviceFunction,
-    endpoint: Arc<Mutex<Endpoint>>,
+    endpoint: Arc<RawSpinLock<Endpoint>>,
 }
 
 #[cfg(virtio_dev)]
@@ -1214,7 +1377,7 @@ impl EndpointConfigAccess {
     fn new(bdf: DeviceFunction, endpoint: Endpoint) -> Self {
         Self {
             bdf,
-            endpoint: Arc::new(Mutex::new(endpoint)),
+            endpoint: Arc::new(RawSpinLock::new(endpoint)),
         }
     }
 
@@ -1232,7 +1395,7 @@ impl EndpointConfigAccess {
     where
         F: FnOnce(CommandRegister) -> CommandRegister,
     {
-        self.endpoint.lock().update_command(f);
+        raw_lock(&self.endpoint).update_command(f);
     }
 }
 
@@ -1240,12 +1403,12 @@ impl EndpointConfigAccess {
 impl ConfigurationAccess for EndpointConfigAccess {
     fn read_word(&self, device_function: DeviceFunction, register_offset: u8) -> u32 {
         self.assert_same_function(device_function);
-        self.endpoint.lock().read(register_offset.into())
+        raw_lock(&self.endpoint).read(register_offset.into())
     }
 
     fn write_word(&mut self, device_function: DeviceFunction, register_offset: u8, data: u32) {
         self.assert_same_function(device_function);
-        self.endpoint.lock().write(register_offset.into(), data);
+        raw_lock(&self.endpoint).write(register_offset.into(), data);
     }
 
     unsafe fn unsafe_clone(&self) -> Self {
@@ -1254,4 +1417,146 @@ impl ConfigurationAccess for EndpointConfigAccess {
             endpoint: Arc::clone(&self.endpoint),
         }
     }
+}
+
+/// A virtio device shared-memory region (e.g. the virtio-gpu hostmem
+/// BAR backing mappable blob resources), resolved from the PCI
+/// `SHARED_MEMORY_CFG` vendor capability.
+#[cfg(virtio_dev)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioShmRegion {
+    /// Guest-physical base address (BAR value + capability offset).
+    pub phys: u64,
+    pub length: u64,
+}
+
+/// PCI vendor-capability subtype carrying a shared memory region.
+#[cfg(virtio_dev)]
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
+/// Legacy PCI capability list id for vendor-specific capabilities.
+#[cfg(virtio_dev)]
+const PCI_CAP_ID_VNDR: u8 = 0x09;
+/// Config-space offset of the first PCI BAR.
+#[cfg(virtio_dev)]
+const PCI_BAR_OFFSET: u8 = 0x10;
+/// `sizeof(struct virtio_pci_cap64)`: the only capability length Linux
+/// accepts for a `SHARED_MEMORY_CFG` region (`virtio_pci_find_shm_cap`).
+#[cfg(virtio_dev)]
+const VIRTIO_PCI_CAP64_LEN: u8 = 24;
+
+/// Like [`take_virtio_transport_masked`], but also walks the virtio
+/// vendor capabilities and resolves the shared memory region with the
+/// requested `shm_id` (e.g. `VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1`).
+#[cfg(virtio_dev)]
+pub fn take_virtio_transport_masked_with_shm(
+    endpoint: &mut EndpointRc,
+    expected: DeviceType,
+    shm_id: u8,
+) -> Result<(PciTransport, Option<VirtioShmRegion>), OnProbeError> {
+    let (transport, shm) =
+        take_virtio_transport_with_intx_policy_and_shm(endpoint, expected, true, shm_id)?;
+    Ok((transport, shm))
+}
+
+#[cfg(virtio_dev)]
+fn take_virtio_transport_with_intx_policy_and_shm(
+    endpoint: &mut EndpointRc,
+    expected: DeviceType,
+    mask_intx_after_match: bool,
+    shm_id: u8,
+) -> Result<(PciTransport, Option<VirtioShmRegion>), OnProbeError> {
+    let (transport, config_access) =
+        take_virtio_transport_with_intx_policy(endpoint, expected, mask_intx_after_match)?;
+    // Parse the shared-memory capability from the retained config access.
+    // QEMU exposes the virtio-gpu hostmem BAR this way; the capability
+    // walk only needs config space, which the retained access keeps.
+    let shm = parse_virtio_shm_cap(&config_access, config_access.bdf, shm_id);
+    Ok((transport, shm))
+}
+
+/// Walks the PCI capability list looking for a virtio vendor capability
+/// of subtype `SHARED_MEMORY_CFG` with the given shm id, and resolves it
+/// to a guest-physical address range.
+#[cfg(virtio_dev)]
+fn parse_virtio_shm_cap(
+    access: &EndpointConfigAccess,
+    bdf: DeviceFunction,
+    want_shm_id: u8,
+) -> Option<VirtioShmRegion> {
+    // Capability pointer lives at config offset 0x34, lower two bits
+    // reserved-zero.
+    let mut next = Some((access.read_word(bdf, 0x34) as u8) & 0xfc);
+    while let Some(off) = next {
+        let header = access.read_word(bdf, off);
+        let cap_id = header as u8;
+        let next_off = (header >> 8) as u8;
+        let cap_len = (header >> 16) as u8;
+        let cfg_type = (header >> 24) as u8;
+
+        if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG {
+            // Linux `virtio_pci_find_shm_cap` accepts the cap64 form only:
+            // a capability whose length is not exactly
+            // `sizeof(struct virtio_pci_cap64)` is malformed and skipped, so
+            // words beyond the capability never leak into the window (a
+            // 16-byte cap has no hi words; 17..23 would read config space
+            // past the capability).
+            if cap_len == VIRTIO_PCI_CAP64_LEN {
+                // virtio_pci_cap: bar@4, id@5, offset@8, length@12; the
+                // cap64 extension appends offset_hi@16, length_hi@20.
+                let bar_and_id = access.read_word(bdf, off + 4);
+                let bar_index = bar_and_id as u8;
+                let shm_id = (bar_and_id >> 8) as u8;
+                let offset = access.read_word(bdf, off + 8) as u64
+                    | ((access.read_word(bdf, off + 16) as u64) << 32);
+                let length = access.read_word(bdf, off + 12) as u64
+                    | ((access.read_word(bdf, off + 20) as u64) << 32);
+                if shm_id == want_shm_id
+                    && bar_index < 6
+                    && length > 0
+                    && let Some(base) = bar_physical_address(access, bdf, bar_index)
+                    // A window ending past the physical address space would
+                    // defeat every downstream bound check; a wrapping base
+                    // means the BAR or offset is garbage, so no hostmem.
+                    && let Some(phys) = base.checked_add(offset)
+                {
+                    return Some(VirtioShmRegion { phys, length });
+                }
+            } else {
+                log::warn!(
+                    "pci: skipping malformed SHARED_MEMORY_CFG capability at offset {off:#x} \
+                     (cap_len {cap_len})"
+                );
+            }
+        }
+
+        next = match next_off {
+            0 => None,
+            value if value >= 0x40 && value < off => Some(value),
+            _ => {
+                log::warn!("pci: malformed capability list at offset {off:#x}");
+                None
+            }
+        };
+    }
+    None
+}
+
+/// Reads the assigned base address of a memory BAR from config space,
+/// reconstructing 64-bit bars from their two registers.
+#[cfg(virtio_dev)]
+fn bar_physical_address(
+    access: &EndpointConfigAccess,
+    bdf: DeviceFunction,
+    bar_index: u8,
+) -> Option<u64> {
+    let low = access.read_word(bdf, PCI_BAR_OFFSET + 4 * bar_index);
+    if low & 0x1 == 1 {
+        return None; // I/O port BAR, not usable as a shared memory region.
+    }
+    if low & 0x6 == 0x4 {
+        // 64-bit memory BAR: the upper half lives in the next register.
+        let high = access.read_word(bdf, PCI_BAR_OFFSET + 4 * bar_index + 4);
+        return Some((((high as u64) << 32) | (low & 0xFFFF_FFF0) as u64) & !0xF);
+    }
+    Some((low & 0xFFFF_FFF0) as u64)
 }

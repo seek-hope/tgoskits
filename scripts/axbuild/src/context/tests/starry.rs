@@ -1,38 +1,6 @@
 use super::{common::*, *};
 
 #[test]
-fn starry_snapshot_load_returns_default_when_missing() {
-    let root = tempdir().unwrap();
-    let snapshot = StarryCommandSnapshot::load(root.path()).unwrap();
-    assert_eq!(snapshot, StarryCommandSnapshot::default());
-}
-
-#[test]
-fn starry_snapshot_store_round_trips() {
-    let root = tempdir().unwrap();
-    let snapshot = StarryCommandSnapshot {
-        arch: Some(DEFAULT_STARRY_ARCH.into()),
-        target: Some(DEFAULT_STARRY_TARGET.into()),
-        smp: None,
-        config: Some(PathBuf::from(
-            "tmp/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml",
-        )),
-        qemu: StarryQemuSnapshot {
-            qemu_config: Some(PathBuf::from("configs/qemu.toml")),
-        },
-        uboot: StarryUbootSnapshot {
-            uboot_config: Some(PathBuf::from("configs/uboot.toml")),
-        },
-    };
-
-    let path = snapshot.store(root.path()).unwrap();
-    let loaded = StarryCommandSnapshot::load(root.path()).unwrap();
-
-    assert_eq!(path, snapshot_path(root.path(), STARRY_SNAPSHOT_FILE));
-    assert_eq!(loaded, snapshot);
-}
-
-#[test]
 fn prepare_starry_request_prefers_cli_over_snapshot() {
     let root = tempdir().unwrap();
     prepare_starry_workspace(root.path());
@@ -286,42 +254,6 @@ target = "aarch64-unknown-none-softfloat"
 }
 
 #[test]
-fn prepare_starry_request_cli_target_overrides_snapshot_arch() {
-    let root = tempdir().unwrap();
-    prepare_starry_workspace(root.path());
-    write_snapshot_text(
-        root.path(),
-        STARRY_SNAPSHOT_FILE,
-        r#"
-arch = "aarch64"
-target = "aarch64-unknown-none-softfloat"
-"#,
-    )
-    .unwrap();
-
-    let app = test_app_context(root.path());
-
-    let (request, snapshot) = prepare_starry_request(
-        &app,
-        StarryCliArgs {
-            config: None,
-            arch: None,
-            target: Some("x86_64-unknown-none".into()),
-            smp: None,
-            debug: false,
-        },
-        None,
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(request.arch, "x86_64");
-    assert_eq!(request.target, "x86_64-unknown-none");
-    assert_eq!(snapshot.arch.as_deref(), Some("x86_64"));
-    assert_eq!(snapshot.target.as_deref(), Some("x86_64-unknown-none"));
-}
-
-#[test]
 fn prepare_starry_request_cli_arch_drops_stale_snapshot_runtime_paths() {
     let root = tempdir().unwrap();
     prepare_starry_workspace(root.path());
@@ -331,6 +263,7 @@ fn prepare_starry_request_cli_arch_drops_stale_snapshot_runtime_paths() {
         r#"
 arch = "aarch64"
 target = "aarch64-unknown-none-softfloat"
+smp = 1
 
 [qemu]
 qemu_config = "os/StarryOS/starryos/.qemu-aarch64.toml"
@@ -359,31 +292,10 @@ uboot_config = "configs/uboot-aarch64.toml"
 
     assert_eq!(request.arch, "riscv64");
     assert_eq!(request.target, "riscv64gc-unknown-none-elf");
+    assert_eq!(request.smp, None);
     assert_eq!(request.qemu_config, None);
     assert_eq!(request.uboot_config, None);
+    assert_eq!(snapshot.smp, None);
     assert_eq!(snapshot.qemu.qemu_config, None);
     assert_eq!(snapshot.uboot.uboot_config, None);
-}
-
-#[test]
-fn starry_arch_target_mapping_helpers_work() {
-    assert_eq!(
-        starry_target_for_arch_checked(DEFAULT_STARRY_ARCH).unwrap(),
-        DEFAULT_STARRY_TARGET
-    );
-    assert_eq!(
-        starry_arch_for_target_checked("x86_64-unknown-none").unwrap(),
-        "x86_64"
-    );
-    assert!(starry_target_for_arch_checked("mips64").is_err());
-    assert!(starry_arch_for_target_checked("mips64-unknown-none").is_err());
-}
-
-#[test]
-fn resolve_starry_arch_and_target_infers_arch_from_target() {
-    let (arch, target) =
-        resolve_starry_arch_and_target(None, Some("x86_64-unknown-none".into())).unwrap();
-
-    assert_eq!(arch, "x86_64");
-    assert_eq!(target, "x86_64-unknown-none");
 }

@@ -37,16 +37,7 @@ fn write_board_to_default_build_config(
         &board.package,
         &board.target,
     );
-    if let Some(parent) = build_config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(&board.path, &build_config_path).map_err(|e| {
-        anyhow!(
-            "failed to copy ArceOS board config {} to {}: {e}",
-            board.path.display(),
-            build_config_path.display()
-        )
-    })?;
+    write_board_to_default_build_config_at(&build_config_path, board)?;
     Ok(build_config_path)
 }
 
@@ -68,11 +59,47 @@ fn update_snapshot_for_board(
     Ok(())
 }
 
+pub(crate) fn ensure_default_build_config_for_target(
+    workspace_root: &Path,
+    package: &str,
+    target: &str,
+    build_config_path: &Path,
+) -> anyhow::Result<Option<Board>> {
+    if build_config_path.exists() {
+        return Ok(None);
+    }
+
+    let Some(board) = board::default_qemu_board(workspace_root, target, Some(package))? else {
+        return Ok(None);
+    };
+    // This only materializes a missing build config. The command dispatcher owns
+    // snapshot persistence, so implicit config creation cannot alter it here.
+    write_board_to_default_build_config_at(build_config_path, &board)?;
+    Ok(Some(board))
+}
+
 pub(crate) fn write_defconfig(workspace_root: &Path, board_name: &str) -> anyhow::Result<PathBuf> {
     let board = resolve_board(workspace_root, board_name)?;
     let build_config_path = write_board_to_default_build_config(workspace_root, &board)?;
     update_snapshot_for_board(workspace_root, &board, &build_config_path)?;
     Ok(build_config_path)
+}
+
+fn write_board_to_default_build_config_at(
+    build_config_path: &Path,
+    board: &Board,
+) -> anyhow::Result<()> {
+    if let Some(parent) = build_config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&board.path, build_config_path).map_err(|e| {
+        anyhow!(
+            "failed to copy ArceOS board config {} to {}: {e}",
+            board.path.display(),
+            build_config_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

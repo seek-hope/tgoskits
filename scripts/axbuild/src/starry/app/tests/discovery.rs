@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use super::discover_apps;
 use crate::starry::app::{
     StarryAppKind,
-    test_support::{write_case_file, write_minimal_board_case},
+    test_support::{write_benchmark_case_file, write_case_file, write_minimal_board_case},
 };
 
 #[test]
@@ -42,9 +42,12 @@ fn discovers_prebuild_apps_and_ignores_listed_names() {
     .unwrap();
 
     let apps = discover_apps(root.path()).unwrap();
-    let names = apps.into_iter().map(|app| app.name).collect::<Vec<_>>();
+    let names = apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>();
 
-    assert_eq!(names, vec!["codex-cli", "picoclaw-cli"]);
+    assert!(names.contains(&"codex-cli"));
+    assert!(names.contains(&"picoclaw-cli"));
+    assert!(!names.contains(&"orangepi-5-plus-uvc"));
+    assert!(!names.contains(&"orangepi-5-plus-uvc-rknn"));
 }
 
 #[test]
@@ -66,8 +69,90 @@ fn infers_qemu_and_board_app_kinds() {
 
     let apps = discover_apps(root.path()).unwrap();
 
-    assert_eq!(apps[0].name, "board-demo");
-    assert_eq!(apps[0].kind, StarryAppKind::Board);
-    assert_eq!(apps[1].name, "codex-cli");
-    assert_eq!(apps[1].kind, StarryAppKind::Qemu);
+    let board = apps.iter().find(|app| app.name == "board-demo").unwrap();
+    let qemu = apps.iter().find(|app| app.name == "codex-cli").unwrap();
+    assert_eq!(board.kind, StarryAppKind::Board);
+    assert_eq!(qemu.kind, StarryAppKind::Qemu);
+}
+#[test]
+fn infers_combined_qemu_and_board_app_kind() {
+    let root = tempdir().unwrap();
+    write_case_file(
+        root.path(),
+        "linux-perf",
+        "qemu-aarch64.toml",
+        "args = []\n",
+    );
+    write_minimal_board_case(root.path(), "linux-perf");
+
+    let apps = discover_apps(root.path()).unwrap();
+    let app = apps.iter().find(|app| app.name == "linux-perf").unwrap();
+
+    assert_eq!(app.kind, StarryAppKind::Both);
+}
+
+#[test]
+fn discovers_benchmark_cases_with_a_distinct_name_and_flag() {
+    let root = tempdir().unwrap();
+    write_case_file(
+        root.path(),
+        "qemu/compile-sim-bench",
+        "qemu-x86_64.toml",
+        "args = []\n",
+    );
+    write_benchmark_case_file(
+        root.path(),
+        "qemu/compile-sim-bench",
+        "qemu-x86_64-benchmark.toml",
+        "args = []\n",
+    );
+
+    let apps = discover_apps(root.path()).unwrap();
+
+    let functional = apps
+        .iter()
+        .find(|app| app.name == "qemu/compile-sim-bench")
+        .expect("functional smoke case must stay discoverable");
+    assert_eq!(functional.kind, StarryAppKind::Qemu);
+    assert!(!functional.benchmark);
+    assert!(
+        functional
+            .case_dir
+            .ends_with("apps/starry/qemu/compile-sim-bench")
+    );
+
+    let benchmark = apps
+        .iter()
+        .find(|app| app.name == "benchmark/qemu/compile-sim-bench")
+        .expect("nightly benchmark case must be discoverable separately");
+    assert_eq!(benchmark.kind, StarryAppKind::Qemu);
+    assert!(benchmark.benchmark);
+    assert!(
+        benchmark
+            .case_dir
+            .ends_with("benchmarks/starry/qemu/compile-sim-bench")
+    );
+}
+
+#[test]
+fn discovers_benchmark_case_without_an_apps_starry_peer() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("apps/starry")).unwrap();
+    write_benchmark_case_file(
+        root.path(),
+        "block-io-bench",
+        "qemu-x86_64.toml",
+        "args = []\n",
+    );
+
+    let apps = discover_apps(root.path()).unwrap();
+
+    let benchmark = apps
+        .iter()
+        .find(|app| app.name == "benchmark/block-io-bench")
+        .expect("benchmark case must be discovered");
+    assert!(benchmark.benchmark);
+    assert_eq!(benchmark.kind, StarryAppKind::Qemu);
+    let names = apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>();
+    assert!(!names.contains(&"block-io-bench"));
 }

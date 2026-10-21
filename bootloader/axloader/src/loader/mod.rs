@@ -1,100 +1,167 @@
+pub mod boot_server;
 pub mod console;
-pub mod control;
+pub mod direct;
 pub mod elf_loader;
-pub mod entry;
-pub mod http;
+pub mod network;
+pub mod serial;
+pub mod smbios;
 
-use uefi::{Status, prelude::*};
+use alloc::{format, string::String};
+use core::time::Duration;
+
+use sha2::{Digest, Sha256};
+use uefi::{Status, boot, prelude::*, proto::rng::Rng};
 
 use crate::logln;
-
-#[cfg(target_arch = "x86_64")]
-const TARGET_ARCH_NAME: &str = "x86_64";
-#[cfg(target_arch = "x86_64")]
-const EFI_OUTPUT_FILE: &str = "BOOTX64.EFI";
-
-const BOOT_ROUND_RETRY_LIMIT: usize = 10;
-const BOOT_ROUND_RETRY_STALL: core::time::Duration = core::time::Duration::from_secs(3);
 
 #[entry]
 fn efi_main() -> Status {
     uefi::helpers::init().expect("failed to initialize UEFI helpers");
-    for round in 1..=BOOT_ROUND_RETRY_LIMIT {
-        logln!("HTTP bootloader");
-        logln!("round: {round}/{BOOT_ROUND_RETRY_LIMIT}");
-        logln!("arch: {TARGET_ARCH_NAME}");
-        logln!("output: {EFI_OUTPUT_FILE}");
-        if fetch_control_offer() {
-            return Status::SUCCESS;
+    let mut ota = axloader::ota::OtaController::open();
+    let mut interface = None;
+    loop {
+        if interface.is_none() {
+            interface = network::NetworkInterface::select().ok();
         }
-        if round < BOOT_ROUND_RETRY_LIMIT {
-            logln!("boot_retry_wait: {} ms", BOOT_ROUND_RETRY_STALL.as_millis());
-            uefi::boot::stall(BOOT_ROUND_RETRY_STALL);
-        }
-    }
-    logln!("error: HTTP Boot retry limit reached");
-    Status::SUCCESS
-}
-
-fn fetch_control_offer() -> bool {
-    match control::fetch_boot_offer() {
-        Ok(offer) => {
-            logln!(
-                "boot_offer: boot_id={} arch={} format={} kernel_size={}",
-                offer.boot_id,
-                offer.arch,
-                offer.image_format,
-                offer.kernel_size
-            );
-            logln!("kernel_url: {}", offer.kernel_url);
-            if let Some(entry_symbol) = offer.entry_symbol.as_deref() {
-                logln!("entry_symbol: {entry_symbol}");
+        let Some(nic) = interface else {
+            logln!("loader_tcp4_unavailable: no matching SNP/IP4/UDP4/TCP4 controller");
+            boot::stall(Duration::from_secs(2));
+            continue;
+        };
+        let identity = new_boot_identity(nic, b"boot-epoch").and_then(|epoch| {
+            new_boot_identity(nic, b"serial-id").map(|serial_id| (epoch, serial_id))
+        });
+        let (epoch, serial_id) = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                logln!("loader_identity_unavailable: {error:?}");
+                boot::stall(Duration::from_secs(2));
+                continue;
             }
-            match elf_loader::download_and_load(
-                &offer.kernel_url,
-                offer.kernel_size,
-                offer.entry_symbol.as_deref(),
-            ) {
-                Ok(elf) => {
+        };
+        let mut beacon = serial::SerialBeacon::new(serial_id);
+        let mut server = boot_server::BootServer::new(
+            epoch,
+            nic.mac_address,
+            nic.current_mac_address,
+            smbios::hardware_info(),
+            beacon.state.clone(),
+        );
+        let mut announcer = match network::Announcer::new(nic, server.epoch()) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                logln!("loader_broadcast_unavailable: {error:?}");
+                None
+            }
+        };
+        let mut listener = match direct::Listener::open(nic.handle()) {
+            Ok(value) => value,
+            Err(error) => {
+                logln!("loader_tcp4_listen_failed: {error:?}");
+                boot::stall(Duration::from_secs(2));
+                continue;
+            }
+        };
+        logln!(
+            "loader_device_listening: port=2999 epoch={}",
+            server.epoch()
+        );
+        let mut ticks = 200_u16;
+        loop {
+            let mut progress = || {
+                beacon.progress();
+                ticks = ticks.saturating_add(1);
+                if ticks >= 200 {
+                    ticks = 0;
+                    if let Some(announcer) = announcer.as_mut()
+                        && let Err(error) = announcer.broadcast(&beacon.state.borrow())
+                    {
+                        logln!("loader_broadcast_error: {error:?}");
+                    }
+                }
+            };
+            progress();
+            match listener.poll(&mut ota, &mut server, &mut progress) {
+                direct::Action::None => boot::stall(Duration::from_millis(10)),
+                direct::Action::Reset => {
+                    logln!("ota_staged_reboot");
+                    drop(listener);
+                    drop(announcer);
+                    drop(beacon);
+                    uefi::runtime::reset(uefi::runtime::ResetType::COLD, Status::SUCCESS, None);
+                }
+                direct::Action::Boot(execution) => {
+                    let boot_server::BootExecution { elf, handoff } = *execution;
                     logln!(
-                        "elf_loaded: load={:#x} end={:#x} pages={} entry={:#x} handoff={:?}",
+                        "elf_loaded: load={:#x} end={:#x} entry={:#x}",
                         elf.load_addr,
                         elf.load_end,
-                        elf.page_count,
-                        elf.entry_point,
-                        elf.handoff
+                        elf.entry_point
                     );
-                    let jump_result = match elf.handoff {
-                        elf_loader::EntryHandoff::BootInfo => {
-                            entry::exit_boot_services_and_jump(elf.entry_point)
-                        }
-                        elf_loader::EntryHandoff::Uefi => {
-                            entry::jump_to_uefi_entry(elf.entry_point)
-                        }
-                    };
-                    match jump_result {
-                        Ok(()) => logln!("jump_error: entry returned unexpectedly"),
-                        Err(err) => logln!("jump_error: {err:?}"),
-                    }
-                    false
-                }
-                Err(err) => {
-                    logln!("elf_load_error: {err:?}");
-                    false
+                    logln!("ready_to_handoff");
+                    drop(listener);
+                    drop(announcer);
+                    drop(beacon);
+                    // SAFETY: ELF validation found the EFI entry in the live image;
+                    // networking has been closed and the guard retains payloads.
+                    let result = unsafe { handoff.enter(elf.entry_point) };
+                    drop(handoff);
+                    drop(elf);
+                    logln!("jump_error: {result:?}");
+                    return Status::LOAD_ERROR;
                 }
             }
         }
-        Err(err) => {
-            logln!("control_boot_error: {err:?}");
-            false
-        }
     }
+}
+
+fn new_boot_identity(nic: network::NetworkInterface, domain: &[u8]) -> uefi::Result<String> {
+    let mut bytes = [0_u8; 16];
+    if let Ok(handle) = boot::get_handle_for_protocol::<Rng>()
+        && let Ok(mut rng) = boot::open_protocol_exclusive::<Rng>(handle)
+        && rng.get_rng(None, &mut bytes).is_ok()
+    {
+        return Ok(hex(&bytes));
+    }
+    // These identities only distinguish boots and are not authentication secrets.
+    // Domain separation keeps the fallback epoch and serial ID independent even
+    // when both are derived from the same monotonic counter and clock sample.
+    let mut count = 0_u64;
+    let table = uefi::table::system_table_raw().ok_or(Status::NOT_READY)?;
+    // SAFETY: this runs at APPLICATION before ExitBootServices, with the initialized
+    // firmware SystemTable. The call initializes the aligned local u64 and does not
+    // retain its address. No mutable Rust reference to the service table is created.
+    let status = unsafe {
+        let services = (*table.as_ptr()).boot_services;
+        if services.is_null() {
+            return Err(Status::NOT_READY.into());
+        }
+        ((*services).get_next_monotonic_count)(&mut count)
+    };
+    if status != Status::SUCCESS {
+        return Err(status.into());
+    }
+    let clock = uefi::runtime::get_time().ok();
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(format!(":{count}:{clock:?}:{:?}", nic.mac_address));
+    bytes.copy_from_slice(&hash.finalize()[..16]);
+    Ok(hex(&bytes))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use core::fmt::Write;
+    let mut value = String::new();
+    for byte in bytes {
+        write!(value, "{byte:02x}").expect("write to String");
+    }
+    value
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     logln!("panic: {info}");
     loop {
-        core::hint::spin_loop();
+        boot::stall(Duration::from_secs(1));
     }
 }

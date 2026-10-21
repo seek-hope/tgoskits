@@ -17,7 +17,7 @@ Apple M3。流程复用现有 Starry app runner：host 侧构建 AArch64 StarryO
 | Stage 1 | `prepare_host_tools.sh` | 准备 macOS host 上构建 AArch64 种子内核需要的工具 wrapper |
 | Stage 2 | `cargo xtask starry app qemu -t macos-selfbuild --arch aarch64` | 使用现有 Starry app runner 构建种子内核、确保 rootfs、执行 `prebuild.sh`、通过内部 `rootfs::inject::inject_overlay()` 注入 overlay，并启动 QEMU/HVF |
 | Stage 2 / prebuild | `cargo xtask image resize <ROOTFS> --size-mib 16384` | host 侧 `prebuild.sh` 在 overlay 注入前扩容 app runner 选中的 rootfs |
-| Stage 3 | QEMU/HVF guest Cargo 构建 | StarryOS guest 启动后，由 `shell_init_cmd` 执行 guest runner，并在 guest 内直接运行 `cargo build` |
+| Stage 3 | QEMU/HVF guest Cargo 构建 | StarryOS guest 启动后，由 `shell_cmd` 执行 guest runner，并在 guest 内直接运行 `cargo build` |
 | Stage 4 | `debugfs` 提取产物 | 从 app runner 使用的 rootfs 提取 guest-built 内核 ELF 和 `.bin` |
 
 ## 脚本职责
@@ -27,17 +27,17 @@ Apple M3。流程复用现有 Starry app runner：host 侧构建 AArch64 StarryO
 | `full_self_build.sh` | 完整入口 | 准备 host 工具，调用现有 Starry app QEMU runner，并在 runner 成功后从 rootfs 提取 guest-built 产物。通常只需要运行这个脚本。 |
 | `prebuild.sh` | host 侧 app runner prebuild | 由 app runner 在 host OS 上执行；接收 `STARRY_ROOTFS` 和 `STARRY_OVERLAY_DIR`，扩容选中的 rootfs，组装待注入 overlay：复制工具链 overlay、打包当前源码、复制离线 Cargo registry cache、写入 guest runner 和源码 metadata。它不负责注入 overlay，也不启动 QEMU。 |
 | `prepare_toolchain_overlay.sh` | 内部/调试脚本 | 下载并准备 guest 里的 Rust/Cargo、Rust 源码、LLVM/libclang、musl C 工具链和 Cargo cache。输出是目录树，不是 rootfs 镜像；默认由 `prebuild.sh` 调用。 |
-| `prepare_host_tools.sh` | 内部/调试脚本 | 准备 macOS host 上构建种子内核所需的 AArch64 musl 编译器 wrapper、`rust-nm`、`rust-objdump` 等工具。 |
-| `guest-selfbuild.sh` | guest 内脚本 | 在 StarryOS guest 中解包源码、写 Cargo 配置、执行 Cargo 构建、刷新 kallsyms，并复制 guest-built 内核产物。 |
+| `prepare_host_tools.sh` | 内部/调试脚本 | 准备 macOS host 上构建种子内核所需的 AArch64 musl 编译器 wrapper及 `rust-objcopy` 工具。 |
+| `guest-selfbuild.sh` | guest 内脚本 | 在 StarryOS guest 中解包源码、写 Cargo 配置、执行 Cargo 构建、校验 AXBT sidecar map，并复制 guest-built 内核产物。 |
 
 rootfs 由 axbuild image storage 选择；这个 app 不维护单独的 rootfs 副本。
 干净默认运行时，路径是：
 
 ```text
-tmp/axbuild/rootfs/rootfs-aarch64-alpine.img/rootfs-aarch64-alpine.img
+target/axbuild/rootfs/rootfs-aarch64-alpine.img
 ```
 
-如果设置了 `TGOS_IMAGE_LOCAL_STORAGE`，axbuild 会使用对应的 image storage。
+如果设置了 `TGOS_IMAGE_EXTRACT_DIR`，axbuild 会使用对应的解压目录。
 `prebuild.sh` 会把本次 app runner 实际使用的 rootfs 记录到：
 
 ```text
@@ -47,10 +47,11 @@ target/starry-macos-selfbuild/rootfs.path
 app runner 通过现有内部 `rootfs::inject::inject_overlay()` 路径把自举 overlay
 注入这个 rootfs。本 app 不暴露也不依赖新的公共注入命令。
 
-因为 guest-built 产物需要写回 rootfs，`qemu-aarch64.toml` 设置
-`snapshot = false`，让 Starry app runner 不追加全局 `-snapshot`。下面的
-单独启动验证命令仍然带 `-snapshot`，它只用于验证提取出的 `.bin` 能正常启动，
-不需要把 shell 写入持久化回 rootfs。
+因为 guest-built 产物需要写回这个专用可写 rootfs，`qemu-aarch64.toml` 设置
+`rootfs_write_policy = "persist"`。rootfs patcher 会保持选中的 rootfs drive
+可写，并拒绝与持久化冲突的全局或 rootfs-drive snapshot 参数。不要让并发测试
+共享这个 rootfs。下面的单独启动验证命令仍然带 `-snapshot`，它只用于验证提取出的
+`.bin` 能正常启动，不需要把 shell 写入持久化回 rootfs。
 
 ## 前置依赖
 
@@ -62,7 +63,7 @@ brew install qemu e2fsprogs zig llvm
 
 其中，`qemu` 用于 HVF 启动，`e2fsprogs` 提供 `e2fsck`、`debugfs` 和
 `resize2fs`，`zig` 用于生成 AArch64 musl 编译器 wrapper，`llvm` 用作
-`rust-nm`、`rust-objdump` 等工具的 fallback。
+`rust-objcopy` 用于生成启动用 BIN；AXBT map 由 axbuild 生成。
 
 ## 完整复现
 
@@ -92,8 +93,8 @@ qemu-system-aarch64 \
   -cpu cortex-a53 \
   -m 512M \
   -smp 1 \
-  -device virtio-blk-pci,drive=disk0 \
-  -drive id=disk0,if=none,format=raw,file=tmp/axbuild/rootfs/rootfs-aarch64-alpine.img/rootfs-aarch64-alpine.img,file.locking=off \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
+  -drive id=disk0,if=none,format=raw,file=target/axbuild/rootfs/rootfs-aarch64-alpine.img,file.locking=off \
   -kernel target/starry-macos-selfbuild/uploaded/starryos-aarch64-unknown-none-softfloat.bin \
   -netdev user,id=net0
 ```
@@ -129,7 +130,7 @@ apps/starry/macos-selfbuild/full_self_build.sh
 
 PASS marker 的 elapsed 为 `1460s`，即 `24m 20s`。它从 guest 即将执行
 `cargo build` 前开始，到 Cargo 命令返回后结束；它包括 guest 内 Cargo 构建、
-build script、build-std 和链接时间，不包括 QEMU 启动、kallsyms 刷新后的
+build script、build-std 和链接时间，不包括 QEMU 启动、AXBT map 校验后的
 产物复制和 host 侧提取。
 
 第二步：使用 qemu 启动自举编译产物
@@ -142,8 +143,8 @@ qemu-system-aarch64 \
   -cpu cortex-a53 \
   -m 512M \
   -smp 1 \
-  -device virtio-blk-pci,drive=disk0 \
-  -drive id=disk0,if=none,format=raw,file=tmp/axbuild/rootfs/rootfs-aarch64-alpine.img/rootfs-aarch64-alpine.img,file.locking=off \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
+  -drive id=disk0,if=none,format=raw,file=target/axbuild/rootfs/rootfs-aarch64-alpine.img,file.locking=off \
   -kernel target/starry-macos-selfbuild/uploaded/starryos-aarch64-unknown-none-softfloat.bin \
   -netdev user,id=net0
 ```
@@ -151,7 +152,7 @@ qemu-system-aarch64 \
 自举产物的启动验证到达：
 
 ```text
-root@starry:/root #
+root@starry:~#
 ```
 
 这说明 guest 编译出的 `.bin` 可以作为普通 StarryOS 内核启动。

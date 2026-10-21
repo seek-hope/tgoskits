@@ -1,5 +1,17 @@
 #![no_std]
 
+//! Device registry and exclusive, guard-owned device borrows.
+//!
+//! Process IDs are diagnostic labels, not authority to revoke a borrow. A
+//! guard may outlive its acquiring process after transfer to a kernel worker.
+//! File release and device-specific shutdown belong in OS adapters; neither
+//! may invalidate a live Rust reference by force-unlocking the registry.
+//!
+//! There is deliberately no safe PID-based revocation API:
+//! ```compile_fail
+//! rdrive::reclaim_all_held_by(42);
+//! ```
+
 #[macro_use]
 extern crate alloc;
 #[macro_use]
@@ -7,12 +19,16 @@ extern crate log;
 
 use core::ptr::NonNull;
 
+use ax_lazyinit::OnceLock;
 // The registry is not hard-IRQ safe, but it is also used by runtime discovery
 // paths that must not trigger task preemption hooks on lock release.
-use ax_kspin::SpinRaw as Mutex;
+use ax_sync::{RawSpinLock, RawSpinLockUnpinnedGuard};
 pub use fdt_edit::{Fdt, Phandle};
 use register::{DriverRegister, ProbeLevel, ProbePriority};
-use spin::Once;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_support;
 
 mod descriptor;
 pub mod driver;
@@ -36,7 +52,7 @@ pub use rdrive_macros::*;
 
 use crate::{error::DriverError, probe::OnProbeError};
 
-static CONTAINER: Once<Mutex<Manager>> = Once::new();
+static CONTAINER: OnceLock<RawSpinLock<Manager>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub enum Platform {
@@ -58,8 +74,14 @@ pub enum PlatformSource {
 
 unsafe impl Send for PlatformSource {}
 
-pub(crate) fn container() -> &'static Mutex<Manager> {
+pub(crate) fn container() -> &'static RawSpinLock<Manager> {
     CONTAINER.get().expect("rdrive not init")
+}
+
+fn lock_container() -> RawSpinLockUnpinnedGuard<'static, Manager> {
+    // SAFETY: registry operations run in serialized discovery/runtime paths
+    // which preserve the legacy raw-lock exclusion contract.
+    unsafe { container().lock_raw() }
 }
 
 pub fn is_initialized() -> bool {
@@ -97,7 +119,7 @@ pub fn init_sources(sources: &[PlatformSource]) -> Result<(), DriverError> {
     }
 
     let m = Manager::new()?;
-    CONTAINER.call_once(|| Mutex::new(m));
+    CONTAINER.call_once(|| RawSpinLock::new(m));
     Ok(())
 }
 
@@ -105,7 +127,7 @@ pub(crate) fn edit<F, T>(f: F) -> T
 where
     F: FnOnce(&mut Manager) -> T,
 {
-    let mut g = container().lock();
+    let mut g = lock_container();
     f(&mut g)
 }
 
@@ -113,7 +135,7 @@ pub(crate) fn read<F, T>(f: F) -> T
 where
     F: FnOnce(&Manager) -> T,
 {
-    let g = container().lock();
+    let g = lock_container();
     f(&g)
 }
 
@@ -284,6 +306,17 @@ pub fn acpi_spcr_console_device_id() -> Option<DeviceId> {
 
 pub fn with_fdt<T>(f: impl FnOnce(&Fdt) -> T) -> Option<T> {
     probe::fdt::try_system().map(|system| f(system.fdt()))
+}
+
+/// Borrow the live device tree for the lifetime of the program.
+///
+/// The FDT is parsed once at init and never mutated, so this hands out a
+/// `'static` reference with no lock and no copy. Prefer this over
+/// `with_fdt(Clone::clone)`, which deep-copies the entire blob on every call —
+/// a real cost when hot paths (e.g. concurrent device probes resolving phandles)
+/// call it repeatedly.
+pub fn fdt_ref() -> Option<&'static Fdt> {
+    probe::fdt::try_system().map(|system| system.fdt())
 }
 
 /// Macro for generating a driver module.

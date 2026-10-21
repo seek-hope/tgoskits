@@ -13,10 +13,53 @@ struct Descriptor {
     flags: u32,
 }
 
+fn device(dma_mask: u64, coherency: DmaCoherency, op: &'static dyn DmaOp) -> DeviceDma {
+    DeviceDma::new(
+        DmaDeviceInfo::new(
+            DmaDomainId::Direct,
+            coherency,
+            DmaConstraints::new(dma_mask),
+        ),
+        op,
+    )
+}
+
 fn new_tracking_device() -> (DeviceDma, &'static TrackingDmaOp) {
     let tracker = Box::new(TrackingDmaOp::new());
     let tracker = Box::leak(tracker);
-    (DeviceDma::new_legacy(u64::MAX, tracker), tracker)
+    (
+        device(u64::MAX, DmaCoherency::NonCoherent, tracker),
+        tracker,
+    )
+}
+
+#[test]
+fn coherent_device_uses_direct_allocator_mapping() {
+    let tracker = Box::leak(Box::new(TrackingDmaOp::new()));
+    let dev = device(u64::MAX, DmaCoherency::Coherent, tracker);
+
+    let buffer = dev.coherent_array_zero::<u8>(64).unwrap();
+    assert!(
+        tracker
+            .operations()
+            .iter()
+            .any(|op| matches!(op, DmaOperation::AllocContiguous { .. }))
+    );
+    assert!(
+        !tracker
+            .operations()
+            .iter()
+            .any(|op| matches!(op, DmaOperation::AllocCoherent { .. }))
+    );
+
+    tracker.clear();
+    drop(buffer);
+    assert!(
+        tracker
+            .operations()
+            .iter()
+            .any(|op| matches!(op, DmaOperation::DeallocContiguous { .. }))
+    );
 }
 
 #[test]
@@ -53,7 +96,7 @@ fn contiguous_array_cpu_accessors_do_not_sync_cache() {
     assert_eq!(tracker.count_sync_alloc_for_device(), 0);
     assert_eq!(tracker.count_sync_alloc_for_cpu(), 0);
 
-    buff.sync_for_device(3 * size_of::<u32>(), size_of::<u32>());
+    buff.prepare_for_device(3 * size_of::<u32>()..4 * size_of::<u32>());
     assert_eq!(tracker.count_sync_alloc_for_device(), 1);
     assert_eq!(tracker.count_sync_alloc_for_cpu(), 0);
 
@@ -81,7 +124,7 @@ fn contiguous_box_supports_cpu_sync() {
         len: 0,
         flags: 0,
     });
-    status.sync_for_cpu_all();
+    status.complete_for_cpu();
 
     assert_eq!(tracker.count_sync_alloc_for_device(), 0);
     assert_eq!(tracker.count_sync_alloc_for_cpu(), 1);
@@ -91,15 +134,15 @@ fn contiguous_box_supports_cpu_sync() {
 fn streaming_map_has_explicit_device_and_cpu_sync() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0x4000));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(u64::MAX, tracker);
+    let dev = device(u64::MAX, DmaCoherency::NonCoherent, tracker);
     let mut backing = [0u8; 128];
     let map = dev
         .map_streaming_slice(&mut backing, 64, DmaDirection::Bidirectional)
         .unwrap();
 
     tracker.clear();
-    map.prepare_for_device_all();
-    map.complete_for_cpu_all();
+    map.prepare_for_device(0..map.bytes_len());
+    map.complete_for_cpu(0..map.bytes_len());
     drop(map);
 
     assert_eq!(tracker.count_sync_map_for_device(), 1);
@@ -116,7 +159,7 @@ fn streaming_map_has_explicit_device_and_cpu_sync() {
 fn streaming_map_for_device_syncs_after_mapping() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0x4000));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(u64::MAX, tracker);
+    let dev = device(u64::MAX, DmaCoherency::NonCoherent, tracker);
     let mut backing = [0u8; 128];
 
     tracker.clear();
@@ -141,7 +184,7 @@ fn streaming_map_for_device_syncs_after_mapping() {
 fn streaming_write_for_device_syncs_after_cpu_write() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0x4000));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(u64::MAX, tracker);
+    let dev = device(u64::MAX, DmaCoherency::NonCoherent, tracker);
     let mut backing = [0u8; 16];
     let mut map = dev
         .map_streaming_slice(&mut backing, 4, DmaDirection::ToDevice)
@@ -166,25 +209,23 @@ fn streaming_write_for_device_syncs_after_cpu_write() {
 fn streaming_read_from_device_syncs_before_cpu_read_and_copies_bounce_buffer() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0x80));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(0xff, tracker);
+    let dev = device(0xff, DmaCoherency::NonCoherent, tracker);
     let mut backing = [1u8; 16];
+    let len = backing.len();
     let map = dev
         .map_streaming_slice(&mut backing, 16, DmaDirection::FromDevice)
         .unwrap();
 
     assert!(map.bounce_ptr().is_some());
     unsafe {
-        map.bounce_ptr()
-            .unwrap()
-            .as_ptr()
-            .write_bytes(0x5a, backing.len());
+        map.bounce_ptr().unwrap().as_ptr().write_bytes(0x5a, len);
     }
 
     tracker.clear();
     let first = map.read_from_device(4, |data| data[0]);
 
     assert_eq!(first, 0x5a);
-    assert_eq!(backing[0], 0x5a);
+    assert_eq!(map.read_cpu(0), Some(0x5a));
     assert_eq!(tracker.count_sync_map_for_cpu(), 1);
     assert!(tracker.operations().iter().any(|op| matches!(
         op,
@@ -200,20 +241,18 @@ fn streaming_read_from_device_syncs_before_cpu_read_and_copies_bounce_buffer() {
 fn streaming_bounce_buffer_copies_back_on_cpu_sync() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0x80));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(0xff, tracker);
+    let dev = device(0xff, DmaCoherency::NonCoherent, tracker);
     let mut backing = [1u8; 16];
+    let len = backing.len();
     let map = dev
         .map_streaming_slice(&mut backing, 16, DmaDirection::FromDevice)
         .unwrap();
 
     assert!(map.bounce_ptr().is_some());
     unsafe {
-        map.bounce_ptr()
-            .unwrap()
-            .as_ptr()
-            .write_bytes(0x5a, backing.len());
+        map.bounce_ptr().unwrap().as_ptr().write_bytes(0x5a, len);
     }
-    map.complete_for_cpu_all();
+    map.complete_for_cpu(0..map.bytes_len());
     drop(map);
 
     assert_eq!(backing, [0x5a; 16]);
@@ -299,25 +338,90 @@ fn allocation_rejects_backend_address_outside_mask() {
 }
 
 #[test]
-fn explicit_dma_domain_survives_constraint_updates() {
-    let tracker = Box::new(TrackingDmaOp::new());
-    let tracker = Box::leak(tracker);
-    let domain = DmaDomainId::from_raw(0x42);
-    let dev = DeviceDma::new(domain, u64::MAX, tracker);
+fn coherent_try_release_reports_failure_without_retrying() {
+    let (dev, tracker) = new_tracking_device();
+    let buffer = dev.coherent_array_zero::<u8>(64).unwrap();
+    tracker.clear();
+    tracker.fail_coherent_release();
 
-    assert_eq!(dev.domain_id(), domain);
+    let result = buffer.try_release();
+
+    assert_eq!(result, Err(DmaError::CoherentReleaseFailed));
+    assert_eq!(
+        tracker
+            .operations()
+            .iter()
+            .filter(|op| matches!(op, DmaOperation::DeallocCoherent { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn coherent_drop_failure_attempts_release_only_once() {
+    let (dev, tracker) = new_tracking_device();
+    let buffer = dev.coherent_array_zero::<u8>(64).unwrap();
+    tracker.clear();
+    tracker.fail_coherent_release();
+
+    drop(buffer);
+
+    assert_eq!(
+        tracker
+            .operations()
+            .iter()
+            .filter(|op| matches!(op, DmaOperation::DeallocCoherent { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn explicit_dma_domain_survives_constraint_updates() {
+    let domain = DmaDomainId::Translated(core::num::NonZeroU64::new(0x42).unwrap());
+    let tracker = std::sync::Arc::new(TrackingDmaOp::new().with_domain(domain));
+    let dev = DeviceDma::new_shared(
+        DmaDeviceInfo::new(
+            domain,
+            DmaCoherency::NonCoherent,
+            DmaConstraints::new(u64::MAX),
+        ),
+        tracker,
+    )
+    .unwrap();
+
+    assert_eq!(dev.info().domain(), domain);
     assert_eq!(
         dev.with_constraints(DmaConstraints::new(u32::MAX as u64))
-            .domain_id(),
+            .info()
+            .domain(),
         domain
     );
+}
+
+#[test]
+fn translated_metadata_requires_matching_backend() {
+    let domain = DmaDomainId::Translated(core::num::NonZeroU64::new(0x43).unwrap());
+    let info = DmaDeviceInfo::new(
+        domain,
+        DmaCoherency::Coherent,
+        DmaConstraints::new(u64::MAX),
+    );
+    let direct = std::sync::Arc::new(TrackingDmaOp::new());
+    assert!(matches!(
+        DeviceDma::new_shared(info, direct),
+        Err(DmaError::DomainMismatch {
+            requested,
+            backend: DmaDomainId::Direct,
+        }) if requested == domain
+    ));
 }
 
 #[test]
 fn low_32bit_allocations_are_validated() {
     let tracker = Box::new(TrackingDmaOp::new().with_next_dma_addr(0xffff_f000));
     let tracker = Box::leak(tracker);
-    let dev = DeviceDma::new_legacy(u32::MAX as u64, tracker);
+    let dev = device(u32::MAX as u64, DmaCoherency::NonCoherent, tracker);
     let buff = dev
         .contiguous_array_zero_with_align::<u8>(0x1000, 0x1000, DmaDirection::ToDevice)
         .unwrap();
@@ -330,6 +434,59 @@ fn low_32bit_allocations_are_validated() {
             ..
         } if *mask == u32::MAX as u64
     )));
+}
+
+#[test]
+fn allocation_preserves_stricter_device_alignment() {
+    let tracker = Box::leak(Box::new(TrackingDmaOp::new().with_next_dma_addr(0x1001)));
+    let dev = DeviceDma::new(
+        DmaDeviceInfo::new(
+            DmaDomainId::Direct,
+            DmaCoherency::NonCoherent,
+            DmaConstraints::new(u64::MAX).with_align(0x1000),
+        ),
+        tracker,
+    );
+
+    let buffer = dev
+        .contiguous_array_zero::<u8>(1, DmaDirection::ToDevice)
+        .unwrap();
+
+    assert_eq!(buffer.dma_addr().as_u64(), 0x2000);
+}
+
+#[test]
+fn owned_buffer_syncs_only_at_ownership_transitions() {
+    let (dev, tracker) = new_tracking_device();
+    let mut tx = CpuDmaBuffer::new_zero(
+        &dev,
+        core::num::NonZeroUsize::new(4).unwrap(),
+        1,
+        DmaDirection::ToDevice,
+    )
+    .unwrap();
+    tracker.clear();
+
+    tx.copy_from_slice_cpu(&[1, 2, 3, 4]);
+    assert_eq!(tracker.count_sync_alloc_for_device(), 0);
+    let _prepared = tx.prepare_for_device();
+    assert_eq!(tracker.count_sync_alloc_for_device(), 1);
+
+    let rx = CpuDmaBuffer::new_zero(
+        &dev,
+        core::num::NonZeroUsize::new(4).unwrap(),
+        1,
+        DmaDirection::FromDevice,
+    )
+    .unwrap();
+    let prepared = rx.prepare_for_device();
+    let in_flight = unsafe { prepared.into_in_flight() };
+    tracker.clear();
+    let completed = unsafe { in_flight.complete_after_quiesce() };
+    assert_eq!(tracker.count_sync_alloc_for_cpu(), 1);
+    let mut output = [0; 4];
+    completed.copy_to_slice_cpu(&mut output);
+    assert_eq!(tracker.count_sync_alloc_for_cpu(), 1);
 }
 
 #[test]

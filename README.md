@@ -5,6 +5,7 @@
 <div align="center">
 
 [![Build & Test](https://github.com/rcore-os/tgoskits/actions/workflows/ci.yml/badge.svg)](https://github.com/rcore-os/tgoskits/actions/workflows/ci.yml)
+[![Nightly Benchmarks](https://img.shields.io/badge/nightly-benchmarks-blueviolet.svg)](https://rcore-os.cn/tgoskits/benchmark/)
 [![Rust](https://img.shields.io/badge/edition-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
@@ -24,20 +25,30 @@ TGOSKits brings multiple standalone subprojects into the root repository through
 
 ```text
 tgoskits/
+├── apps/                      # ArceOS and StarryOS application packages
+├── benchmarks/                # benchmark suites and reports
+├── bootloader/                # UEFI and platform bootloaders
 ├── components/                # reusable component crates
+├── container/                 # CI and development container images
+├── drivers/                   # reusable drivers and driver subsystems
+├── fs/                        # filesystem crates
+├── memory/                    # memory-management crates
+├── net/                       # networking crates
 ├── os/
 │   ├── arceos/                # ArceOS modular kernel
 │   ├── StarryOS/              # StarryOS Linux-compatible OS
 │   └── axvisor/               # Axvisor Type-I Hypervisor
-├── platform/                  # platform and board support crates
-├── drivers/                   # reusable drivers and driver subsystems
+├── platforms/                 # platform and board support crates
+├── nixos-tests/               # NixOS integration tests
 ├── test-suit/                 # system-level test cases
+├── tools/                     # repository and development tools
+├── virtualization/            # virtualization support crates
 ├── xtask/                     # unified root command entry
 ├── scripts/                   # repository maintenance, test, and sync scripts
 └── docs/                      # Docusaurus documentation site
 ```
 
-For subtree synchronization, component layering, and development conventions, see [repository structure and collaboration](https://rcore-os.cn/tgoskits/docs/contributing/repo) and the [component development guide](https://rcore-os.cn/tgoskits/docs/development/components).
+For subtree synchronization, component layering, and development conventions, see [repository structure and collaboration](https://rcore-os.cn/tgoskits/docs/contributing/repo) and the [architecture overview](https://rcore-os.cn/tgoskits/docs/architecture/overview).
 
 ## 3. Quick Experience
 
@@ -56,12 +67,12 @@ docker run -it --rm \
   ghcr.io/rcore-os/tgoskits-container:latest
 ```
 
-If you do not use the container, prepare at least Rust, basic build tools, and common QEMU packages. The recommended QEMU version is 10.2.1, matching the container and CI environment; distribution packages are usually enough for quick trials, but switch to the container if a target is missing or behavior differs:
+If you do not use the container, prepare at least Rust, basic build tools, and common QEMU packages. The recommended QEMU version is 11.1.1, matching the container and CI environment; distribution packages are usually enough for quick trials, but switch to the container if a target is missing or behavior differs:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt update
-sudo apt install -y cmake make ninja-build pkg-config
+sudo apt install -y cmake make ninja-build pkg-config e2fsprogs fakeroot
 sudo apt install -y qemu-system-arm qemu-system-riscv64 qemu-system-x86
 cargo install cargo-binutils
 ```
@@ -70,7 +81,7 @@ See [quick start overview](https://rcore-os.cn/tgoskits/docs/quickstart/overview
 
 ### 3.2 QEMU Verification
 
-First confirm that common QEMU commands are available, preferably matching QEMU 10.2.1 from the container and CI environment:
+First confirm that common QEMU commands are available, preferably matching QEMU 11.1.1 from the container and CI environment:
 
 ```bash
 qemu-system-riscv64 --version
@@ -82,8 +93,8 @@ qemu-system-loongarch64 --version
 Then use the unified `cargo xtask` entry point to run the three system paths:
 
 ```bash
-# ArceOS: run Hello World
-cargo xtask arceos qemu --package arceos-helloworld --arch aarch64
+# ArceOS: run the default Hello World
+cargo xtask arceos qemu --arch aarch64
 
 # StarryOS: prepare rootfs before the first run
 cargo xtask starry rootfs --arch aarch64
@@ -93,7 +104,7 @@ cargo xtask starry qemu --arch aarch64
 cargo xtask axvisor qemu --arch aarch64
 ```
 
-If you only want the shortest path to a successful run, start with ArceOS Hello World. For more systems, architecture combinations, and QEMU options, see the [quick start overview](https://rcore-os.cn/tgoskits/docs/quickstart/overview) and [run and QEMU](https://rcore-os.cn/tgoskits/docs/build/run).
+If you only want the shortest path to a successful run, start with the default ArceOS Hello World app. Pass `--package arceos-shell` when you specifically need the interactive Shell. For more systems, architecture combinations, and QEMU options, see the [quick start overview](https://rcore-os.cn/tgoskits/docs/quickstart/overview) and the [command reference](https://rcore-os.cn/tgoskits/docs/build/commands).
 
 ## 4. Contributing
 

@@ -8,21 +8,24 @@ mod dir;
 mod dyn_debug;
 mod file;
 mod fs;
+mod mqueue;
 pub(crate) mod overlay;
 pub(crate) mod proc;
+mod proc_mountinfo;
 mod sysfs;
-mod tmp;
 pub(crate) mod usbfs;
 
 use alloc::{boxed::Box, sync::Arc};
 
-use ax_errno::LinuxResult;
-use ax_fs_ng::vfs::{FS_CONTEXT, FsContext};
+use ax_fs_ng::vfs::{FsContext, current_fs_context};
 use ax_lazyinit::LazyInit;
-use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, NodePermission, WeakDirEntry};
-pub use tmp::MemoryFs;
+use axfs_ng_vfs::{
+    DirNodeOps, FileNodeOps, Filesystem, MutationCredentials, NodePermission, WeakDirEntry,
+};
+pub use ax_fs_ng::MemoryFs;
 
 pub use self::{device::*, dir::*, file::*, fs::*};
+use crate::StarryResult;
 
 /// A callback that builds a `Arc<dyn DirNodeOps>` for a given
 /// `WeakDirEntry`.
@@ -57,48 +60,56 @@ impl<T: FileNodeOps> From<Arc<T>> for NodeOpsMux {
 
 const DIR_PERMISSION: NodePermission = NodePermission::from_bits_truncate(0o755);
 
-static SHM_TMPFS: LazyInit<Arc<tmp::MemoryFs>> = LazyInit::new();
-static TMP_TMPFS: LazyInit<Arc<tmp::MemoryFs>> = LazyInit::new();
+static SHM_TMPFS: LazyInit<Arc<MemoryFs>> = LazyInit::new();
+static TMP_TMPFS: LazyInit<Arc<MemoryFs>> = LazyInit::new();
 
-pub fn shm_tmpfs() -> Option<Arc<tmp::MemoryFs>> {
+pub fn shm_tmpfs() -> Option<Arc<MemoryFs>> {
     SHM_TMPFS.get().map(Arc::clone)
 }
 
-pub fn tmp_tmpfs() -> Option<Arc<tmp::MemoryFs>> {
+pub fn tmp_tmpfs() -> Option<Arc<MemoryFs>> {
     TMP_TMPFS.get().map(Arc::clone)
 }
 
-fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> LinuxResult<()> {
+fn mount_at(fs: &FsContext, path: &str, mount_fs: Filesystem) -> StarryResult<()> {
     let initial_resolve = fs.resolve(path);
     if initial_resolve.is_err() {
-        fs.create_dir(path, DIR_PERMISSION, 0, 0)?;
+        fs.create_dir(path, DIR_PERMISSION, 0, 0, &MutationCredentials::root())?;
     }
     let loc = fs.resolve(path)?;
-    loc.mount(&mount_fs)?;
+    loc.mount_with_source(&mount_fs, mount_fs.name())?;
     info!("Mounted {} at {}", mount_fs.name(), path);
     Ok(())
 }
 
 /// Mount all filesystems
-pub fn mount_all() -> LinuxResult<()> {
+pub fn mount_all() -> StarryResult<()> {
     info!("Initialize pseudofs...");
 
-    let fs = FS_CONTEXT.lock();
-    mount_at(&fs, "/dev", dev::new_devfs())?;
+    let fs_context = current_fs_context();
+    let fs = fs_context.lock();
     let usbfs = usbfs::new_usbfs()?;
+    let root_mount_device = fs.root_dir().mountpoint().device();
+    mount_at(&fs, "/dev", dev::new_devfs(root_mount_device))?;
     if let Some(dev_usbfs) = usbfs {
         mount_at(&fs, "/dev/bus/usb", dev_usbfs)?;
     }
 
-    let (shm_fs, shm_handle) = tmp::MemoryFs::new_with_handle();
+    let (shm_fs, shm_handle) = MemoryFs::new_with_handle();
     mount_at(&fs, "/dev/shm", shm_fs)?;
     SHM_TMPFS.init_once(shm_handle);
 
-    let (tmp_fs, tmp_handle) = tmp::MemoryFs::new_with_handle();
+    let (tmp_fs, tmp_handle) = MemoryFs::new_with_handle();
     mount_at(&fs, "/tmp", tmp_fs)?;
     TMP_TMPFS.init_once(tmp_handle);
 
-    mount_at(&fs, "/proc", proc::new_procfs())?;
+    mount_at(&fs, "/dev/mqueue", mqueue::new_mqueuefs())?;
+
+    mount_at(
+        &fs,
+        "/proc",
+        proc::new_procfs(crate::task::ROOT_PID_NS.clone()),
+    )?;
 
     mount_at(&fs, "/sys", sysfs::new_sysfs())?;
     if usbfs::has_manager() {

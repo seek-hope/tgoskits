@@ -1,7 +1,6 @@
 use tock_registers::{interfaces::*, registers::*};
 
 pub mod v2;
-#[cfg(any(target_arch = "aarch64", doc))]
 pub mod v3;
 
 use crate::define::*;
@@ -14,7 +13,7 @@ trait IrqVecWriteable {
     fn set_irq_bit(&self, intid: u32);
     fn clear_irq_bit(&self, intid: u32);
 }
-trait IrqVecReadable {
+pub(crate) trait IrqVecReadable {
     fn get_irq_bit(&self, intid: u32) -> bool;
 }
 

@@ -4,14 +4,95 @@ use core::marker::PhantomData;
 
 use crate::{
     X86HostPhysAddr, X86HostVirtAddr, X86InterruptVector, X86TimerCallback, X86VcpuId,
-    X86VlapicError, X86VlapicResult, X86VmId,
+    X86VlapicResult, X86VmId,
 };
 
 /// Size of a 4 KiB host frame.
 pub const X86_PAGE_SIZE_4K: usize = 0x1000;
 
-/// Host operations required by x86 vLAPIC, PIT, and serial emulation.
-pub trait X86VlapicHostOps {
+/// Run-scoped operations injected into one vCPU-owned interrupt device.
+///
+/// A runtime port is created before guest entry and retains only pre-bound
+/// lower capabilities. It must not search a global VM registry, acquire a
+/// sleeping lock, or reach another vCPU's backend.
+pub trait X86VlapicRuntimeOps: Send + Sync + 'static {
+    /// Stable handle type returned by this host's timer service.
+    type TimerHandle: Copy + Send + 'static;
+
+    /// Returns the VM identity fixed when this port was created.
+    fn vm_id(&self) -> X86VmId;
+
+    /// Returns the source vCPU identity fixed when this port was created.
+    fn vcpu_id(&self) -> X86VcpuId;
+
+    /// Returns the number of vCPUs in this run.
+    fn vcpu_count(&self) -> usize;
+
+    /// Returns this run's active-vCPU mask.
+    fn active_vcpu_mask(&self) -> usize;
+
+    /// Publishes a virtual interrupt to a target vCPU and wakes its owner.
+    fn inject_interrupt(
+        &self,
+        target_vcpu_id: X86VcpuId,
+        vector: X86InterruptVector,
+    ) -> X86VlapicResult;
+
+    /// Fans one PIT IRQ0 edge through this run's legacy-PIC and IOAPIC paths.
+    fn inject_pit_irq(&self) -> X86VlapicResult;
+
+    /// Registers a task-context timer callback for an absolute deadline.
+    fn register_timer(
+        &self,
+        deadline_nanos: u64,
+        callback: X86TimerCallback,
+    ) -> X86VlapicResult<Self::TimerHandle>;
+
+    /// Registers a bounded hard-IRQ timer callback.
+    ///
+    /// # Safety
+    ///
+    /// The callback and all state transitions around it must be non-sleeping,
+    /// allocation-free, and use only capabilities pre-bound to this run port.
+    unsafe fn register_hard_timer(
+        &self,
+        deadline_nanos: u64,
+        callback: X86TimerCallback,
+    ) -> X86VlapicResult<Self::TimerHandle>;
+
+    /// Yields the calling task while a timer callback or its host payload
+    /// reclamation is still in flight.
+    ///
+    /// Task-side cancellation uses this instead of spinning so a callback that
+    /// was preempted on the same CPU can run and retire its arm. It must not
+    /// busy-wait, and it must not require any lock the callback acquires.
+    fn wait_timer_progress(&self);
+
+    /// Consumes host-timer ingress edges observed by the owning vCPU task.
+    ///
+    /// Implementations without a separate ingress may return zero; the
+    /// vLAPIC's owner-local pending state remains authoritative for them.
+    fn consume_timer_expiries(&self) -> u64 {
+        0
+    }
+
+    /// Cancels a timer returned by this port and waits for its completion.
+    ///
+    /// Returns only once the callback has left the host timer queue and its
+    /// payload is reclaimed (an already-completed registration reports
+    /// success). A merely accepted but still-in-flight cancellation is not
+    /// quiescence and must not be reported as success.
+    fn cancel_timer(&self, handle: Self::TimerHandle) -> X86VlapicResult;
+}
+
+/// Host operations required by x86 vLAPIC and PIT emulation.
+pub trait X86VlapicHostOps: 'static {
+    /// Stable handle for one host timer registration.
+    type TimerHandle: Copy + Send + 'static;
+
+    /// Pre-bound run port handed to each vCPU-owned interrupt device.
+    type Runtime: X86VlapicRuntimeOps<TimerHandle = Self::TimerHandle> + Clone;
+
     /// Allocate one host frame.
     fn alloc_frame() -> Option<X86HostPhysAddr>;
 
@@ -24,39 +105,13 @@ pub trait X86VlapicHostOps {
     /// Convert host virtual address to host physical address.
     fn virt_to_phys(vaddr: X86HostVirtAddr) -> X86HostPhysAddr;
 
+    /// Creates an inactive port for host-side adapters that are not attached
+    /// to a guest run. Real vLAPIC and PIT instances receive a run port
+    /// explicitly instead of relying on this constructor.
+    fn unbound_runtime(vm_id: X86VmId, vcpu_id: X86VcpuId) -> Self::Runtime;
+
     /// Current monotonic host time in nanoseconds.
     fn current_time_nanos() -> u64;
-
-    /// Register a timer callback for an absolute host deadline in nanoseconds.
-    fn register_timer(deadline_nanos: u64, callback: X86TimerCallback) -> Option<usize>;
-
-    /// Cancel a timer callback.
-    fn cancel_timer(token: usize);
-
-    /// Write bytes to the host console.
-    fn write_bytes(bytes: &[u8]);
-
-    /// Read bytes from the host console.
-    fn read_bytes(bytes: &mut [u8]) -> usize;
-
-    /// Return the current VM ID.
-    fn current_vm_id() -> X86VmId;
-
-    /// Return the current VM vCPU count.
-    fn current_vm_vcpu_num() -> usize;
-
-    /// Return the active vCPU mask for the current VM.
-    fn current_vm_active_vcpus() -> usize;
-
-    /// Return the active vCPU mask for the given VM.
-    fn active_vcpus(vm_id: X86VmId) -> Option<usize>;
-
-    /// Inject a virtual interrupt into a vCPU.
-    fn inject_interrupt(
-        vm_id: X86VmId,
-        vcpu_id: X86VcpuId,
-        vector: X86InterruptVector,
-    ) -> X86VlapicResult;
 }
 
 /// RAII host frame used by x86 virtual interrupt-controller structures.
@@ -70,12 +125,14 @@ impl<H: X86VlapicHostOps> PhysFrame<H> {
     /// Allocate a host frame.
     pub fn alloc_zero() -> X86VlapicResult<Self> {
         let frame = Self::alloc()?;
+        // SAFETY: the host allocator returned one writable 4-KiB frame and no
+        // Rust reference to it exists yet.
         unsafe { core::ptr::write_bytes(frame.as_mut_ptr(), 0, X86_PAGE_SIZE_4K) };
         Ok(frame)
     }
 
     fn alloc() -> X86VlapicResult<Self> {
-        let start_paddr = H::alloc_frame().ok_or(X86VlapicError::NoMemory)?;
+        let start_paddr = H::alloc_frame().ok_or(crate::X86VlapicError::NoMemory)?;
         assert_ne!(start_paddr.as_usize(), 0);
         Ok(Self {
             start_paddr,
@@ -110,43 +167,4 @@ pub(crate) fn virt_to_phys<H: X86VlapicHostOps>(vaddr: X86HostVirtAddr) -> X86Ho
 
 pub(crate) fn current_time_nanos<H: X86VlapicHostOps>() -> u64 {
     H::current_time_nanos()
-}
-
-pub(crate) fn register_timer<H: X86VlapicHostOps>(
-    deadline_nanos: u64,
-    callback: X86TimerCallback,
-) -> Option<usize> {
-    H::register_timer(deadline_nanos, callback)
-}
-
-pub(crate) fn cancel_timer<H: X86VlapicHostOps>(token: usize) {
-    H::cancel_timer(token);
-}
-
-pub(crate) fn write_bytes<H: X86VlapicHostOps>(bytes: &[u8]) {
-    H::write_bytes(bytes);
-}
-
-pub(crate) fn read_bytes<H: X86VlapicHostOps>(bytes: &mut [u8]) -> usize {
-    H::read_bytes(bytes)
-}
-
-pub(crate) fn current_vm_vcpu_num<H: X86VlapicHostOps>() -> usize {
-    H::current_vm_vcpu_num()
-}
-
-pub(crate) fn current_vm_active_vcpus<H: X86VlapicHostOps>() -> usize {
-    H::current_vm_active_vcpus()
-}
-
-pub(crate) fn active_vcpus<H: X86VlapicHostOps>(vm_id: X86VmId) -> Option<usize> {
-    H::active_vcpus(vm_id)
-}
-
-pub(crate) fn inject_interrupt<H: X86VlapicHostOps>(
-    vm_id: X86VmId,
-    vcpu_id: X86VcpuId,
-    vector: X86InterruptVector,
-) -> X86VlapicResult {
-    H::inject_interrupt(vm_id, vcpu_id, vector)
 }

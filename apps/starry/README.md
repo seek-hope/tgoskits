@@ -7,6 +7,11 @@ some x86_64 QEMU demos provide their own `cargo xtask starry qemu` commands.
 Cases are intentionally separate from `test-suit/starryos`: apps are
 operator-facing workflows, while the test suit remains CI-oriented coverage.
 
+Nightly performance applications live under `benchmarks/starry` and are
+selected as `-t benchmark/<case>`. They stay out of `cargo xtask starry app
+qemu --all`; the equally named QEMU smoke cases that remain in this directory
+keep their original names.
+
 ## Case Layout
 
 ```text
@@ -30,8 +35,36 @@ apps/starry/<case>/
 Example:
 
 ```bash
-cargo xtask starry app board -t orangepi-5-plus-uvc
+cargo xtask starry app board -t benchmark/orangepi-5-plus-uvc
 ```
+
+## Network throughput
+
+网络吞吐基准位于 `benchmarks/starry/network-throughput`，通过 ostool-server 的
+网络测试端口 3000 测量 HTTP 流式吞吐。它覆盖单流、双向和多流，每场景打印三轮样本和中位数：
+
+```bash
+cargo xtask starry app board -t benchmark/network-throughput -b OrangePi-5-Plus \
+  --board-config board-orangepi-5-plus.toml
+```
+
+固定 T01--T07 档位及板卡配置见
+[`network-throughput/README.md`](../../benchmarks/starry/network-throughput/README.md)。
+
+## AArch64 Linux perf
+
+`linux-perf` 应用在 AArch64 QEMU 和 OrangePi 5 Plus 的 StarryOS 客户机内运行
+Alpine 上游 `perf 6.19.14`，验证 `perf_event_open`、采样 ring、用户 FP 调用链、
+system-wide record，以及实体板卡的 PMUv3 事件。宿主机的 `tools/qperf` 则分析
+QEMU translation blocks，两者的计数来源和验收目标不同。
+
+```bash
+cargo xtask starry app qemu -t linux-perf --arch aarch64
+cargo xtask starry app board -t linux-perf -b OrangePi-5-Plus
+```
+
+锁定的 Alpine 依赖闭包及 QEMU、实体板卡各自的验收边界见
+`linux-perf/README.md`。
 
 ## Resource Monitor
 
@@ -54,14 +87,14 @@ The `picoclaw-cli` case is an opt-in StarryOS x86_64 QEMU workflow for checking
 PicoClaw compatibility in three stages: offline CLI smoke, online agent request,
 and gateway service smoke. It also provides an interactive StarryOS shell for
 manual PicoClaw use. It prepares local-only release assets and rootfs images
-under `target/picoclaw/` and `tmp/axbuild/rootfs/`.
+under `target/picoclaw/` and `target/axbuild/rootfs/`.
 
 ```bash
 apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-offline.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw.img
 ```
 
 See `picoclaw-cli/README.md` for the online agent, gateway, and interactive
@@ -83,7 +116,7 @@ PATH="$PWD/target/qemu-k230-docker-build:$PATH" \
   cargo xtask starry app qemu -t k230-kpu-nncase --arch riscv64
 ```
 
-See `k230-kpu-nncase/README.md` and `docs/docs/architecture/driver/k230-kpu-nncase-runtime.md` for the
+See `k230-kpu-nncase/README.md` and `docs/docs/runtime/k230-kpu-nncase-runtime.md` for the
 asset preparation flow.
 
 ## macOS AArch64 Self-Build
@@ -101,8 +134,8 @@ qemu-system-aarch64 \
   -cpu cortex-a53 \
   -m 512M \
   -smp 1 \
-  -device virtio-blk-pci,drive=disk0 \
-  -drive id=disk0,if=none,format=raw,file=tmp/axbuild/rootfs/rootfs-aarch64-alpine.img/rootfs-aarch64-alpine.img,file.locking=off \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
+  -drive id=disk0,if=none,format=raw,file=target/axbuild/rootfs/rootfs-aarch64-alpine.img,file.locking=off \
   -kernel target/starry-macos-selfbuild/uploaded/starryos-aarch64-unknown-none-softfloat.bin \
   -netdev user,id=net0
 ```
@@ -191,7 +224,7 @@ apps/starry/jcode/prepare_jcode_rootfs.sh
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/jcode/qemu-x86_64.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-jcode.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-jcode.img
 ```
 
 See `jcode/README.md` for interactive usage and troubleshooting.
@@ -213,21 +246,22 @@ nginx test entry in tgoskits workflows.
 
 ## Orange Pi 5 Plus UVC
 
-The `orangepi-5-plus-uvc` case needs `/usr/bin/uvc-fps` to be installed in the
-board rootfs before StarryOS is booted. The usual preparation flow is:
+The `orangepi-5-plus-uvc` case moved to `benchmarks/starry/orangepi-5-plus-uvc`
+as a nightly performance case. It needs `/usr/bin/uvc-fps` to be installed in
+the board rootfs before StarryOS is booted. The usual preparation flow is:
 
 1. reserve the board with `cargo board connect --board-type OrangePi-5-Plus`
    and leave that serial session open;
 2. boot into the board Linux shell and read the board IP from the login banner
    or `ip -br addr`;
-3. use SSH from the host to copy `apps/starry/orangepi-5-plus-uvc/uvc-fps/`
+3. use SSH from the host to copy `benchmarks/starry/orangepi-5-plus-uvc/uvc-fps/`
    into the board Linux system;
 4. build and install `uvc-fps` on the board Linux rootfs;
 5. close the `cargo board connect` session, then boot StarryOS with:
 
 ```bash
-cargo xtask starry app board -t orangepi-5-plus-uvc
+cargo xtask starry app board -t benchmark/orangepi-5-plus-uvc
 ```
 
-See `orangepi-5-plus-uvc/README.md` for the complete copy, build, install, and
-test commands.
+See `../../benchmarks/starry/orangepi-5-plus-uvc/README.md` for the complete copy,
+build, install, and test commands.

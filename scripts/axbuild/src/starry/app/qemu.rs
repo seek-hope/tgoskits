@@ -4,16 +4,20 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use serde::Deserialize;
 
 use super::{
     StarryAppQemuCase,
     build_config::{collect_prefixed_toml_files, discover_optional_build_config},
     discovery::resolve_case_relative_path,
     rootfs::prepare_qemu_app_rootfs,
-    types::{StarryAppCase, StarryAppKind},
+    types::{
+        AppOwnedRootfsPreparation, RootfsPreparation, RootfsPreparationConfig,
+        RootfsPreparationMode, StarryAppCase, StarryAppKind,
+    },
 };
 use crate::{
-    context::starry_target_for_arch_checked,
+    context::{DEFAULT_STARRY_ARCH, starry_target_for_arch_checked},
     test::{
         case::TestQemuCase,
         qemu::{self as qemu_test},
@@ -24,17 +28,25 @@ use crate::{
 struct LoadedQemuAppCaseFields {
     test_case: TestQemuCase,
     rootfs_path: Option<PathBuf>,
-    snapshot: bool,
+    rootfs_preparation: RootfsPreparation,
+    write_policy: crate::rootfs::qemu::RootfsWritePolicy,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct QemuAppConfig {
+    #[serde(default)]
+    rootfs_preparation: RootfsPreparationConfig,
 }
 
 pub(crate) async fn prepare_qemu_app_case(
     workspace_root: &Path,
+    target_dir: &Path,
     app: &StarryAppCase,
     arch: Option<&str>,
     explicit_qemu_config: Option<&Path>,
 ) -> anyhow::Result<StarryAppQemuCase> {
     ensure!(
-        app.kind == StarryAppKind::Qemu,
+        matches!(app.kind, StarryAppKind::Qemu | StarryAppKind::Both),
         "Starry app `{}` is not a QEMU app",
         app.name
     );
@@ -47,21 +59,26 @@ pub(crate) async fn prepare_qemu_app_case(
                 .and_then(arch_from_qemu_config_path)
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "x86_64".to_string());
+        .unwrap_or_else(|| DEFAULT_STARRY_ARCH.to_string());
     let target = starry_target_for_arch_checked(&arch)?.to_string();
     let build_config_path = discover_optional_build_config(&app.case_dir, &target)?;
     let fields = qemu_config_path
         .as_deref()
-        .map(|path| load_qemu_app_case_fields(workspace_root, app, path))
+        .map(|path| load_qemu_app_case_fields(workspace_root, target_dir, app, path))
         .transpose()?;
-    let rootfs_path = prepare_qemu_app_rootfs(
+    let rootfs = prepare_qemu_app_rootfs(
         workspace_root,
+        target_dir,
         app,
         &arch,
         &target,
         fields
             .as_ref()
             .and_then(|fields| fields.rootfs_path.as_deref()),
+        fields
+            .as_ref()
+            .map(|fields| &fields.rootfs_preparation)
+            .unwrap_or(&RootfsPreparation::Default),
     )
     .await?;
 
@@ -71,15 +88,19 @@ pub(crate) async fn prepare_qemu_app_case(
         target,
         build_config_path,
         qemu_config_path,
-        rootfs_path,
-        snapshot: fields.as_ref().is_none_or(|fields| fields.snapshot),
+        rootfs_path: rootfs.path,
+        rootfs_cleanup_dir: rootfs.cleanup_dir,
+        rootfs_write_policy: fields
+            .as_ref()
+            .map(|fields| fields.write_policy)
+            .unwrap_or_default(),
         test_commands: fields
             .as_ref()
             .map(|fields| fields.test_case.test_commands.clone())
             .unwrap_or_default(),
-        host_symbolize_success_regex: fields
+        grouped_command_selection: fields
             .as_ref()
-            .map(|fields| fields.test_case.host_symbolize_success_regex.clone())
+            .map(|fields| fields.test_case.grouped_command_selection)
             .unwrap_or_default(),
         host_http_server: fields
             .as_ref()
@@ -101,19 +122,21 @@ pub(crate) fn app_qemu_test_case(
         case_dir,
         qemu_config_path,
         test_commands: case.test_commands.clone(),
-        host_symbolize_success_regex: case.host_symbolize_success_regex.clone(),
+        grouped_command_selection: case.grouped_command_selection,
         host_http_server: case.host_http_server.clone(),
         subcases: case.subcases.clone(),
         grouped_subcase_filter: None,
+        ltp_case_id: None,
     })
 }
 
 fn load_qemu_app_case_fields(
     workspace_root: &Path,
+    target_dir: &Path,
     app: &StarryAppCase,
     qemu_config_path: &Path,
 ) -> anyhow::Result<LoadedQemuAppCaseFields> {
-    let test_case = qemu_test::load_test_qemu_case_fields(
+    let (test_case, write_policy) = qemu_test::load_qemu_case_fields_with_write_policy(
         app.name.clone(),
         app.name.clone(),
         app.case_dir.clone(),
@@ -121,26 +144,86 @@ fn load_qemu_app_case_fields(
         "Starry app",
         true,
     )?;
-    let rootfs_path = qemu_app_config_rootfs_path(workspace_root, qemu_config_path)?;
-    let snapshot = qemu_test::load_qemu_case_extra_config(qemu_config_path)?
-        .snapshot
-        .unwrap_or(true);
+    let rootfs_path = qemu_app_config_rootfs_path(workspace_root, target_dir, qemu_config_path)?;
+    let rootfs_preparation = qemu_app_rootfs_preparation(app, qemu_config_path)?;
 
     Ok(LoadedQemuAppCaseFields {
         test_case,
         rootfs_path,
-        snapshot,
+        rootfs_preparation,
+        write_policy,
     })
+}
+
+fn qemu_app_rootfs_preparation(
+    app: &StarryAppCase,
+    qemu_config_path: &Path,
+) -> anyhow::Result<RootfsPreparation> {
+    let content = fs::read_to_string(qemu_config_path)
+        .with_context(|| format!("failed to read {}", qemu_config_path.display()))?;
+    let config = toml::from_str::<QemuAppConfig>(&content)
+        .with_context(|| format!("failed to parse {}", qemu_config_path.display()))?
+        .rootfs_preparation;
+
+    match config.mode {
+        RootfsPreparationMode::Default => {
+            ensure!(
+                config.builder.is_none() && config.target_arch.is_none(),
+                "default rootfs preparation in {} must not declare a builder or target_arch",
+                qemu_config_path.display()
+            );
+            Ok(RootfsPreparation::Default)
+        }
+        RootfsPreparationMode::AppOwned => {
+            let builder = config.builder.with_context(|| {
+                format!(
+                    "app-owned rootfs preparation in {} requires `builder`",
+                    qemu_config_path.display()
+                )
+            })?;
+            ensure!(
+                !builder.is_absolute()
+                    && builder
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "app-owned rootfs builder `{}` must be relative to the app directory",
+                builder.display()
+            );
+            let builder_path = app.case_dir.join(&builder);
+            ensure!(
+                builder_path.is_file(),
+                "app-owned rootfs builder `{}` does not exist",
+                builder_path.display()
+            );
+            let target_arch = config.target_arch.with_context(|| {
+                format!(
+                    "app-owned rootfs preparation in {} requires `target_arch`",
+                    qemu_config_path.display()
+                )
+            })?;
+            ensure!(
+                !target_arch.trim().is_empty() && target_arch == target_arch.trim(),
+                "app-owned rootfs target_arch must be non-empty and trimmed"
+            );
+            Ok(RootfsPreparation::AppOwned(AppOwnedRootfsPreparation {
+                builder_path,
+                target_arch,
+            }))
+        }
+    }
 }
 
 fn qemu_app_config_rootfs_path(
     workspace_root: &Path,
+    target_dir: &Path,
     qemu_config_path: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     let qemu = read_qemu_app_config(qemu_config_path)?;
-    Ok(qemu_app_managed_rootfs_paths(workspace_root, &qemu)?
-        .into_iter()
-        .next())
+    Ok(
+        qemu_app_managed_rootfs_paths(workspace_root, target_dir, &qemu)?
+            .into_iter()
+            .next(),
+    )
 }
 
 fn read_qemu_app_config(qemu_config_path: &Path) -> anyhow::Result<ostool::run::qemu::QemuConfig> {
@@ -152,12 +235,14 @@ fn read_qemu_app_config(qemu_config_path: &Path) -> anyhow::Result<ostool::run::
 
 fn qemu_app_managed_rootfs_paths(
     workspace_root: &Path,
+    target_dir: &Path,
     qemu: &ostool::run::qemu::QemuConfig,
 ) -> anyhow::Result<Vec<PathBuf>> {
     crate::rootfs::qemu::drive_file_paths(qemu)
         .into_iter()
         .filter_map(|path| {
-            crate::image::storage::resolve_managed_rootfs_path(workspace_root, &path).transpose()
+            crate::image::storage::resolve_managed_rootfs_path(workspace_root, target_dir, &path)
+                .transpose()
         })
         .collect()
 }
@@ -171,7 +256,7 @@ pub(super) fn resolve_qemu_config(
         return Ok(Some(resolve_case_relative_path(&app.case_dir, path)));
     }
 
-    let arch = arch.unwrap_or("x86_64");
+    let arch = arch.unwrap_or(DEFAULT_STARRY_ARCH);
     let path = app.case_dir.join(qemu_config_name(arch));
     if path.is_file() {
         return Ok(Some(path));
@@ -232,3 +317,4 @@ fn arch_from_qemu_config_path(path: &Path) -> Option<&str> {
 #[cfg(test)]
 #[path = "tests/qemu.rs"]
 mod tests;
+// weave: run 'weave explain scripts/axbuild/src/starry/app/qemu.rs' for per-hunk detail, 'weave check' to verify your resolution

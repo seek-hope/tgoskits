@@ -112,57 +112,114 @@ stage_run_state() {
     printf 'ready %s prebuild\n' "$run_id" >"$overlay_dir/opt/starry-selfhost.state"
 }
 
-# Install the Rust toolchain on the host via rustup and inject the result as
-# a single uncompressed tar.  Host-side rustup produces a properly merged
-# toolchain tree (unlike manual tarball extraction, which leaves each
-# component in its own subdirectory).  The guest just needs `tar xf`.
+# Build a pre-extracted Rust toolchain tarball from host-downloaded components.
+# The guest cannot reliably extract .tar.xz files because: (1) QEMU slirp
+# degrades catastrophically for large downloads, and (2) StarryOS MemoryFs
+# (/tmp) has a limited size — filling it during XZ extraction freezes the
+# guest.  We download the six component tarballs on the host, extract them
+# into a merged toolchain tree, and inject a single uncompressed tar so the
+# guest only needs `tar xf` (no XZ, no network, no tmpfs pressure).
 stage_rust_toolchain() {
-    local toolchain_name="nightly-2026-05-28-x86_64-unknown-linux-musl"
+    local rust_date="2026-09-04"
+    local rust_dl="https://static.rust-lang.org/dist/${rust_date}"
+    local toolchain_name="nightly-2026-09-04-x86_64-unknown-linux-musl"
+    local toolchain_version="4"
+    local version_file=".starry-selfhost-toolchain-version"
+    local stage_dir="$output_dir/toolchain-stage"
+    local toolchain_dir="$stage_dir/$toolchain_name"
+    local component_stage="$stage_dir/component"
+    local cache_dir="$output_dir/toolchain-downloads"
     local output_tar="$output_dir/rust-toolchain.tar"
 
-    if [ -f "$output_tar" ] && [ "$(stat -c%s "$output_tar" 2>/dev/null)" -gt 500000000 ]; then
+    # component → sha256 from channel-rust-nightly.toml
+    local pairs=(
+        "rustc:01ee9e20ea9ed52bd6a3f53ea361ea15025cf1d26247853f560fb0015b49c404"
+        "cargo:a05e5b60629349dfc0a0d9cb0ab4676c76b003d6ac74425e8481fa77533a11d1"
+        "rust-std:1ec624e0db948dd4162895b2e2f2195506958810a768c87dc3c38d115229c493"
+        "rust-src:e5a4a08ae5a771eb1a1d25d4ea2b0165178ab2e239fb6cd0fed1e8b37b2e2965"
+        "llvm-tools:4780812e36b8f607a8d08a5fc825daf2ff61d21443229d8e180ad7d1cb940699"
+        "rust-std-none:1464b0a0c10276f3b1efb1687a78606c14283767a0de6fa696eab328fce9ad7d"
+    )
+
+    if [[ -f "$output_tar" ]] \
+        && [[ "$(tar -xOf "$output_tar" "$toolchain_name/$version_file" 2>/dev/null)" \
+            == "$toolchain_version" ]]; then
         echo "[prebuild] rust toolchain tar already built ($(du -h "$output_tar" | cut -f1)) — skipping"
         install -m 0644 "$output_tar" "$overlay_dir/opt/rust-toolchain.tar"
         return
     fi
 
-    echo "[prebuild] installing Rust musl toolchain on host via rustup..."
-    # Install the minimal musl toolchain (cross-compilation — binaries are
-    # glibc-linked on the host, std libs are for musl).
-    rustup toolchain install "$toolchain_name" --profile minimal --force-non-host 2>/dev/null || {
-        echo "[prebuild] ERROR: failed to install $toolchain_name via rustup" >&2
-        exit 1
-    }
+    rm -rf "$stage_dir"
+    mkdir -p "$toolchain_dir" "$cache_dir"
 
-    # Add the extra components and the bare-metal target.
-    rustup component add --toolchain "$toolchain_name" rust-src llvm-tools-preview 2>/dev/null || true
-    rustup target add --toolchain "$toolchain_name" x86_64-unknown-none 2>/dev/null || true
+    for pair in "${pairs[@]}"; do
+        component="${pair%%:*}"
+        hash="${pair##*:}"
+        case "$component" in
+            rust-src)        tarball="rust-src-nightly.tar.xz" ;;
+            llvm-tools)      tarball="llvm-tools-nightly-x86_64-unknown-linux-musl.tar.xz" ;;
+            rust-std-none)   tarball="rust-std-nightly-x86_64-unknown-none.tar.xz" ;;
+            *)               tarball="${component}-nightly-x86_64-unknown-linux-musl.tar.xz" ;;
+        esac
+        url="${rust_dl}/${tarball}"
+        dest="$cache_dir/$hash"
 
-    local src_dir="$HOME/.rustup/toolchains/$toolchain_name"
-    [ -d "$src_dir/bin" ] || {
-        echo "[prebuild] ERROR: toolchain directory missing: $src_dir" >&2
-        exit 1
-    }
+        if [[ -f "$dest" ]] \
+            && printf '%s  %s\n' "$hash" "$dest" | sha256sum --check --status; then
+            echo "[prebuild]   ${component} already downloaded ($(du -h "$dest" | cut -f1))"
+        else
+            rm -f "$dest"
+            echo "[prebuild]   downloading ${tarball}..."
+            curl -fsSL --retry 3 --connect-timeout 30 --max-time 600 \
+                "$url" -o "${dest}.tmp" 2>/dev/null || {
+                    rm -f "${dest}.tmp"
+                    echo "[prebuild] ERROR: failed to download ${tarball}" >&2
+                    exit 1
+            }
+            mv "${dest}.tmp" "$dest"
+        fi
 
-    echo "[prebuild] creating uncompressed toolchain tar from host rustup install..."
-    tar -C "$HOME/.rustup/toolchains" -cf "$output_tar" "$toolchain_name"
+        if ! printf '%s  %s\n' "$hash" "$dest" | sha256sum --check --status; then
+            rm -f "$dest"
+            echo "[prebuild] ERROR: checksum mismatch for ${tarball}" >&2
+            exit 1
+        fi
+
+        echo "[prebuild]   installing ${tarball}..."
+        rm -rf "$component_stage"
+        mkdir -p "$component_stage"
+        tar xf "$dest" -C "$component_stage" 2>/dev/null || {
+            echo "[prebuild] ERROR: failed to extract ${tarball}" >&2
+            exit 1
+        }
+        installer="$(find "$component_stage" -mindepth 2 -maxdepth 2 -type f -name install.sh -print -quit)"
+        if [[ -z "$installer" ]]; then
+            echo "[prebuild] ERROR: installer missing from ${tarball}" >&2
+            exit 1
+        fi
+        bash "$installer" --prefix="$toolchain_dir" --disable-ldconfig >/dev/null || {
+            echo "[prebuild] ERROR: failed to install ${tarball}" >&2
+            exit 1
+        }
+    done
+
+    [[ -x "$toolchain_dir/bin/rustc" ]] \
+        || { echo "[prebuild] ERROR: rustc missing from assembled toolchain" >&2; exit 1; }
+    [[ -x "$toolchain_dir/bin/cargo" ]] \
+        || { echo "[prebuild] ERROR: cargo missing from assembled toolchain" >&2; exit 1; }
+    [[ -d "$toolchain_dir/lib/rustlib/src/rust/library" ]] \
+        || { echo "[prebuild] ERROR: rust-src missing from assembled toolchain" >&2; exit 1; }
+    [[ -d "$toolchain_dir/lib/rustlib/x86_64-unknown-none/lib" ]] \
+        || { echo "[prebuild] ERROR: x86_64-unknown-none missing from assembled toolchain" >&2; exit 1; }
+    printf '%s\n' "$toolchain_version" >"$toolchain_dir/$version_file"
+
+    echo "[prebuild] creating uncompressed toolchain tar..."
+    rm -f "$output_tar"
+    tar -C "$stage_dir" -cf "$output_tar" "$toolchain_name"
     echo "[prebuild] rust toolchain tar built ($(du -h "$output_tar" | cut -f1))"
 
+    rm -rf "$stage_dir"
     install -m 0644 "$output_tar" "$overlay_dir/opt/rust-toolchain.tar"
-
-    # Also pre-download rustup-init.sh on the host so the guest doesn't
-    # need QEMU slirp networking for this ~10 MB download.
-    local rustup_init="$output_dir/rustup-init.sh"
-    if [ ! -f "$rustup_init" ] || [ "$(stat -c%s "$rustup_init" 2>/dev/null)" -lt 1000000 ]; then
-        echo "[prebuild] downloading rustup-init.sh..."
-        curl -fsSL --retry 3 --connect-timeout 30 --max-time 120 \
-            https://sh.rustup.rs -o "$rustup_init" || {
-            echo "[prebuild] WARNING: failed to download rustup-init.sh" >&2
-            return
-        }
-    fi
-    install -m 0755 "$rustup_init" "$overlay_dir/opt/rustup-init.sh"
-    echo "[prebuild] rustup-init.sh staged"
 }
 
 require_x86_64

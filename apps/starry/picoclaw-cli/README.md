@@ -21,8 +21,8 @@ apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh
 ```bash
 cargo xtask starry qemu \
   --arch x86_64 \
-  --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-offline.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-alpine.img
+  --qemu-config apps/starry/picoclaw-cli/qemu-x86_64.toml \
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-alpine.img
 ```
 
 成功标记：
@@ -38,7 +38,7 @@ STARRY_PICOCLAW_OFFLINE_PASSED
 ```bash
 PICOCLAW_API_KEY=sk-... \
 apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
   --proxy http://10.0.2.2:7890
 ```
 
@@ -73,7 +73,7 @@ OpenAI-compatible 调用链没有回传 `reasoning_content`，所以脚本会为
 
 ```bash
 apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
   --api-key "$PICOCLAW_API_KEY" \
   --provider openai \
   --model-name mimo-v25 \
@@ -85,7 +85,7 @@ apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh \
 
 ```bash
 apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img \
   --config-json /path/to/config.json \
   --security-yml /path/to/.security.yml \
   --env-file /path/to/online-env
@@ -99,7 +99,7 @@ apps/starry/picoclaw-cli/prepare_picoclaw_rootfs.sh \
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-agent.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
 ```
 
 成功标记：
@@ -118,7 +118,7 @@ Gateway smoke 复用在线 rootfs，不会发起模型请求；它在 guest 内�
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-gateway.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
 ```
 
 成功标记：
@@ -157,34 +157,19 @@ STARRY_PICOCLAW_AGENT_PASSED
 
 中间还会看到多段 `PicoClaw chat`，用于现场展示 StarryOS guest 内连续模型对话。
 
-## 交互式长期使用
+## 离线测试配置
 
-如果希望进入 StarryOS 后自己持续输入 PicoClaw 命令，可以运行：
-
-```bash
-PICOCLAW_API_KEY=... apps/starry/picoclaw-cli/run_picoclaw_interactive.sh
-```
-
-脚本默认创建或复用 `tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-user.img`，
-然后启动一个不带自动退出条件的 StarryOS shell。进入 guest 后优先运行裸
-`picoclaw agent`，它会进入持续交互模式，可以连续输入多轮消息：
+`qemu-x86_64-picoclaw-interactive.toml` 保留原文件名，现在执行版本、帮助、初始化配置和状态检查，匹配 `STARRY_PICOCLAW_OFFLINE_PASSED` 后退出，不再作为长期交互入口。
 
 ```bash
-picoclaw status
-picoclaw agent
-picoclaw gateway --allow-empty --host 127.0.0.1 --port 18790
+cargo xtask starry app qemu -t picoclaw-cli --arch x86_64 \
+  --qemu-config qemu-x86_64-picoclaw-interactive.toml
 ```
 
-交互式 QEMU 默认把 guest 的 `18790` 转发到宿主机。启动 gateway 后，宿主机可以访问：
-
-```bash
-curl http://127.0.0.1:18790/health
-```
-
-退出 QEMU 使用 `Ctrl-a x`。
+离线检查使用客户机 `/tmp/picoclaw-smoke-home` 保存测试配置，不改动 `/root/.picoclaw`。`run_picoclaw_interactive.sh` 的默认配置也会执行该离线检查后退出；脚本名保留，不再表示持续交互。
 
 ## 边界
 
 - 第一目标只覆盖 StarryOS x86_64 QEMU。
-- 资产放在 `target/picoclaw/assets/`，rootfs 放在 `tmp/axbuild/rootfs/`。
+- 资产放在 `target/picoclaw/assets/`，rootfs 放在 `target/axbuild/rootfs/`。
 - 如果 smoke 暴露 syscall 或 ABI 缺口，再按最小复现补 StarryOS 内核和对应回归测试。

@@ -4,14 +4,16 @@
 # dropbear suite on-target with `apk add` then drives every SSH session over 127.0.0.1.
 args = [
     "-nographic", "-m", "1024M", "-smp", "1", "-cpu", "cortex-a72",
-    "-device", "virtio-blk-pci,drive=disk0",
-    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+    "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-aarch64-alpine.img",
     "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0",
 ]
 uefi = false
 to_bin = true
-shell_prefix = "root@starry:"
-shell_init_cmd = "sh /usr/bin/run-dropbear.sh"
-success_regex = ['(?m)^TEST PASSED\s*$']
 fail_regex = ['(?i)\bpanic(?:ked)?\b', '(?m)^TEST FAILED\s*$']
 timeout = 3600
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = "sh /usr/bin/run-dropbear.sh"
+success_regex = ['(?m)^TEST PASSED\s*$']

@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 
-use ax_kspin::{SpinRaw as Mutex, SpinRwLock as RwLock};
+use ax_sync::{RawSpinLock, RawSpinRwLock};
+use dma_api::DmaDirection;
 use mbarrier::wmb;
 use usb_if::err::TransferError;
 use xhci::{
@@ -12,31 +13,34 @@ use super::{reg::XhciRegisters, ring::SendRing};
 use crate::{err::ConvertXhciError, osal::Kernel, queue::Finished};
 
 #[derive(Clone)]
-pub struct CommandRing(Arc<Mutex<Inner>>);
+pub struct CommandRing(Arc<RawSpinLock<Inner>>);
 
 impl CommandRing {
     pub fn new(
-        direction: crate::osal::DmaDirection,
+        direction: DmaDirection,
         dma: &Kernel,
-        reg: Arc<RwLock<XhciRegisters>>,
+        reg: Arc<RawSpinRwLock<XhciRegisters>>,
     ) -> crate::err::Result<Self> {
         let ring = SendRing::new(direction, dma)?;
         let inner = Inner { ring, reg };
-        Ok(Self(Arc::new(Mutex::new(inner))))
+        Ok(Self(Arc::new(RawSpinLock::new(inner))))
     }
 
     pub fn bus_addr(&self) -> crate::BusAddr {
-        let inner = self.0.lock();
+        // SAFETY: command-ring access excludes local xHCI event re-entry.
+        let inner = unsafe { self.0.lock_raw() };
         inner.ring.bus_addr()
     }
 
     pub fn cycle(&self) -> bool {
-        let inner = self.0.lock();
+        // SAFETY: command-ring access excludes local xHCI event re-entry.
+        let inner = unsafe { self.0.lock_raw() };
         inner.ring.cycle()
     }
 
     pub fn finished_handle(&self) -> Finished<CommandCompletion> {
-        let inner = self.0.lock();
+        // SAFETY: command-ring access excludes local xHCI event re-entry.
+        let inner = unsafe { self.0.lock_raw() };
         inner.ring.finished_handle()
     }
 
@@ -45,7 +49,8 @@ impl CommandRing {
         trb: command::Allowed,
     ) -> Result<CommandCompletion, TransferError> {
         let fur = {
-            let mut inner = self.0.lock();
+            // SAFETY: command submission excludes local xHCI event re-entry.
+            let mut inner = unsafe { self.0.lock_raw() };
             let trb_addr = inner.ring.enque_command(trb);
             let fur = inner.ring.take_finished_future(trb_addr);
             wmb();
@@ -70,5 +75,5 @@ impl CommandRing {
 
 struct Inner {
     ring: SendRing<CommandCompletion>,
-    reg: Arc<RwLock<XhciRegisters>>,
+    reg: Arc<RawSpinRwLock<XhciRegisters>>,
 }

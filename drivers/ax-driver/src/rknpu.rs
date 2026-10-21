@@ -1,21 +1,46 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{format, sync::Arc, vec::Vec};
 use core::any::Any;
 
-use log::info;
-use rdrive::{probe::OnProbeError, register::ProbeFdt};
+use log::{info, warn};
+use rdrive::{
+    DriverGeneric,
+    probe::{
+        OnProbeError,
+        fdt::{FdtInfo, ResetLine, ResourcePrepareConfig},
+    },
+    register::ProbeFdt,
+};
 pub use rockchip_npu::{
-    GemBufferInfo, GemCachePolicy, RknpuAction,
+    GemBufferInfo, GemCachePolicy, GemOwner, RKNPU_CORE0_MASK, RKNPU_CORE1_MASK, RKNPU_CORE2_MASK,
+    RknpuAction, RknpuTask,
     ioctrl::{RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync, RknpuSubmit},
 };
 use rockchip_npu::{Rknpu, RknpuConfig, RknpuType};
 
 use crate::mmio::iomap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+const RK3588_NPU_CLOCK_NAME: &str = "clk_npu";
+// Highest RK3588 NPU OPP that needs no more than the firmware-provided 750 mV.
+const RK3588_NPU_FIXED_RATE_HZ: u64 = 800_000_000;
+const RK3588_NPU_SUPPLY: &str = "rknpu-supply";
+const RK3588_NPU_MEM_SUPPLY: &str = "mem-supply";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error("Rockchip NPU is unavailable or the requested object was not found")]
     NotFound,
+    #[error("Rockchip NPU is busy")]
     Busy,
+    #[error("Rockchip NPU request timed out")]
+    TimedOut,
+    #[error("Rockchip NPU reset failed after a timed-out submission; the device is quarantined")]
+    Quarantined,
+    #[error("Rockchip NPU request contains invalid data")]
     InvalidData,
+    #[error("Rockchip NPU allocation or quota exhausted")]
+    NoMemory,
+    #[error("Rockchip NPU user task submission is not supported by this DMA setup")]
+    NotSupported,
 }
 
 crate::model_register!(
@@ -30,8 +55,84 @@ crate::model_register!(
     ],
 );
 
+struct RknpuDevice {
+    core: Rknpu,
+    resets: Vec<ResetLine>,
+    state: DeviceState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceState {
+    Operational,
+    Quarantined,
+}
+
+impl DeviceState {
+    fn ensure_operational(self) -> Result<(), Error> {
+        if matches!(self, Self::Quarantined) {
+            Err(Error::Quarantined)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl RknpuDevice {
+    fn ensure_available(&self) -> Result<(), Error> {
+        self.state.ensure_operational()
+    }
+
+    fn recover_timeout(&mut self) -> Result<(), Error> {
+        recover_after_timeout(&mut self.state, || {
+            for reset in &self.resets {
+                reset.reset().map_err(|err| {
+                    log::error!(
+                        "RKNPU reset {:?} ({:#x}) failed after timeout: {err}",
+                        reset.name(),
+                        reset.id().raw()
+                    );
+                    Error::Quarantined
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn destroy_gem(&mut self, handle: u32) -> Result<(), Error> {
+        cleanup_gem_if_safe(self.state, || self.core.destroy(handle))
+    }
+}
+
+fn recover_after_timeout(
+    state: &mut DeviceState,
+    reset_all_cores: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Err(err) = reset_all_cores() {
+        quarantine_device(state);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn quarantine_device(state: &mut DeviceState) {
+    *state = DeviceState::Quarantined;
+}
+
+fn cleanup_gem_if_safe<T>(state: DeviceState, cleanup: impl FnOnce() -> T) -> Result<T, Error> {
+    state.ensure_operational()?;
+    Ok(cleanup())
+}
+
+impl DriverGeneric for RknpuDevice {
+    fn name(&self) -> &str {
+        self.core.name()
+    }
+}
+
 fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let (info, plat_dev) = probe.into_parts();
+    prepare_resources(&info)?;
+    configure_fixed_clock(&info)?;
     let regs = info.node.regs();
 
     let config = RknpuConfig {
@@ -52,15 +153,70 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         base_regs.push(unsafe { iomap(start, size)?.add(offset) });
     }
 
-    let dma = axklib::dma::device_with_mask(u32::MAX as u64);
-    let npu = Rknpu::new(&base_regs, config, dma);
+    let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
+        dma_api::DmaDomainId::Direct,
+        crate::binding_resolver::dma_coherency_from_fdt(&info),
+        dma_api::DmaConstraints::new(u32::MAX as u64),
+    ));
+    let resets = info.reset_lines()?;
+    if resets.is_empty() {
+        return Err(OnProbeError::other("RKNPU node has no reset line"));
+    }
+    let core = Rknpu::new(&base_regs, config, dma).map_err(|error| {
+        OnProbeError::other(format!("failed to initialize RK3588 NPU: {error}"))
+    })?;
+    let npu = RknpuDevice {
+        core,
+        resets,
+        state: DeviceState::Operational,
+    };
     plat_dev.register(npu);
     info!("NPU registered successfully");
     Ok(())
 }
 
+/// Powers the NPU on before the first register access.
+///
+/// The OrangePi-5-Plus node declares three NPU power domains, eight clocks, six CRU
+/// resets, and the `rknpu-supply`/`mem-supply` rails. `clk_npu` is the NPU root clock
+/// owned by the SoC firmware through SCMI, so builds without an SCMI clock driver
+/// still prepare every resource the OS owns instead of failing the probe.
+fn prepare_resources(info: &FdtInfo<'_>) -> Result<(), OnProbeError> {
+    info.prepare_resources(
+        ResourcePrepareConfig::default()
+            .with_assigned_clocks()
+            .with_power_domains()
+            .with_optional_clock_providers()
+            .with_supply(RK3588_NPU_SUPPLY)
+            .with_supply(RK3588_NPU_MEM_SUPPLY),
+    )?;
+    Ok(())
+}
+
+fn configure_fixed_clock(info: &FdtInfo<'_>) -> Result<(), OnProbeError> {
+    // The firmware-owned SCMI clock cannot be retuned without its driver, so keep the
+    // rate the firmware set before handoff instead of failing the whole probe.
+    let Some(clock) = info.find_optional_clock_line_by_name(RK3588_NPU_CLOCK_NAME)? else {
+        warn!(
+            "RK3588 NPU {RK3588_NPU_CLOCK_NAME} has no rdrive clock provider; keeping the rate \
+             configured before handoff"
+        );
+        return Ok(());
+    };
+    clock.set_rate(RK3588_NPU_FIXED_RATE_HZ)?;
+    let actual_rate = clock.rate()?;
+    if actual_rate != RK3588_NPU_FIXED_RATE_HZ {
+        return Err(OnProbeError::other(format!(
+            "RK3588 NPU clock rate mismatch: requested {} Hz, got {actual_rate} Hz",
+            RK3588_NPU_FIXED_RATE_HZ
+        )));
+    }
+    info!("RK3588 NPU fixed clock rate: {actual_rate} Hz");
+    Ok(())
+}
+
 pub fn is_available() -> bool {
-    rdrive::get_one::<Rknpu>().is_some()
+    rdrive::get_one::<RknpuDevice>().is_some()
 }
 
 pub fn obj_addr_and_size(handle: u32) -> Result<(usize, usize), Error> {
@@ -78,12 +234,79 @@ pub fn buffer_retainer(handle: u32) -> Result<Arc<dyn Any + Send + Sync>, Error>
     with_npu(|npu| npu.buffer_retainer(handle).ok_or(Error::NotFound))
 }
 
-pub fn submit(args: &mut RknpuSubmit) -> Result<(), Error> {
-    with_npu(|npu| npu.submit_ioctrl(args).map_err(|_| Error::InvalidData))
+pub fn submit(args: &mut RknpuSubmit, tasks: &mut [RknpuTask]) -> Result<(), Error> {
+    let mut npu = rdrive::get_one::<RknpuDevice>()
+        .ok_or(Error::NotFound)?
+        .try_lock()
+        .map_err(|_| Error::Busy)?;
+    npu.ensure_available()?;
+    if !npu.core.user_submit_supported() {
+        return Err(Error::NotSupported);
+    }
+    let mut clock = axklib::time::monotonic_nanos;
+    match npu.core.submit_ioctrl(args, tasks, &mut clock) {
+        Ok(()) => Ok(()),
+        Err(rockchip_npu::RknpuError::Timeout) => {
+            npu.recover_timeout()?;
+            Err(Error::TimedOut)
+        }
+        Err(_) => Err(Error::InvalidData),
+    }
 }
 
-pub fn mem_create(args: &mut RknpuMemCreate) -> Result<(), Error> {
-    with_npu(|npu| npu.create(args).map_err(|_| Error::InvalidData))
+/// Submit a task snapshot for a producer authorized to issue raw DMA commands.
+///
+/// # Safety
+/// The caller must check raw-I/O authority for the current submitting process
+/// and keep its command/data buffers pinned until this synchronous operation
+/// returns. The producer is trusted to access physical memory on Direct DMA.
+pub unsafe fn submit_rawio(args: &mut RknpuSubmit, tasks: &mut [RknpuTask]) -> Result<(), Error> {
+    let mut npu = rdrive::get_one::<RknpuDevice>()
+        .ok_or(Error::NotFound)?
+        .try_lock()
+        .map_err(|_| Error::Busy)?;
+    npu.ensure_available()?;
+    let mut clock = axklib::time::monotonic_nanos;
+    // SAFETY: authorization and buffer lifetime are the caller's documented
+    // contract; this lock serializes the entire submission and recovery.
+    match unsafe { npu.core.submit_rawio(args, tasks, &mut clock) } {
+        Ok(()) => Ok(()),
+        Err(rockchip_npu::RknpuError::Timeout) => {
+            npu.recover_timeout()?;
+            Err(Error::TimedOut)
+        }
+        Err(_) => Err(Error::InvalidData),
+    }
+}
+
+/// Reports whether the current RKNPU instance can safely accept user tasks.
+///
+/// The capability is separate from GEM allocation and mapping: those paths
+/// remain available for the direct DMA domain used by RK3588, while user task
+/// submission stays disabled until a translated IOMMU domain and a matching
+/// CPU physical-address mapping are wired together.
+pub fn submit_available() -> Result<bool, Error> {
+    with_npu(|npu| Ok(npu.user_submit_supported()))
+}
+
+/// Resolve the core mask using the same device state as a later submission.
+///
+/// Card-specific validation uses this result to select only task descriptors
+/// that the portable RKNPU submit path will consume.
+pub fn normalize_core_mask(requested_mask: u32) -> Result<u32, Error> {
+    with_npu(|npu| {
+        npu.normalize_core_mask(requested_mask)
+            .map_err(|_| Error::InvalidData)
+    })
+}
+
+pub fn mem_create(owner: &GemOwner, args: &mut RknpuMemCreate) -> Result<(), Error> {
+    with_npu(|npu| {
+        npu.create(owner, args).map_err(|error| match error {
+            rockchip_npu::RknpuError::OutOfMemory => Error::NoMemory,
+            _ => Error::InvalidData,
+        })
+    })
 }
 
 /// Import an externally-owned, physically-contiguous buffer (resolved from a
@@ -105,12 +328,15 @@ pub fn mem_sync(args: &mut RknpuMemSync) -> Result<(), Error> {
 }
 
 /// Release a GEM handle, freeing an owned allocation or dropping the retainer of
-/// an imported buffer. A missing handle is a no-op.
+/// an imported buffer. A missing handle is a no-op. If the device is quarantined,
+/// this returns [`Error::Quarantined`] and keeps the handle because the device may
+/// still be accessing its backing allocation.
 pub fn mem_destroy(handle: u32) -> Result<(), Error> {
-    with_npu(|npu| {
-        npu.destroy(handle);
-        Ok(())
-    })
+    let mut npu = rdrive::get_one::<RknpuDevice>()
+        .ok_or(Error::NotFound)?
+        .try_lock()
+        .map_err(|_| Error::Busy)?;
+    npu.destroy_gem(handle)
 }
 
 pub fn mem_map_offset(handle: u32) -> Result<u64, Error> {
@@ -129,9 +355,63 @@ fn with_npu<F, R>(f: F) -> Result<R, Error>
 where
     F: FnOnce(&mut Rknpu) -> Result<R, Error>,
 {
-    let mut npu = rdrive::get_one::<Rknpu>()
+    let mut npu = rdrive::get_one::<RknpuDevice>()
         .ok_or(Error::NotFound)?
         .try_lock()
         .map_err(|_| Error::Busy)?;
-    f(&mut npu)
+    npu.ensure_available()?;
+    f(&mut npu.core)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_timeout_recovery_quarantines_the_device() {
+        let mut state = DeviceState::Operational;
+        let mut reset_attempted = false;
+
+        assert_eq!(
+            recover_after_timeout(&mut state, || {
+                reset_attempted = true;
+                Err(Error::Quarantined)
+            }),
+            Err(Error::Quarantined)
+        );
+
+        assert!(reset_attempted);
+        assert_eq!(state, DeviceState::Quarantined);
+        assert_eq!(state.ensure_operational(), Err(Error::Quarantined));
+    }
+
+    #[test]
+    fn failed_reset_keeps_gem_backing_for_deferred_cleanup() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropSpy(Arc<AtomicBool>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut state = DeviceState::Operational;
+        assert_eq!(
+            recover_after_timeout(&mut state, || Err(Error::Quarantined)),
+            Err(Error::Quarantined)
+        );
+
+        let released = Arc::new(AtomicBool::new(false));
+        let mut backing = Some(DropSpy(released.clone()));
+        let result = cleanup_gem_if_safe(state, || backing.take());
+
+        assert!(matches!(result, Err(Error::Quarantined)));
+        assert!(backing.is_some());
+        assert!(!released.load(Ordering::SeqCst));
+
+        drop(backing);
+        assert!(released.load(Ordering::SeqCst));
+    }
 }

@@ -97,6 +97,14 @@ pub(super) fn exit_status_code(status: &ExitStatus) -> i32 {
         .unwrap_or_else(|| if status.success() { 0 } else { 1 })
 }
 
+pub(super) fn report_returncode(returncode: i32, timed_out: bool) -> i32 {
+    if timed_out && returncode == 124 {
+        0
+    } else {
+        returncode
+    }
+}
+
 fn nonnegative_delta(after: i128, before: i128) -> i128 {
     after.saturating_sub(before).max(0)
 }

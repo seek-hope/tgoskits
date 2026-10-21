@@ -1,24 +1,16 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{any::Any, task::Context};
+use core::any::Any;
 
 use ax_fs_ng::vfs::CachedFile;
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
 use axfs_ng_vfs::{
-    DeviceId, FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate,
-    NodeFlags, NodeOps, NodePermission, NodeType, VfsError, VfsResult,
+    DeviceId, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
+    NodePermission, NodeType, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 
 use super::{SimpleFs, SimpleFsNode};
-
-fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
-    IoEvents::from_bits_truncate(events.bits())
-}
-
-fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
-    FsIoEvents::from_bits_truncate(events.bits())
-}
 
 /// Mmap behavior for devices.
 #[derive(Clone)]
@@ -35,13 +27,28 @@ pub enum DeviceMmap {
     ///
     /// This is for DMA buffers that are normal memory and whose driver/runtime
     /// performs explicit cache maintenance around device access.
-    #[cfg(feature = "rknpu")]
     PhysicalCached(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
     /// Maps to an already offset-resolved physical address range.
     ///
     /// This is for file descriptors whose mmap offset is a selector rather than
     /// a byte offset into a linear device, such as io_uring ring offsets.
     PhysicalResolved(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
+    /// Cacheable counterpart of [`Self::PhysicalResolved`]: the mmap offset is
+    /// a selector (the range is already resolved), but the backing is normal
+    /// memory the CPU may cache. GPU host-visible shared memory (e.g. the
+    /// virtio-gpu hostmem BAR) lands here — userspace runs atomic RMW on ring
+    /// buffers in it, which device-memory mappings would not support.
+    PhysicalCachedResolved(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
+    /// Maps to an already offset-resolved physical GEM range whose backing
+    /// allocation is fully initialized only through complete pages.
+    ///
+    /// Unlike [`Self::Physical`], this variant caps the mapping length down to
+    /// a complete page so a partial final allocation page is never exposed.
+    #[cfg(feature = "rknpu")]
+    PhysicalResolvedPageCapped(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
+    /// Cacheable counterpart of [`Self::PhysicalResolvedPageCapped`].
+    #[cfg(feature = "rknpu")]
+    PhysicalCachedResolvedPageCapped(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
     /// Maps to an explicit physical page list for this exact mmap request.
     /// The producer has already applied the requested offset and length, so
     /// mmap callers must map these pages in order without adding the offset
@@ -54,12 +61,27 @@ pub enum DeviceMmap {
 
 /// Trait for device operations.
 pub trait DeviceOps: Send + Sync {
+    /// Returns the addressable byte length, independently of stat's size field.
+    fn len(&self) -> VfsResult<u64> {
+        Ok(0)
+    }
+
+    /// Flushes device data and, unless `data_only`, its backing metadata.
+    fn sync(&self, _data_only: bool) -> VfsResult<()> {
+        Err(VfsError::InvalidInput)
+    }
+
     /// Reads data from the device at the specified offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
     /// Writes data to the device at the specified offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
     /// Manipulates the underlying device parameters of special files.
-    fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
+    fn ioctl(
+        &self,
+        _current: &crate::task::UserTaskRef,
+        _cmd: u32,
+        _arg: usize,
+    ) -> VfsResult<usize> {
         Err(VfsError::NotATty)
     }
 
@@ -109,7 +131,7 @@ impl Device {
         ops: Arc<dyn DeviceOps>,
     ) -> Arc<Self> {
         let node = SimpleFsNode::new(fs, node_type, NodePermission::default());
-        node.metadata.lock().rdev = device_id;
+        node.metadata.lock_irqsave().rdev = device_id;
         Arc::new(Self { node, ops })
     }
 
@@ -120,12 +142,22 @@ impl Device {
 
     /// Updates the device ID.
     pub fn set_device_id(&self, device_id: DeviceId) {
-        self.node.metadata.lock().rdev = device_id;
+        self.node.metadata.lock_irqsave().rdev = device_id;
     }
 
     /// Returns the memory mapping behavior of the device for the given offset.
     pub fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
         self.ops.mmap(offset, length)
+    }
+
+    /// Executes a user ioctl with an explicit address-space capability.
+    pub fn ioctl_for_task(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> VfsResult<usize> {
+        self.ops.ioctl(current, cmd, arg)
     }
 }
 
@@ -139,8 +171,8 @@ impl NodeOps for Device {
 
     fn filesystem(&self) -> &dyn FilesystemOps;
 
-    fn sync(&self, _data_only: bool) -> VfsResult<()> {
-        Err(VfsError::InvalidInput)
+    fn sync(&self, data_only: bool) -> VfsResult<()> {
+        self.ops.sync(data_only)
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
@@ -148,7 +180,7 @@ impl NodeOps for Device {
     }
 
     fn len(&self) -> VfsResult<u64> {
-        Ok(0)
+        self.ops.len()
     }
 
     fn flags(&self) -> NodeFlags {
@@ -178,37 +210,38 @@ impl FileNodeOps for Device {
         }
     }
 
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-        Err(VfsError::BadFileDescriptor)
-    }
-
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        self.ops.ioctl(cmd, arg)
-    }
-}
-
-impl FsPollable for Device {
-    fn poll(&self) -> FsIoEvents {
-        if let Some(pollable) = self.ops.as_pollable() {
-            io_events_to_fs(pollable.poll())
-        } else {
-            FsIoEvents::IN | FsIoEvents::OUT
-        }
-    }
-
-    fn register(&self, context: &mut Context<'_>, events: FsIoEvents) {
-        if let Some(pollable) = self.ops.as_pollable() {
-            pollable.register(context, fs_events_to_io(events));
-        }
+        let _ = (cmd, arg);
+        Err(VfsError::NotATty)
     }
 }
 
 impl Pollable for Device {
     fn poll(&self) -> IoEvents {
-        fs_events_to_io(FsPollable::poll(self))
+        if let Some(pollable) = self.ops.as_pollable() {
+            pollable.poll()
+        } else {
+            IoEvents::IN | IoEvents::OUT
+        }
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        FsPollable::register(self, context, io_events_to_fs(events));
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: IoEvents,
+    ) {
+        if let Some(pollable) = self.ops.as_pollable() {
+            unsafe { pollable.register_shared(sink, events) };
+        }
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: IoEvents,
+    ) {
+        if let Some(pollable) = self.ops.as_pollable() {
+            unsafe { pollable.register_exclusive(sink, events) };
+        }
     }
 }

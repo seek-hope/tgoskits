@@ -1,12 +1,12 @@
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 use core::fmt;
 
 use ax_api::fs as api;
 
 use super::FileType;
-use crate::io::Result;
+use crate::StdResult;
 
 /// Iterator over the entries in a directory.
 pub struct ReadDir<'a> {
@@ -32,7 +32,7 @@ pub struct DirBuilder {
 }
 
 impl<'a> ReadDir<'a> {
-    pub(super) fn new(path: &'a str) -> Result<Self> {
+    pub(super) fn new(path: &'a str) -> StdResult<Self> {
         let mut opts = api::AxOpenOptions::new();
         opts.read(true);
         let inner = api::ax_open_dir(path, &opts)?;
@@ -51,9 +51,9 @@ impl<'a> ReadDir<'a> {
 }
 
 impl<'a> Iterator for ReadDir<'a> {
-    type Item = Result<DirEntry<'a>>;
+    type Item = StdResult<DirEntry<'a>>;
 
-    fn next(&mut self) -> Option<Result<DirEntry<'a>>> {
+    fn next(&mut self) -> Option<StdResult<DirEntry<'a>>> {
         if self.end_of_stream {
             return None;
         }
@@ -71,7 +71,7 @@ impl<'a> Iterator for ReadDir<'a> {
                     }
                     Err(e) => {
                         self.end_of_stream = true;
-                        return Some(Err(e));
+                        return Some(Err(e.into()));
                     }
                 }
             }
@@ -137,18 +137,53 @@ impl DirBuilder {
 
     /// Creates the specified directory with the options configured in this
     /// builder.
-    pub fn create(&self, path: &str) -> Result<()> {
+    pub fn create(&self, path: &str) -> StdResult {
         if self.recursive {
             self.create_dir_all(path)
         } else {
-            api::ax_create_dir(path)
+            api::ax_create_dir(path)?;
+            Ok(())
         }
     }
 
-    fn create_dir_all(&self, _path: &str) -> Result<()> {
-        ax_errno::ax_err!(
-            Unsupported,
-            "Recursive directory creation is not supported yet"
-        )
+    fn create_dir_all(&self, path: &str) -> StdResult {
+        let mut path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        let create = |path: &str| match api::ax_create_dir(path) {
+            Err(error)
+                if ax_io::IoError::from(error) == ax_io::IoError::AlreadyExists
+                    && super::metadata(path).is_ok_and(|metadata| metadata.is_dir()) =>
+            {
+                Ok(())
+            }
+            result => result,
+        };
+
+        // Try the leaf first so existing ancestors need not be writable.
+        // Keep missing paths on the heap instead of recursing on the kernel stack.
+        let mut missing = Vec::new();
+        loop {
+            match create(path) {
+                Ok(()) => break,
+                Err(error) if ax_io::IoError::from(error) == ax_io::IoError::NotFound => {
+                    missing.push(path);
+                    let Some((parent, _)) = path.rsplit_once('/') else {
+                        return Err(error.into());
+                    };
+                    path = parent.trim_end_matches('/');
+                    if path.is_empty() {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for path in missing.into_iter().rev() {
+            create(path)?;
+        }
+        Ok(())
     }
 }

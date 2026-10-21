@@ -1,7 +1,8 @@
 features = [
-  "sdmmc",
-  "rockchip-soc",
-  "fs",
+  "ax-driver/rk3588-cpufreq",
+  "ax-driver/rockchip-dwmmc",
+  "ax-driver/rockchip-sdhci",
+
 ]
 log = "Info"
 target = "aarch64-unknown-none-softfloat"

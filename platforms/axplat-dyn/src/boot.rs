@@ -1,7 +1,7 @@
 use ax_memory_addr::VirtAddr;
 use somehal::{
     KernelOp,
-    setup::{MapError, MmioAddr, MmioOp, MmioRaw},
+    setup::{CpuBindError, CpuIndex, MapError, MmioAddr, MmioOp, MmioRaw},
 };
 
 #[somehal::entry(Kernel)]
@@ -12,7 +12,13 @@ fn main() -> ! {
     }
 
     let cpu_idx = somehal::smp::early_current_cpu_idx();
-    ax_percpu::init_percpu_reg(cpu_idx);
+    validate_frozen_percpu_layout();
+    bind_current_cpu(cpu_index(cpu_idx))
+        .unwrap_or_else(|error| panic!("failed to bind the primary CPU-local area: {error}"));
+    // SAFETY: final someboot entry already installed this image's stack,
+    // exception vectors and page tables; binding above replaced CPU-local state.
+    // No platform memory cache or runtime allocator has been initialized yet.
+    unsafe { somehal::mem::complete_boot_takeover() };
     ax_plat::call_main(cpu_idx, args)
 }
 
@@ -20,8 +26,46 @@ fn main() -> ! {
 fn secondary_main() {
     #[cfg(feature = "smp")]
     {
-        ax_percpu::init_percpu_reg(meta.cpu_idx);
         ax_plat::call_secondary_main(meta.cpu_idx);
+    }
+}
+
+fn validate_frozen_percpu_layout() {
+    let platform = somehal::smp::percpu_data_layout()
+        .expect("someboot must publish CPU-local storage before platform entry");
+    let installed = ax_percpu::layout()
+        .expect("someboot final-high must install the CPU-local layout exactly once");
+    assert_eq!(installed.runtime_base(), platform.runtime_base);
+    assert_eq!(installed.area_stride(), platform.area_stride);
+    assert_eq!(installed.area_count(), platform.area_count);
+}
+
+fn cpu_index(cpu_idx: usize) -> CpuIndex {
+    somehal::setup::cpu_index(cpu_idx)
+        .expect("platform must allocate CPU-local storage for every boot CPU")
+}
+
+fn bind_current_cpu(cpu_index: CpuIndex) -> Result<(), CpuBindError> {
+    let area = ax_percpu::area(cpu_index).map_err(map_percpu_bind_error)?;
+    let cpu_area = area.cpu_area().map_err(map_percpu_bind_error)?;
+    // SAFETY: platform entry runs before the CPU is online, with local IRQs
+    // masked and no scheduler capable of migrating this execution.
+    unsafe { cpu_local::install_cpu_area(cpu_area) }.map_err(CpuBindError::from)
+}
+
+fn map_percpu_bind_error(error: ax_percpu::PerCpuError) -> CpuBindError {
+    match error {
+        ax_percpu::PerCpuError::LayoutNotInstalled => CpuBindError::LayoutNotInstalled,
+        ax_percpu::PerCpuError::CpuOutOfRange {
+            cpu_index,
+            area_count,
+        } => CpuBindError::CpuOutOfRange {
+            cpu_index,
+            area_count,
+        },
+        ax_percpu::PerCpuError::AddressOverflow => CpuBindError::AddressOverflow,
+        ax_percpu::PerCpuError::CpuLocal(error) => CpuBindError::CpuLocal(error),
+        _ => CpuBindError::LayoutMismatch,
     }
 }
 
@@ -36,9 +80,28 @@ pub fn bootargs() -> Option<&'static str> {
     somehal::bootargs()
 }
 
+pub use somehal::{Initramfs, InitramfsRange, InitramfsReclaim};
+
+pub fn initramfs_range() -> Option<InitramfsRange> {
+    somehal::initramfs_range()
+}
+
+/// Claims the host archive exactly once, after allocator reservations are installed.
+pub fn take_initramfs_range() -> Option<Initramfs> {
+    somehal::take_initramfs_range()
+}
+
+pub fn boot_entropy() -> Option<[u8; 32]> {
+    somehal::boot_entropy()
+}
+
 pub struct Kernel;
 
 impl KernelOp for Kernel {
+    fn bind_current_cpu(&self, cpu_index: CpuIndex) -> Result<(), CpuBindError> {
+        bind_current_cpu(cpu_index)
+    }
+
     fn current_cpu_idx(&self) -> Option<usize> {
         Some(ax_plat::percpu::this_cpu_id())
     }

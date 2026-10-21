@@ -6,8 +6,8 @@
 //! - `NETLINK_KOBJECT_UEVENT` (15): subscribe to kernel uevent broadcasts;
 //!   listener side only — kernel emitters call [`broadcast`].
 //! - `NETLINK_ROUTE` (0): rtnetlink socket; `bind` + `read`/`recv` work,
-//!   actual RTM_GETLINK / RTM_GETADDR responder lives elsewhere (the socket
-//!   here just provides the byte transport).
+//!   supports RTM_GETLINK / RTM_GETADDR plus IPv4 default-route dumps through
+//!   RTM_GETROUTE.
 //! - `NETLINK_GENERIC` (16): same shape as NETLINK_ROUTE — a queued byte
 //!   transport that genl userspace can drive.
 //!
@@ -29,31 +29,31 @@ use core::{
     mem::size_of,
     net::Ipv4Addr,
     sync::atomic::{AtomicBool, Ordering},
-    task::Context,
 };
 
-use ax_errno::{AxError, AxResult, LinuxError};
-use ax_kspin::SpinNoIrq as Mutex;
+use ax_lazyinit::LazyLock;
 use ax_net::{InterfaceFlags, InterfaceId, InterfaceInfo, InterfaceKind};
-use ax_task::future::{block_on, poll_io};
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{IoEvents, Pollable};
+use axpoll_set::PollSet;
 use linux_raw_sys::{
     general::{O_RDWR, S_IFSOCK},
     net::AF_NETLINK,
     netlink::{NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT, NETLINK_ROUTE, sockaddr_nl},
 };
-use spin::LazyLock;
 
 use crate::{
-    file::{FileLike, IoDst, IoSrc},
-    syscall::in_root_net_ns,
-    task::AsThread,
+    Errno, StarryError, StarryResult,
+    file::{FileLike, IoDst, IoSrc, net::in_root_net_ns},
+    sync::Mutex,
+    task::{
+        current_user_task,
+        future::{block_on_user, poll_io},
+    },
 };
 
 /// Maximum number of queued receive messages per socket.  Matches
 /// libudev's default monitor buffer expectation (~32 messages × 4 KiB).
 const MAX_QUEUED: usize = 128;
-
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_MULTI: u16 = 2;
@@ -66,6 +66,7 @@ const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 /// the controller and only the controller; family ID assignment for
 /// other families starts above this.
 const GENL_ID_CTRL: u16 = 0x10;
+
 const CTRL_CMD_NEWFAMILY: u8 = 1;
 const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
@@ -73,6 +74,7 @@ const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 const CTRL_ATTR_VERSION: u16 = 3;
 const CTRL_ATTR_HDRSIZE: u16 = 4;
 const CTRL_ATTR_MAXATTR: u16 = 5;
+
 /// Linux's max length of a family name, including the NUL terminator.
 const GENL_NAMSIZ: usize = 16;
 const CTRL_VERSION: u32 = 2;
@@ -83,15 +85,21 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
 
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
+
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
+const ARPHRD_NONE: u16 = 0xfffe;
 
 const IFF_UP: u32 = 1;
 const IFF_BROADCAST: u32 = 2;
 const IFF_LOOPBACK: u32 = 8;
+const IFF_POINTOPOINT: u32 = 16;
+const IFF_NOARP: u32 = 128;
 const IFF_RUNNING: u32 = 64;
 const IFF_MULTICAST: u32 = 4096;
 const IFF_LOWER_UP: u32 = 65536;
@@ -109,11 +117,23 @@ const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
 const IFA_BROADCAST: u16 = 4;
 
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PRIORITY: u16 = 6;
+const RTA_PREFSRC: u16 = 7;
+
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_UP: u8 = 6;
 
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_HOST: u8 = 254;
+
+const RT_TABLE_UNSPEC: u8 = 0;
+const RT_TABLE_MAIN: u8 = 254;
+
+const RTPROT_BOOT: u8 = 3;
+
+const RTN_UNICAST: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -138,6 +158,7 @@ struct GenlMsgHdr {
 /// errno table.
 #[allow(non_upper_case_globals)]
 const libc_ENOENT: i32 = 2;
+
 #[allow(non_upper_case_globals)]
 const libc_EOPNOTSUPP: i32 = 95;
 
@@ -169,6 +190,20 @@ struct IfAddrMsg {
     index: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtMsg {
+    family: u8,
+    dst_len: u8,
+    src_len: u8,
+    tos: u8,
+    table: u8,
+    protocol: u8,
+    scope: u8,
+    ty: u8,
+    flags: u32,
+}
+
 struct LinkInfo {
     index: i32,
     name: String,
@@ -178,8 +213,8 @@ struct LinkInfo {
     qlen: u32,
     qdisc: &'static str,
     operstate: u8,
-    address: [u8; 6],
-    broadcast: [u8; 6],
+    /// `dev_addr` and `broadcast`, reported only when `addr_len` is nonzero.
+    link_addresses: Option<([u8; 6], [u8; 6])>,
 }
 
 struct AddrInfo {
@@ -238,10 +273,12 @@ struct NetlinkState {
     addr: Option<sockaddr_nl>,
     receive_buffer_size: usize,
     passcred: bool,
+    reuse_address: bool,
 }
 
 pub struct NetlinkSocket {
     protocol: u32,
+    socket_type: u32,
     non_blocking: AtomicBool,
     poll_rx: PollSet,
     state: Mutex<NetlinkState>,
@@ -255,9 +292,10 @@ static NETLINK_SOCKETS: LazyLock<Mutex<Vec<Weak<NetlinkSocket>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 impl NetlinkSocket {
-    pub fn new(protocol: u32) -> Arc<Self> {
+    pub fn new(protocol: u32, socket_type: u32) -> Arc<Self> {
         Arc::new(Self {
             protocol,
+            socket_type,
             non_blocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
             state: Mutex::new(NetlinkState::default()),
@@ -265,19 +303,17 @@ impl NetlinkSocket {
         })
     }
 
-    pub fn bind(self: &Arc<Self>, addr: sockaddr_nl) -> AxResult {
+    pub fn bind(self: &Arc<Self>, addr: sockaddr_nl) -> StarryResult {
         if addr.nl_family as u32 != AF_NETLINK {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         {
             let mut state = self.state.lock();
             if state.addr.is_some() {
-                return Err(AxError::InvalidInput);
+                return Err(StarryError::InvalidInput);
             }
             state.addr = Some(addr);
         }
-        // Register self in the global broadcast registry so kernel-side
-        // `broadcast()` calls can reach this socket.
         NETLINK_SOCKETS.lock().push(Arc::downgrade(self));
         Ok(())
     }
@@ -303,14 +339,30 @@ impl NetlinkSocket {
     pub fn set_receive_buffer_size(&self, size: usize) {
         self.state.lock().receive_buffer_size = size;
     }
-
     pub fn set_passcred(&self, enabled: bool) {
         self.state.lock().passcred = enabled;
     }
-
-    #[allow(dead_code)]
+    pub fn reuse_address(&self) -> bool {
+        self.state.lock().reuse_address
+    }
+    pub fn set_reuse_address(&self, enabled: bool) {
+        self.state.lock().reuse_address = enabled;
+    }
     pub fn protocol(&self) -> u32 {
         self.protocol
+    }
+    pub fn socket_type(&self) -> u32 {
+        self.socket_type
+    }
+
+    /// Enqueue a kernel-originated datagram and wake readers.
+    pub fn deliver_datagram(&self, payload: Vec<u8>) {
+        let mut queue = self.queue.lock();
+        if queue.len() < MAX_QUEUED {
+            queue.push_back(payload);
+            drop(queue);
+            unsafe { self.poll_rx.wake(IoEvents::IN) };
+        }
     }
 
     fn local_pid(&self) -> u32 {
@@ -318,7 +370,12 @@ impl NetlinkSocket {
         match state.addr {
             Some(addr) if addr.nl_pid != 0 => addr.nl_pid,
             _ => {
-                let pid = ax_task::current().as_thread().proc_data.proc.pid();
+                let task = crate::task::current_user_task();
+                let thread = task.as_thread();
+                let pid = crate::task::current_pid_view()
+                    .visible_number(&thread.proc_data.identity())
+                    .expect("current process is visible in its active PID namespace")
+                    .get();
                 state.addr = Some(sockaddr_nl {
                     nl_family: AF_NETLINK as _,
                     nl_pad: 0,
@@ -339,9 +396,9 @@ impl NetlinkSocket {
     /// — also returns `-ENOENT`. This matches what libnl-genl and
     /// `genl-ctrl-list` need to enumerate the controller and report
     /// "no other families" cleanly.
-    fn build_genl_response(&self, request: &[u8]) -> AxResult<Vec<u8>> {
+    fn build_genl_response(&self, request: &[u8]) -> StarryResult<Vec<u8>> {
         if request.len() < size_of::<NlMsgHdr>() + size_of::<GenlMsgHdr>() {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         let header = unsafe { request.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
         let genl = unsafe {
@@ -381,7 +438,6 @@ impl NetlinkSocket {
             push_nlmsg_error(&mut response, request, pid, -libc_ENOENT);
             return Ok(response);
         }
-
         let is_dump = want_name.is_none();
         push_ctrl_family(&mut response, header.seq, pid, is_dump);
         if is_dump {
@@ -390,9 +446,9 @@ impl NetlinkSocket {
         Ok(response)
     }
 
-    fn build_route_response(&self, request: &[u8]) -> AxResult<Vec<u8>> {
+    fn build_route_response(&self, request: &[u8]) -> StarryResult<Vec<u8>> {
         if request.len() < size_of::<NlMsgHdr>() {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
 
         let header = unsafe { request.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
@@ -414,7 +470,12 @@ impl NetlinkSocket {
                     push_link_message(&mut response, header.seq, pid, &link);
                 }
                 if !matched && !is_dump_request(header.flags) && filter.has_selector() {
-                    push_nlmsg_error_from_ax(&mut response, request, pid, AxError::NoSuchDevice);
+                    push_nlmsg_error_from_ax(
+                        &mut response,
+                        request,
+                        pid,
+                        StarryError::NoSuchDevice,
+                    );
                     return Ok(response);
                 }
             }
@@ -432,17 +493,42 @@ impl NetlinkSocket {
                     push_addr_message(&mut response, header.seq, pid, &addr);
                 }
                 if !matched && !is_dump_request(header.flags) && filter.has_selector() {
-                    push_nlmsg_error_from_ax(&mut response, request, pid, AxError::NoSuchDevice);
+                    push_nlmsg_error_from_ax(
+                        &mut response,
+                        request,
+                        pid,
+                        StarryError::NoSuchDevice,
+                    );
                     return Ok(response);
+                }
+            }
+            RTM_GETROUTE => {
+                if !is_dump_request(header.flags) {
+                    push_nlmsg_error(&mut response, request, pid, -libc_EOPNOTSUPP);
+                    return Ok(response);
+                }
+                let route = match parse_route_request(request) {
+                    Ok(route) => route,
+                    Err(err) => {
+                        push_nlmsg_error_from_ax(&mut response, request, pid, err);
+                        return Ok(response);
+                    }
+                };
+                if matches!(route.family, AF_UNSPEC | AF_INET)
+                    && matches!(route.table, RT_TABLE_UNSPEC | RT_TABLE_MAIN)
+                {
+                    for route in ax_net::default_routes() {
+                        if !in_root && route.interface_id != InterfaceId::LOOPBACK {
+                            continue;
+                        }
+                        push_default_route_message(&mut response, header.seq, pid, &route);
+                    }
                 }
             }
             RTM_NEWADDR => {
                 let error = match handle_newaddr_request(request) {
                     Ok(()) => 0,
-                    Err(err) => {
-                        let linux_err = LinuxError::from(err);
-                        -linux_err.code()
-                    }
+                    Err(err) => -err.linux_errno().into_raw(),
                 };
                 push_nlmsg_error(&mut response, request, pid, error);
                 return Ok(response);
@@ -453,11 +539,8 @@ impl NetlinkSocket {
                     // Linux reports EADDRNOTAVAIL when the requested address
                     // is not assigned; ax-net uses NotFound for that internal
                     // state so translate it explicitly for iproute2.
-                    Err(AxError::NotFound) => -LinuxError::EADDRNOTAVAIL.code(),
-                    Err(err) => {
-                        let linux_err = LinuxError::from(err);
-                        -linux_err.code()
-                    }
+                    Err(StarryError::NotFound) => -Errno::EADDRNOTAVAIL.into_raw(),
+                    Err(err) => -err.linux_errno().into_raw(),
                 };
                 push_nlmsg_error(&mut response, request, pid, error);
                 return Ok(response);
@@ -484,17 +567,17 @@ impl NetlinkSocket {
     /// `truncate` (MSG_TRUNC) is set, else the number of bytes copied;
     /// `truncated` is true when the datagram did not fit in `dst` (so the
     /// caller can raise MSG_TRUNC in `msg_flags`).
-    fn read_one(&self, dst: &mut IoDst, peek: bool, truncate: bool) -> AxResult<(usize, bool)> {
+    fn read_one(&self, dst: &mut IoDst, peek: bool, truncate: bool) -> StarryResult<(usize, bool)> {
         let msg = {
             let mut queue = self.queue.lock();
             if peek {
                 let Some(msg) = queue.front() else {
-                    return Err(AxError::WouldBlock);
+                    return Err(StarryError::WouldBlock);
                 };
                 msg.clone()
             } else {
                 let Some(msg) = queue.pop_front() else {
-                    return Err(AxError::WouldBlock);
+                    return Err(StarryError::WouldBlock);
                 };
                 msg
             }
@@ -548,23 +631,51 @@ impl NetlinkSocket {
         peek: bool,
         truncate: bool,
         dontwait: bool,
-    ) -> AxResult<(usize, bool)> {
+    ) -> StarryResult<(usize, bool)> {
         let non_blocking = self.nonblocking() || dontwait;
-        block_on(poll_io(self, IoEvents::IN, non_blocking, || {
-            self.read_one(dst, peek, truncate)
-        }))
+        let task = current_user_task();
+        block_on_user(
+            &task,
+            poll_io(self, IoEvents::IN, non_blocking, || {
+                self.read_one(dst, peek, truncate)
+            }),
+        )
+        .into_result()?
     }
 }
 
 impl FileLike for NetlinkSocket {
-    fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
-        block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            self.read_one(dst, false, false)
-        }))
+    fn validate_write_access(&self) -> StarryResult {
+        Ok(())
+    }
+
+    fn ioctl(
+        &self,
+        current: &crate::task::UserTaskRef,
+        cmd: u32,
+        arg: usize,
+    ) -> crate::StarryResult<usize> {
+        // Device ioctls (SIOCGIF*) are family-agnostic in Linux sock_ioctl, so a
+        // netlink socket answers them too rather than returning ENOTTY.
+        if let Some(result) = crate::file::net::device_ioctl(current, cmd, arg) {
+            return result;
+        }
+        Err(StarryError::NotATty)
+    }
+
+    fn read(&self, dst: &mut IoDst) -> crate::StarryResult<usize> {
+        let task = current_user_task();
+        block_on_user(
+            &task,
+            poll_io(self, IoEvents::IN, self.nonblocking(), || {
+                self.read_one(dst, false, false)
+            }),
+        )
+        .into_result()?
         .map(|(len, _)| len)
     }
 
-    fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+    fn write(&self, src: &mut IoSrc) -> StarryResult<usize> {
         let size = src.remaining().min(64 * 1024);
         let mut request = vec![0; size];
         let total = src.read(&mut request)?;
@@ -596,7 +707,7 @@ impl FileLike for NetlinkSocket {
         Ok(total)
     }
 
-    fn stat(&self) -> AxResult<crate::file::Kstat> {
+    fn stat(&self) -> StarryResult<crate::file::Kstat> {
         Ok(crate::file::Kstat {
             mode: S_IFSOCK | 0o777,
             blksize: 4096,
@@ -608,7 +719,7 @@ impl FileLike for NetlinkSocket {
         self.non_blocking.load(Ordering::Acquire)
     }
 
-    fn set_nonblocking(&self, non_blocking: bool) -> AxResult {
+    fn set_nonblocking(&self, non_blocking: bool) -> StarryResult {
         self.non_blocking.store(non_blocking, Ordering::Release);
         Ok(())
     }
@@ -634,10 +745,23 @@ impl Pollable for NetlinkSocket {
         events
     }
 
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: IoEvents,
+    ) {
         if events.contains(IoEvents::IN) {
-            // Registration happens from socket poll task context.
-            unsafe { self.poll_rx.register(context.waker(), IoEvents::IN) };
+            unsafe { sink.register_shared(&self.poll_rx, IoEvents::IN) };
+        }
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: IoEvents,
+    ) {
+        if events.contains(IoEvents::IN) {
+            unsafe { sink.register_exclusive(&self.poll_rx, IoEvents::IN) };
         }
     }
 }
@@ -656,26 +780,29 @@ fn link_infos() -> Vec<LinkInfo> {
                 name: info.name,
                 ty: match info.kind {
                     InterfaceKind::Loopback => ARPHRD_LOOPBACK,
-                    InterfaceKind::Ethernet => ARPHRD_ETHER,
+                    InterfaceKind::Ethernet | InterfaceKind::Tap => ARPHRD_ETHER,
+                    InterfaceKind::Tun => ARPHRD_NONE,
                 },
                 flags,
                 mtu: info.mtu as u32,
                 qlen: 1000,
                 qdisc: match info.kind {
                     InterfaceKind::Loopback => "noqueue",
-                    InterfaceKind::Ethernet => "mq",
+                    InterfaceKind::Ethernet | InterfaceKind::Tun | InterfaceKind::Tap => "mq",
                 },
                 operstate: if info.flags.contains(InterfaceFlags::RUNNING) {
                     IF_OPER_UP
                 } else {
                     IF_OPER_UNKNOWN
                 },
-                address,
-                broadcast: if info.kind == InterfaceKind::Ethernet {
-                    [0xff; 6]
-                } else {
-                    [0; 6]
-                },
+                link_addresses: (info.kind != InterfaceKind::Tun).then(|| {
+                    let broadcast = if matches!(info.kind, InterfaceKind::Ethernet | InterfaceKind::Tap) {
+                        [0xff; 6]
+                    } else {
+                        [0; 6]
+                    };
+                    (address, broadcast)
+                }),
             }
         })
         .collect()
@@ -687,7 +814,7 @@ fn addr_infos() -> Vec<AddrInfo> {
         .filter_map(|info| {
             let ipv4 = info.ipv4?;
             let local = ipv4.address.address().octets();
-            let broadcast = (info.kind == InterfaceKind::Ethernet).then(|| {
+            let broadcast = matches!(info.kind, InterfaceKind::Ethernet | InterfaceKind::Tap).then(|| {
                 let ip = u32::from_be_bytes(local);
                 let mask = if ipv4.address.prefix_len() == 0 {
                     0
@@ -702,7 +829,9 @@ fn addr_infos() -> Vec<AddrInfo> {
                 prefix_len: ipv4.address.prefix_len(),
                 scope: match info.kind {
                     InterfaceKind::Loopback => RT_SCOPE_HOST,
-                    InterfaceKind::Ethernet => RT_SCOPE_UNIVERSE,
+                    InterfaceKind::Ethernet | InterfaceKind::Tun | InterfaceKind::Tap => {
+                        RT_SCOPE_UNIVERSE
+                    }
                 },
                 local,
                 broadcast,
@@ -721,6 +850,12 @@ fn linux_link_flags(info: &InterfaceInfo) -> u32 {
     }
     if info.flags.contains(InterfaceFlags::LOOPBACK) {
         flags |= IFF_LOOPBACK;
+    }
+    if info.flags.contains(InterfaceFlags::POINTOPOINT) {
+        flags |= IFF_POINTOPOINT;
+    }
+    if info.flags.contains(InterfaceFlags::NOARP) {
+        flags |= IFF_NOARP;
     }
     if info.flags.contains(InterfaceFlags::RUNNING) {
         flags |= IFF_RUNNING | IFF_LOWER_UP;
@@ -745,15 +880,16 @@ fn push_link_message(out: &mut Vec<u8>, seq: u32, pid: u32, link: &LinkInfo) {
         },
     );
     push_attr_string(&mut body, IFLA_IFNAME, &link.name);
-    push_attr(&mut body, IFLA_ADDRESS, &link.address);
-    push_attr(&mut body, IFLA_BROADCAST, &link.broadcast);
+    if let Some((address, broadcast)) = &link.link_addresses {
+        push_attr(&mut body, IFLA_ADDRESS, address);
+        push_attr(&mut body, IFLA_BROADCAST, broadcast);
+    }
     push_attr(&mut body, IFLA_MTU, &link.mtu.to_ne_bytes());
     push_attr(&mut body, IFLA_QDISC, link.qdisc.as_bytes());
     push_attr(&mut body, IFLA_TXQLEN, &link.qlen.to_ne_bytes());
     push_attr(&mut body, IFLA_OPERSTATE, &[link.operstate]);
 
-    push_nl_header(out, RTM_NEWLINK, NLM_F_MULTI, seq, pid, body.len());
-    out.extend_from_slice(&body);
+    push_nl_message(out, RTM_NEWLINK, NLM_F_MULTI, seq, pid, &body);
 }
 
 fn push_addr_message(out: &mut Vec<u8>, seq: u32, pid: u32, addr: &AddrInfo) {
@@ -775,8 +911,41 @@ fn push_addr_message(out: &mut Vec<u8>, seq: u32, pid: u32, addr: &AddrInfo) {
         push_attr(&mut body, IFA_BROADCAST, &broadcast);
     }
 
-    push_nl_header(out, RTM_NEWADDR, NLM_F_MULTI, seq, pid, body.len());
-    out.extend_from_slice(&body);
+    push_nl_message(out, RTM_NEWADDR, NLM_F_MULTI, seq, pid, &body);
+}
+
+fn push_default_route_message(out: &mut Vec<u8>, seq: u32, pid: u32, route: &ax_net::RouteInfo) {
+    let Some(gateway) = route.via else {
+        return;
+    };
+    let core::net::IpAddr::V4(gateway) = gateway.into() else {
+        return;
+    };
+    let core::net::IpAddr::V4(source) = route.source.into() else {
+        return;
+    };
+
+    let mut body = Vec::new();
+    push_struct(
+        &mut body,
+        &RtMsg {
+            family: AF_INET,
+            dst_len: 0,
+            src_len: 0,
+            tos: 0,
+            table: RT_TABLE_MAIN,
+            protocol: RTPROT_BOOT,
+            scope: RT_SCOPE_UNIVERSE,
+            ty: RTN_UNICAST,
+            flags: 0,
+        },
+    );
+    push_attr(&mut body, RTA_GATEWAY, &gateway.octets());
+    push_attr(&mut body, RTA_OIF, &route.interface_id.get().to_ne_bytes());
+    push_attr(&mut body, RTA_PRIORITY, &route.metric.to_ne_bytes());
+    push_attr(&mut body, RTA_PREFSRC, &source.octets());
+
+    push_nl_message(out, RTM_NEWROUTE, NLM_F_MULTI, seq, pid, &body);
 }
 
 fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
@@ -804,8 +973,7 @@ fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
     );
 
     let flags = if multi { NLM_F_MULTI } else { 0 };
-    push_nl_header(out, GENL_ID_CTRL, flags, seq, pid, payload.len());
-    out.extend_from_slice(&payload);
+    push_nl_message(out, GENL_ID_CTRL, flags, seq, pid, &payload);
 }
 
 /// Emit a `NLMSG_ERROR` whose payload echoes the entire original
@@ -818,25 +986,24 @@ fn push_ctrl_family(out: &mut Vec<u8>, seq: u32, pid: u32, multi: bool) {
 fn push_nlmsg_error(out: &mut Vec<u8>, request_bytes: &[u8], pid: u32, error: i32) {
     let header = unsafe { request_bytes.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
     let req_len = (header.len as usize).min(request_bytes.len());
-    let payload_len = size_of::<i32>() + req_len;
-    push_nl_header(out, NLMSG_ERROR, 0, header.seq, pid, payload_len);
-    out.extend_from_slice(&error.to_ne_bytes());
-    out.extend_from_slice(&request_bytes[..req_len]);
+    let mut payload = Vec::with_capacity(size_of::<i32>() + req_len);
+    payload.extend_from_slice(&error.to_ne_bytes());
+    payload.extend_from_slice(&request_bytes[..req_len]);
+    push_nl_message(out, NLMSG_ERROR, 0, header.seq, pid, &payload);
 }
 
-fn push_nlmsg_error_from_ax(out: &mut Vec<u8>, request_bytes: &[u8], pid: u32, err: AxError) {
-    let linux_err = LinuxError::from(err);
-    push_nlmsg_error(out, request_bytes, pid, -linux_err.code());
+fn push_nlmsg_error_from_ax(out: &mut Vec<u8>, request_bytes: &[u8], pid: u32, err: StarryError) {
+    push_nlmsg_error(out, request_bytes, pid, -err.linux_errno().into_raw());
 }
 
-fn handle_newaddr_request(request: &[u8]) -> AxResult {
+fn handle_newaddr_request(request: &[u8]) -> StarryResult {
     if request.len() < size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let header = unsafe { request.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
     let msg_len = (header.len as usize).min(request.len());
     if msg_len < size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let addr = unsafe {
         request
@@ -846,28 +1013,28 @@ fn handle_newaddr_request(request: &[u8]) -> AxResult {
             .read_unaligned()
     };
     if addr.family != AF_INET {
-        return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+        return Err(StarryError::from(Errno::EAFNOSUPPORT));
     }
 
     let attrs = &request[size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>()..msg_len];
     let local = parse_ipv4_attr(attrs, IFA_LOCAL)
         .or_else(|| parse_ipv4_attr(attrs, IFA_ADDRESS))
-        .ok_or(AxError::InvalidInput)?;
-    ax_net::set_interface_ipv4(
+        .ok_or(StarryError::InvalidInput)?;
+    Ok(ax_net::set_interface_ipv4(
         InterfaceId::new(addr.index),
         Ipv4Addr::from(local),
         addr.prefix_len,
-    )
+    )?)
 }
 
-fn handle_deladdr_request(request: &[u8]) -> AxResult {
+fn handle_deladdr_request(request: &[u8]) -> StarryResult {
     if request.len() < size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let header = unsafe { request.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
     let msg_len = (header.len as usize).min(request.len());
     if msg_len < size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>() {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let addr = unsafe {
         request
@@ -877,18 +1044,18 @@ fn handle_deladdr_request(request: &[u8]) -> AxResult {
             .read_unaligned()
     };
     if addr.family != AF_INET {
-        return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+        return Err(StarryError::from(Errno::EAFNOSUPPORT));
     }
 
     let attrs = &request[size_of::<NlMsgHdr>() + size_of::<IfAddrMsg>()..msg_len];
     let local = parse_ipv4_attr(attrs, IFA_LOCAL)
         .or_else(|| parse_ipv4_attr(attrs, IFA_ADDRESS))
-        .ok_or(AxError::InvalidInput)?;
-    ax_net::remove_interface_ipv4(
+        .ok_or(StarryError::InvalidInput)?;
+    Ok(ax_net::remove_interface_ipv4(
         InterfaceId::new(addr.index),
         Ipv4Addr::from(local),
         addr.prefix_len,
-    )
+    )?)
 }
 
 fn parse_ipv4_attr(mut buf: &[u8], ty: u16) -> Option<[u8; 4]> {
@@ -935,6 +1102,28 @@ fn parse_addr_filter(request: &[u8]) -> AddrFilter {
         index: (info.index > 0).then_some(info.index),
         label: parse_string_attr(attrs, IFA_LABEL),
     }
+}
+
+fn parse_route_request(request: &[u8]) -> StarryResult<RtMsg> {
+    if request.len() < size_of::<NlMsgHdr>() + size_of::<RtMsg>() {
+        return Err(StarryError::InvalidInput);
+    }
+    // SAFETY: The length check above covers a complete header, and
+    // `read_unaligned` accepts the byte alignment of the request buffer.
+    let header = unsafe { request.as_ptr().cast::<NlMsgHdr>().read_unaligned() };
+    let msg_len = (header.len as usize).min(request.len());
+    if msg_len < size_of::<NlMsgHdr>() + size_of::<RtMsg>() {
+        return Err(StarryError::InvalidInput);
+    }
+    // SAFETY: `msg_len` proves that the request contains a complete `RtMsg`
+    // after the header, and `read_unaligned` accepts the buffer alignment.
+    Ok(unsafe {
+        request
+            .as_ptr()
+            .add(size_of::<NlMsgHdr>())
+            .cast::<RtMsg>()
+            .read_unaligned()
+    })
 }
 
 fn parse_link_filter(request: &[u8]) -> LinkFilter {
@@ -1020,8 +1209,23 @@ fn parse_genl_family_name(mut buf: &[u8]) -> Option<alloc::string::String> {
 }
 
 fn push_done_message(out: &mut Vec<u8>, seq: u32, pid: u32) {
-    push_nl_header(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, size_of::<i32>());
-    out.extend_from_slice(&0i32.to_ne_bytes());
+    push_nl_message(out, NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_ne_bytes());
+}
+
+/// Append one netlink message followed by the padding that ends it.
+///
+/// `nlmsg_len` carries the unpadded size, but the datagram itself has to reach
+/// the next `NLMSG_ALIGNTO` boundary. Readers advance with `NLMSG_NEXT`, which
+/// subtracts the *aligned* length from a byte count that `NLMSG_OK` validates
+/// against the *unaligned* one; a message that ends mid-word therefore drives
+/// that count below zero, and every reader holding it in an unsigned variable
+/// then walks past the end of its receive buffer. Linux reserves the same
+/// padding in `__nlmsg_put()` (include/linux/netlink.h), where `skb_put` takes
+/// `NLMSG_ALIGN(size)` while the header stores the unaligned `size`.
+fn push_nl_message(out: &mut Vec<u8>, ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) {
+    push_nl_header(out, ty, flags, seq, pid, payload.len());
+    out.extend_from_slice(payload);
+    pad_to_align4(out);
 }
 
 fn push_nl_header(out: &mut Vec<u8>, ty: u16, flags: u16, seq: u32, pid: u32, payload_len: usize) {

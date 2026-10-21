@@ -12,76 +12,103 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![no_std]
-
 //! This crate provides a minimal VM monitor (VMM) for running guest VMs.
 //!
 //! This crate contains:
-//! - [`AxVM`]: The main structure representing a VM.
+//! - [`VmManager`]: VM instance creation and registry ownership.
+//! - [`VmHandle`]: lifecycle requests and immutable observations.
 
-extern crate alloc;
+#![cfg_attr(any(test, target_arch = "aarch64"), feature(once_cell_try))]
+
 #[macro_use]
 extern crate log;
 
 mod arch;
 mod architecture;
 pub mod boot;
+mod configured;
+mod control;
+mod engine;
 mod error;
-mod host;
+mod guest_memory;
+pub mod host;
+mod identity;
 pub mod irq;
 pub mod layout;
 pub mod lifecycle;
+pub mod machine;
 mod manager;
 mod npt;
+mod operation;
 mod percpu;
 mod runtime;
+mod services;
+mod sync;
 mod task;
-mod timer;
 mod vcpu;
 mod vm;
 
-use crate::arch::ArchOps;
-
 pub mod config;
 
-pub use arch::platform::*;
 pub use ax_cpumask::CpuMask;
-/// Compatibility export for legacy/common normalized VM events.
-///
-/// Architecture-local raw exits are handled by `arch::CurrentArch` through
-/// `VmArchVcpuOps::Exit`; new code should not treat this as the universal raw
-/// vCPU exit type.
-pub use axvm_types::VmExit;
+pub use ax_std::os::arceos::task::sched::{RtPriority, SchedulePolicy};
+pub use axdevice::{SerialBackend, SerialBackendFactory};
 pub use axvm_types::{
     AccessWidth, GuestPhysAddr, HostPhysAddr, InterruptTriggerMode, MappingFlags, Port, SysRegAddr,
-    VMId, VmVcpuState,
+    VMId, VmBackendError, VmVcpuState,
+};
+pub use configured::{
+    ConfiguredDeviceCatalog, ConfiguredDeviceError, ConfiguredModelConstructor,
+    ConfiguredModelRegistration, DefaultVirtualDeviceIntent, DeviceInstantiationContext,
+    FixedDeviceBindings, FixedWiredBinding, PhysicalUplink, PhysicalUplinkError,
+    VIRTUAL_CPUFREQ_MAX_PERFORMANCE, VIRTUAL_CPUFREQ_MODEL, VirtioPciFunction,
+    VirtualCpuFreqOptions, install_physical_uplink, physical_uplink_installed, reserve_host_mac,
+    switch_from_physical_rx, virtio_capabilities,
 };
 pub use error::{AxVmError, AxVmResult};
 pub(crate) use error::{ax_err, ax_err_type};
+pub use guest_memory::{GuestMemoryPort, GuestRange, MappingLease, MemoryRevision, MemoryUpdate};
 pub(crate) use host::{
     paging::HostPagingHandler,
-    task::{AxTaskExt, AxTaskRef, TaskInner, WaitQueue, WaitQueueHandle as HostWaitQueueHandle},
+    task::{ThreadHandle, WaitQueueHandle as HostWaitQueueHandle},
 };
-pub use irq::InterruptFabric;
+pub use identity::{OperationId, RunId, VcpuInstance, VmKey};
+pub use irq::model::{
+    DeliveryToken, InterruptControllerEndpoint, InterruptSourceId, RunEpoch, SourceEvent,
+    VcpuLocalInterrupts, VcpuLocalTimer, VcpuTimerIngress,
+};
 pub use lifecycle::{StopReason, VmStatus};
 pub use manager::{
-    AxvmRuntime, current_vcpu_id, current_vm_id, get_vm_by_id, get_vm_list,
-    inject_current_vcpu_interrupt, register_vm,
+    CpuObservation, DeviceObservation, GuestCpuFreqBackend, GuestCpuFreqError, MemoryObservation,
+    VmConfigSnapshot, VmCreatePlan, VmHandle, VmLifecycleSubscription, VmManager, VmSnapshot,
 };
-pub(crate) use task::{AsVCpuTask, VCpuTask};
-pub use vm::{
-    AxVM, AxVMRef, FwCfgDeviceConfig, PreparedMemoryLayout, VMMemoryRegion, VcpuSnapshot,
-};
+pub use operation::VmOperation;
+pub use runtime::queue::SignalError;
+pub use services::VcpuInterruptPort;
+pub(crate) use vm::AxVM;
+pub use vm::{FwCfgDeviceConfig, PreparedMemoryLayout, VMMemoryRegion, VcpuSnapshot};
 
-/// The architecture-independent per-CPU type.
-pub(crate) type AxVMPerCpu = vcpu::AxPerCpu<arch::ArchPerCpu>;
-
-/// Check and dispatch pending AxVM timer events on the current CPU.
-pub fn check_timer_events() {
-    timer::check_events();
+/// Returns the guest identity currently loaded on this CPU.
+pub fn current_vm_id() -> Option<VMId> {
+    vcpu::with_current_execution(|current| current.map(|context| context.vm_id()))
 }
 
-/// Clean data cache lines covering a host virtual address range.
-pub fn clean_dcache_range(addr: ax_memory_addr::VirtAddr, size: usize) {
-    arch::CurrentArch::clean_dcache_range(addr, size);
+/// Returns the virtual CPU currently loaded on this CPU.
+pub fn current_vcpu_id() -> Option<usize> {
+    vcpu::with_current_execution(|current| current.map(|context| context.vcpu_id()))
+}
+
+/// The architecture-independent per-CPU type.
+pub(crate) type AxVMPerCpu = vcpu::AxPerCpu<arch::current::ArchPerCpu>;
+
+#[cfg(test)]
+mod host_link_symbols {
+    #[unsafe(no_mangle)]
+    static STACK_SIZE: usize = 0;
+    #[unsafe(no_mangle)]
+    static PAGE_SIZE: usize = 0;
+    #[unsafe(no_mangle)]
+    static __PERCPU_TEMPLATE_ALIGN_START: usize = 0;
+    #[unsafe(no_mangle)]
+    static __PERCPU_TEMPLATE_ALIGN_END: usize = 0;
 }

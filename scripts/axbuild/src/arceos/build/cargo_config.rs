@@ -1,55 +1,74 @@
-use anyhow::{Context, bail};
+use anyhow::bail;
 use ostool::build::config::Cargo;
 
-use super::{ArceosBuildInfo, info::load_build_config_with_makefile_features_and_metadata};
-use crate::{build, context::ResolvedBuildRequest};
+use super::info::load_build_config_with_makefile_features;
+use crate::{
+    build,
+    context::{ResolvedBuildRequest, WorkspaceContext},
+};
 
-pub(crate) fn load_cargo_config(request: &ResolvedBuildRequest) -> anyhow::Result<Cargo> {
-    let metadata =
-        build::cached_workspace_metadata().context("failed to load workspace metadata")?;
+pub(crate) fn load_cargo_config(
+    request: &ResolvedBuildRequest,
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Cargo> {
+    load_cargo_config_with_default_features(request, workspace, true)
+}
+
+pub(crate) fn load_cargo_config_with_default_features(
+    request: &ResolvedBuildRequest,
+    workspace: &WorkspaceContext,
+    include_default_features: bool,
+) -> anyhow::Result<Cargo> {
+    let metadata = workspace.metadata();
+    let axbuild_dir = workspace.axbuild_artifact_dir();
     let makefile_features = build::makefile_features_from_env();
-    let config = load_build_config_with_makefile_features_and_metadata(
-        request,
-        &makefile_features,
-        Some(metadata),
-    )?;
+    let config = load_build_config_with_makefile_features(request, &makefile_features)?;
     if config.app_c.is_some() {
         bail!(
             "ArceOS build config {} uses `app-c`; use the C app build path",
             request.build_info_path.display()
         );
     }
+    let to_bin = config.to_bin;
     let build_info = config.build_info;
+    let mut cargo = if config.freestanding {
+        build_info.into_prepared_no_std_cargo_config_with_metadata_and_defaults(
+            &request.package,
+            &request.target,
+            metadata,
+            build::BareKernelLinkMode::Pie,
+            include_default_features,
+        )?
+    } else {
+        build_info.into_prepared_std_cargo_config_with_metadata_and_defaults(
+            &request.package,
+            &request.target,
+            metadata,
+            &axbuild_dir,
+            include_default_features,
+        )?
+    };
+    cargo.to_bin |= to_bin;
+    Ok(cargo)
+}
 
-    build_info.into_prepared_base_cargo_config_with_metadata(
+pub(crate) fn load_c_app_cargo_config(
+    request: &ResolvedBuildRequest,
+    workspace: &WorkspaceContext,
+) -> anyhow::Result<Cargo> {
+    let metadata = workspace.metadata();
+    let makefile_features = build::makefile_features_from_env();
+    let config = load_build_config_with_makefile_features(request, &makefile_features)?;
+    let to_bin = config.to_bin;
+    let mut build_info = config.build_info;
+    build_info.validated_max_cpu_num()?;
+    build_info.resolve_c_app_features()?;
+    let mut cargo = build_info.into_prepared_no_std_cargo_config_with_metadata(
         &request.package,
         &request.target,
         metadata,
-    )
-}
-
-pub(crate) fn load_c_app_cargo_config(request: &ResolvedBuildRequest) -> anyhow::Result<Cargo> {
-    let metadata =
-        build::cached_workspace_metadata().context("failed to load workspace metadata")?;
-    let makefile_features = build::makefile_features_from_env();
-    let mut build_info = load_build_config_with_makefile_features_and_metadata(
-        request,
-        &makefile_features,
-        Some(metadata),
-    )?
-    .build_info;
-    build_info.validated_max_cpu_num()?;
-    build_info.resolve_features_with_metadata(&request.package, &request.target, metadata);
-    let rustflags = build::toolchain_rustflags_for_features(&build_info.env, &build_info.features);
-    let args = ArceosBuildInfo::build_cargo_args(&request.target, &rustflags);
-
-    build_info.prepare_log_env();
-    build_info.prepare_max_cpu_num_env()?;
-
-    Ok(build_info.into_base_cargo_config_with_to_bin(
-        request.package.clone(),
-        request.target.clone(),
-        args,
-        false,
-    ))
+        build::BareKernelLinkMode::Default,
+    )?;
+    cargo.to_bin = to_bin;
+    Ok(cargo)
 }

@@ -1,157 +1,142 @@
-//! Core vCPU and nested-paging contract implemented by every target architecture.
+//! Hardware-only vCPU boundary selected once for the current architecture.
 
-use alloc::{format, vec::Vec};
+use std::{sync::Arc, vec::Vec};
 
-use ax_memory_addr::VirtAddr;
 use axaddrspace::NestedPageTableOps;
-use axvm_types::{VmArchPerCpuOps, VmArchVcpuOps, VmVcpuState};
+use axvm_types::{VmArchPerCpuOps, VmArchVcpuOps};
 
-use super::{BoundVcpuExit, VcpuRunAction};
-use crate::{AxVmResult, ax_err};
+use crate::{
+    AxVmResult,
+    engine::VcpuAction,
+    irq::model::PendingVcpuInterrupt,
+    runtime::{QueuedVcpuInterrupt, hvc::GuestRequest},
+    services::{RunServices, RunSignals, VcpuWait},
+    vm::{AxVM, AxVMResources},
+};
 
+/// Portable register effects produced after hardware has been unloaded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RegisterCompletion {
+    #[default]
+    None,
+    Gpr {
+        register: usize,
+        value: usize,
+    },
+    Return(usize),
+}
+
+/// Each entry value retains only prepared hardware and interrupt capabilities.
+/// Device callbacks and task-service locks belong in `RunServices` instead.
 pub(crate) trait ArchOps {
-    type VCpu: VmArchVcpuOps;
+    /// Owner-local architecture backend. All mutable state is accessed through
+    /// `&mut`; scheduling, locking, and lifecycle ownership remain in AxVM.
+    type VCpu: VmArchVcpuOps + Send;
     type PerCpu: VmArchPerCpuOps;
-    type DeferredRunWork;
     type NestedPageTable: NestedPageTableOps;
+    type Entry: Send + Sync;
+    type Exit: Send;
+    type Completion: Send + Default + From<RegisterCompletion>;
 
     fn has_hardware_support() -> bool;
 
-    fn clean_dcache_range(_addr: VirtAddr, _size: usize) {}
+    /// Retires translations for the old root on each CPU that could cache them.
+    /// Called in a synchronous host CPU rendezvous after every vCPU is unloaded.
+    fn invalidate_translations(
+        entry: &Self::Entry,
+        old_root: axvm_types::NestedPagingConfig,
+    ) -> AxVmResult;
+    fn prepare_entry(
+        resources: &AxVMResources,
+        signals: Arc<RunSignals>,
+    ) -> AxVmResult<Self::Entry>;
 
-    fn register_platform_irq_injector() {}
+    /// These lifecycle hooks run on the unique control owner in task context.
+    fn enter_runtime(vm: &mut AxVM, signals: &Arc<RunSignals>) -> AxVmResult;
+    fn exit_runtime(vm: &mut AxVM, signals: &Arc<RunSignals>) -> AxVmResult;
 
-    fn vcpu_affinities(
-        cpu_num: usize,
-        phys_cpu_ids: Option<&[usize]>,
-        phys_cpu_sets: Option<&[usize]>,
-    ) -> Vec<(usize, Option<usize>, usize)> {
-        default_vcpu_affinities(cpu_num, phys_cpu_ids, phys_cpu_sets)
+    /// All task-side preparation finishes before CPU binding and IRQ masking.
+    fn prepare_vcpu(vcpu: &mut Self::VCpu, entry: &Self::Entry) -> AxVmResult;
+    /// Quiesces per-vCPU task producers while preserving their guest state.
+    fn suspend_vcpu(_vcpu: &mut Self::VCpu) -> AxVmResult {
+        Ok(())
     }
 
-    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, _vcpu_id: usize, arg: usize) {
-        vcpu.set_gpr(0, arg);
+    /// Restarts quiesced per-vCPU producers before opening guest admission.
+    fn resume_vcpu(_vcpu: &mut Self::VCpu) -> AxVmResult {
+        Ok(())
     }
 
-    fn before_first_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
-
-    fn before_vcpu_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {}
-
-    fn inject_pending_interrupt(
-        _vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        interrupt: crate::vm::PendingInterrupt,
-    ) {
-        match interrupt {
-            crate::vm::PendingInterrupt::Normal(vector) => {
-                trace!(
-                    "Injecting queued interrupt {vector:#x} into VM[{}] VCpu[{}]",
-                    vcpu.vm_id(),
-                    vcpu.id()
-                );
-                if let Err(err) = vcpu.inject_interrupt(vector) {
-                    warn!(
-                        "Failed to inject queued interrupt {vector:#x} into VM[{}] VCpu[{}]: \
-                         {err:?}",
-                        vcpu.vm_id(),
-                        vcpu.id()
-                    );
-                }
-            }
-            crate::vm::PendingInterrupt::External {
-                vector,
-                physical_irq,
-            } => {
-                warn!(
-                    "VM[{}] VCpu[{}] dropped unsupported external interrupt vector={vector:#x}, \
-                     physical_irq={physical_irq:#x}",
-                    vcpu.vm_id(),
-                    vcpu.id()
-                );
-            }
-        }
+    /// Stops task-side vCPU producers before returning or releasing a backend.
+    /// Architectures without a per-vCPU producer need no retirement work.
+    fn quiet_vcpu(_vcpu: &mut Self::VCpu) -> AxVmResult {
+        Ok(())
     }
 
-    fn after_external_interrupt(
-        _vm: &crate::AxVMRef,
-        _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        vector: usize,
-    ) {
-        crate::host::arceos::dispatch_host_irq(vector);
-        crate::check_timer_events();
+    /// Rechecks CPU-local resource ownership after task preparation and pinning.
+    /// False retires this attempt without guest entry; preparation may then
+    /// perform a remote handoff in task context before the next pinned attempt.
+    /// Backends without retained CPU-local claims are immediately ready.
+    fn entry_cpu_is_ready(_vcpu: &mut Self::VCpu) -> bool {
+        true
     }
 
-    fn on_last_vcpu_exit(_vm_id: usize) {}
-
-    fn after_mmio_write(_vm: &crate::AxVMRef) {}
-
-    fn handle_vcpu_exit_bound(
-        vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
+    fn before_guest(vcpu: &mut Self::VCpu, vcpu_id: usize, entry: &Self::Entry) -> AxVmResult;
+    fn complete(
+        vcpu: &mut Self::VCpu,
+        entry: &Self::Entry,
+        completion: Self::Completion,
+    ) -> AxVmResult;
+    fn capture_exit(
+        vcpu: &mut Self::VCpu,
+        entry: &Self::Entry,
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
-    ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>>;
-
-    fn finish_deferred_run_work(
-        vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-        work: Self::DeferredRunWork,
-    ) -> AxVmResult<VcpuRunAction>;
-
-    fn run_vcpu(
-        vm: &crate::AxVMRef,
-        vcpu: &crate::vm::AxVCpuRef<Self::VCpu>,
-    ) -> AxVmResult<VcpuRunAction>
-    where
-        Self: Sized,
-    {
-        let vm_id = vm.id();
-        let vcpu_id = vcpu.id();
-
-        match vcpu.state() {
-            VmVcpuState::Free => vcpu.bind()?,
-            VmVcpuState::Ready => {}
-            state => {
-                return ax_err!(
-                    BadState,
-                    format!("VCpu state is not Free or Ready, but {state:?}")
-                );
-            }
-        }
-
-        let run_result = vcpu.with_current_cpu_set(|| -> AxVmResult<_> {
-            loop {
-                crate::runtime::vcpus::inject_pending_interrupts::<Self>(vm.id(), vcpu_id, vcpu);
-
-                let exit = vcpu.run()?;
-                trace!("{exit:#x?}");
-                match Self::handle_vcpu_exit_bound(vm, vcpu, exit)? {
-                    BoundVcpuExit::Continue => continue,
-                    action => break Ok(action),
-                }
-            }
-        });
-
-        let unbind_result = vcpu.unbind();
-        match run_result {
-            Ok(BoundVcpuExit::Complete(action)) => {
-                unbind_result?;
-                Ok(action)
-            }
-            Ok(BoundVcpuExit::Defer(work)) => {
-                unbind_result?;
-                Self::finish_deferred_run_work(vm, vcpu, work)
-            }
-            Ok(BoundVcpuExit::Continue) => unreachable!("continued exits do not leave run loop"),
-            Err(err) => {
-                if let Err(unbind_err) = unbind_result {
-                    warn!(
-                        "VM[{vm_id}] VCpu[{vcpu_id}] unbind after run error failed: {unbind_err:?}"
-                    );
-                }
-                Err(err)
-            }
-        }
+    ) -> AxVmResult<Self::Exit>;
+    /// Resolves software-only exits after unloading and restoring the CPU.
+    /// Already durable exits need no further backend work. An architecture
+    /// that defers CSR or timer emulation overrides this task-context stage.
+    fn finish_exit(
+        _vcpu: &mut Self::VCpu,
+        _entry: &Self::Entry,
+        exit: Self::Exit,
+    ) -> AxVmResult<Self::Exit> {
+        Ok(exit)
     }
+    fn handle_exit(
+        exit: Self::Exit,
+        vcpu_id: usize,
+        services: &RunServices,
+    ) -> AxVmResult<VcpuAction<Self::Completion, GuestRequest>>;
+
+    /// Arm/PLIC/LAPIC native pending and source state remains authoritative.
+    fn inject_vcpu_interrupt(vcpu: &mut Self::VCpu, interrupt: PendingVcpuInterrupt) -> AxVmResult {
+        vcpu.inject_interrupt_with_trigger(interrupt.id.0 as usize, interrupt.trigger)
+            .map_err(|error| crate::vcpu::map_vcpu_backend_error("inject vCPU interrupt", error))
+    }
+    fn inject_arch_interrupt(
+        vcpu: &mut Self::VCpu,
+        vcpu_id: usize,
+        entry: &Self::Entry,
+        interrupt: QueuedVcpuInterrupt,
+    ) -> AxVmResult;
+
+    /// Invoked with an unloaded backend; wait predicates use only lower state.
+    fn wait_for_event(
+        vcpu: &mut Self::VCpu,
+        vcpu_id: usize,
+        entry: &Self::Entry,
+        wait: &VcpuWait,
+    ) -> AxVmResult;
+}
+
+/// Real CPU_ON capability provided only by Arm and RISC-V.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) trait CpuOn: ArchOps {
+    fn initialize_cpu_on(
+        vcpu: &mut Self::VCpu,
+        entry: axvm_types::GuestPhysAddr,
+        argument: usize,
+    ) -> AxVmResult;
 }
 
 pub(crate) fn target_phys_cpu_ids(vcpu_mappings: &[(usize, Option<usize>, usize)]) -> Vec<usize> {
@@ -168,33 +153,4 @@ pub(crate) fn target_phys_cpu_ids(vcpu_mappings: &[(usize, Option<usize>, usize)
         }
     }
     cpu_ids
-}
-
-pub(crate) fn default_vcpu_affinities(
-    cpu_num: usize,
-    phys_cpu_ids: Option<&[usize]>,
-    phys_cpu_sets: Option<&[usize]>,
-) -> Vec<(usize, Option<usize>, usize)> {
-    let mut vcpus = Vec::with_capacity(cpu_num);
-    for vcpu_id in 0..cpu_num {
-        vcpus.push((vcpu_id, None, vcpu_id));
-    }
-
-    if let Some(phys_cpu_sets) = phys_cpu_sets {
-        for (vcpu_id, pcpu_mask_bitmap) in phys_cpu_sets.iter().enumerate() {
-            if let Some(vcpu) = vcpus.get_mut(vcpu_id) {
-                vcpu.1 = Some(*pcpu_mask_bitmap);
-            }
-        }
-    }
-
-    if let Some(phys_cpu_ids) = phys_cpu_ids {
-        for (vcpu_id, phys_id) in phys_cpu_ids.iter().enumerate() {
-            if let Some(vcpu) = vcpus.get_mut(vcpu_id) {
-                vcpu.2 = *phys_id;
-            }
-        }
-    }
-
-    vcpus
 }

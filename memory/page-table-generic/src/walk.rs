@@ -36,6 +36,7 @@ pub struct PageTableWalker<'a, T: TableMeta, A: FrameAllocator> {
     // 内部状态管理 - 使用heapless::Vec
     stack: Vec<WalkState<T, A>, MAX_WALK_DEPTH>,
     finished: bool,
+    skip_unused: bool,
 }
 
 /// 遍历状态
@@ -45,6 +46,8 @@ struct WalkState<T: TableMeta, A: FrameAllocator> {
     level: usize,
     index: usize,
     base_vaddr: VirtAddr,
+    end_index: usize,
+    contains_end: bool,
 }
 
 impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
@@ -55,6 +58,7 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             config,
             stack: Vec::new(),
             finished: false,
+            skip_unused: false,
         };
 
         // 初始化栈，从根页表开始
@@ -62,14 +66,29 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             let root_state = WalkState {
                 frame: page_table.root.clone(),
                 level: Frame::<T, A>::PT_LEVEL,
-                index: 0,
-                base_vaddr: VirtAddr::new(0),
+                index: Frame::<T, A>::virt_to_index(
+                    walker.config.start_vaddr,
+                    Frame::<T, A>::PT_LEVEL,
+                ),
+                base_vaddr: VirtAddr::from_usize(0),
+                end_index: page_table.root.len(),
+                contains_end: false,
             };
             walker.stack.push(root_state).ok(); // 栈容量足够时一定成功
         } else {
             walker.finished = true;
         }
 
+        walker
+    }
+
+    pub(crate) fn new_occupied(page_table: &'a PageTableRef<T, A>, config: WalkConfig) -> Self {
+        let mut walker = Self::new(page_table, config);
+        walker.skip_unused = true;
+        if let Some(root) = walker.stack.last_mut() {
+            root.end_index = Frame::<T, A>::virt_to_index(config.end_vaddr - 1, root.level) + 1;
+            root.contains_end = true;
+        }
         walker
     }
 
@@ -88,7 +107,7 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             let state = self.stack.last_mut().unwrap();
 
             // 检查当前级别是否还有更多条目
-            if state.index >= state.frame.len() {
+            if state.index >= state.end_index {
                 self.stack.pop();
                 continue;
             }
@@ -98,12 +117,25 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             let pte = entries[state.index];
             state.index += 1;
 
-            // 获取当前条目的虚拟地址 - 重建完整的虚拟地址
-            let current_vaddr =
-                Frame::<T, A>::reconstruct_vaddr(state.index - 1, state.level, state.base_vaddr);
+            if self.skip_unused && pte.unused() {
+                continue;
+            }
 
-            // 跳过不在范围内的地址
-            if current_vaddr < self.config.start_vaddr {
+            // 获取当前条目的虚拟地址 - 重建完整的虚拟地址
+            let current_vaddr = T::canonicalize_vaddr(Frame::<T, A>::reconstruct_vaddr(
+                state.index - 1,
+                state.level,
+                state.base_vaddr,
+            ));
+
+            // A range may begin inside an entry owned by an upper-level page
+            // table. Compare the represented interval rather than only the
+            // entry base, otherwise the walker skips the child table that
+            // contains `start_vaddr` and has to fall back to a full-tree walk.
+            let entry_end = current_vaddr
+                .as_usize()
+                .saturating_add(Frame::<T, A>::level_size(state.level));
+            if entry_end <= self.config.start_vaddr.as_usize() {
                 continue;
             }
 
@@ -117,23 +149,37 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             // - 有效且是大页：是最终映射
             // - 有效且在叶子级别（level == 1）：是最终映射
             // - 有效但在中间级别且不是大页：不是最终映射（页表指针）
-            let pte_config = pte.to_config(state.level > 1);
-            let is_final_mapping = pte_config.valid && (pte_config.huge || state.level == 1);
+            let is_dir = state.level > 1;
+            let is_huge = pte.huge(is_dir);
+            let is_final_mapping = pte.present() && (is_huge || state.level == 1);
 
             // 如果是有效的子页表项（中间级别的页表指针），需要深入下一级
-            if pte_config.valid && !pte_config.huge && state.level > 1 {
-                let child_frame =
-                    Frame::from_paddr(pte_config.paddr, state.frame.allocator.clone());
+            if pte.present() && !is_huge && state.level > 1 {
+                let child_frame = Frame::from_paddr(pte.paddr(true), state.frame.allocator.clone());
 
                 // 计算子页表的基地址：当前条目的虚拟地址就是子页表覆盖的地址范围起点
                 let child_base_vaddr = current_vaddr;
+                let contains_end = state.contains_end
+                    && state.index - 1
+                        == Frame::<T, A>::virt_to_index(self.config.end_vaddr - 1, state.level);
+                let end_index = if contains_end {
+                    Frame::<T, A>::virt_to_index(self.config.end_vaddr - 1, state.level - 1) + 1
+                } else {
+                    child_frame.len()
+                };
 
                 // 创建子页表状态并压入栈中
                 let child_state = WalkState {
                     frame: child_frame,
                     level: state.level - 1,
-                    index: 0,
+                    index: if current_vaddr < self.config.start_vaddr {
+                        Frame::<T, A>::virt_to_index(self.config.start_vaddr, state.level - 1)
+                    } else {
+                        0
+                    },
                     base_vaddr: child_base_vaddr,
+                    end_index,
+                    contains_end,
                 };
 
                 // 先返回当前中间级别的页表项，然后压入子页表状态

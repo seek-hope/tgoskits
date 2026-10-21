@@ -12,7 +12,7 @@ Command:
 cargo xtask starry qemu \
   --arch x86_64 \
   --qemu-config apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-agent.toml \
-  --rootfs tmp/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
+  --rootfs target/axbuild/rootfs/rootfs-x86_64-picoclaw-online.img
 ```
 
 Guest command:
@@ -89,8 +89,8 @@ No API key or generated rootfs image is tracked.
   - Avoids success marker false positives from shell echo.
   - Preserves the agent command exit status.
 
-- `apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-offline.toml`
-  - Uses the safer split success marker.
+- `apps/starry/picoclaw-cli/qemu-x86_64.toml`
+  - Uses the safer split success marker for the offline phase.
 
 - `apps/starry/picoclaw-cli/qemu-x86_64-picoclaw-gateway.toml`
   - Uses the safer split success marker.

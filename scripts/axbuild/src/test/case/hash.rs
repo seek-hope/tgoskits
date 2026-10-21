@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::Context;
@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use super::types::{
-    CaseAssetConfig, CasePipeline, GROUPED_RUNNER_SCRIPT_FORMAT_VERSION, GroupedCaseRunnerConfig,
-    PYTHON_PIPELINE_CACHE_VERSION, RUST_PIPELINE_CACHE_VERSION, TestQemuCase,
+    CaseAssetConfig, CasePipeline, GROUPED_RUNNER_SCRIPT_FORMAT_VERSION, GroupedCaseExecution,
+    GroupedCaseRunnerConfig, PYTHON_PIPELINE_CACHE_VERSION, RUST_PIPELINE_CACHE_VERSION,
+    TestQemuCase,
 };
 
-const CMAKE_TOOLCHAIN_TEMPLATE_PATH: &str = "src/test/cmake-toolchain.cmake.in";
+const CMAKE_TOOLCHAIN_TEMPLATE: &[u8] = include_bytes!("../cmake-toolchain.cmake.in");
 
 pub(super) fn case_asset_cache_key(
     arch: &str,
@@ -24,24 +25,66 @@ pub(super) fn case_asset_cache_key(
     shared_rootfs: &Path,
     config: &CaseAssetConfig,
 ) -> anyhow::Result<String> {
+    case_asset_cache_key_with_lookup(
+        arch,
+        target,
+        pipeline,
+        case,
+        shared_rootfs,
+        config,
+        crate::support::process::find_optional_host_binary,
+    )
+}
+
+fn case_asset_cache_key_with_lookup(
+    arch: &str,
+    target: &str,
+    pipeline: CasePipeline,
+    case: &TestQemuCase,
+    shared_rootfs: &Path,
+    config: &CaseAssetConfig,
+    find: impl FnMut(&str) -> Option<PathBuf>,
+) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hash_token(&mut hasher, "v3");
     hash_token(&mut hasher, arch);
     hash_token(&mut hasher, target);
     hash_token(&mut hasher, case.display_name.as_str());
     hash_token(&mut hasher, pipeline.as_str());
+    if matches!(
+        pipeline,
+        CasePipeline::C | CasePipeline::Grouped | CasePipeline::Rust
+    ) {
+        let spec = crate::context::cross_compile_spec_for_arch_checked(arch)?;
+        let qemu = crate::test::build::find_cross_tool_qemu(spec, find);
+        // Cached images contain linked binaries. Never reuse them across
+        // providers, even when the source tree and shared rootfs are unchanged.
+        hash_token(
+            &mut hasher,
+            if qemu.is_some() {
+                "binutils-emulated-v1"
+            } else {
+                "binutils-native-v1"
+            },
+        );
+        if matches!(pipeline, CasePipeline::C | CasePipeline::Grouped) {
+            for flag in spec.clang_target_flags {
+                hash_token(&mut hasher, flag);
+            }
+        }
+    }
     for var in &config.cache_env_vars {
         hash_token(&mut hasher, var);
         hash_token(&mut hasher, std::env::var(var).unwrap_or_default().as_str());
     }
-    // Only the C pipeline uses the CMake toolchain template; include it in the
-    // key only when relevant so that changes to the template don't invalidate
-    // caches for unrelated pipelines.
-    if pipeline == CasePipeline::C {
-        hash_file(
-            &mut hasher,
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join(CMAKE_TOOLCHAIN_TEMPLATE_PATH),
-        )?;
+    // C and grouped-C pipelines use the CMake toolchain template. Keep it out
+    // of unrelated pipeline keys while invalidating every compiled C image.
+    if matches!(pipeline, CasePipeline::C | CasePipeline::Grouped) {
+        // The xtask binary can be built in one checkout and run from another
+        // (the CI artifact workflow does exactly that).  Hash the template
+        // embedded at build time instead of reopening the build checkout's
+        // absolute path at runtime.
+        hash_bytes(&mut hasher, CMAKE_TOOLCHAIN_TEMPLATE);
     }
     if pipeline == CasePipeline::Python {
         hash_token(&mut hasher, PYTHON_PIPELINE_CACHE_VERSION);
@@ -50,8 +93,12 @@ pub(super) fn case_asset_cache_key(
         hash_token(&mut hasher, RUST_PIPELINE_CACHE_VERSION);
     }
     if pipeline == CasePipeline::Grouped {
-        hash_grouped_runner_config(&mut hasher, &config.grouped_runner);
+        hash_grouped_execution(&mut hasher, &config.grouped_execution);
         hash_grouped_subcase_filter(&mut hasher, case.grouped_subcase_filter.as_ref());
+        if let Some(ltp_case_id) = case.ltp_case_id.as_deref() {
+            hash_token(&mut hasher, "ltp-case-select-v1");
+            hash_token(&mut hasher, ltp_case_id);
+        }
     }
 
     hash_rootfs_fingerprint(&mut hasher, shared_rootfs)?;
@@ -63,17 +110,20 @@ pub(super) fn case_asset_cache_key(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn hash_grouped_execution(hasher: &mut Sha256, execution: &GroupedCaseExecution) {
+    match execution {
+        GroupedCaseExecution::GuestInit(config) => {
+            hash_token(hasher, "guest-init");
+            hash_grouped_runner_config(hasher, config);
+        }
+        GroupedCaseExecution::External => hash_token(hasher, "external"),
+    }
+}
+
 fn hash_grouped_runner_config(hasher: &mut Sha256, config: &GroupedCaseRunnerConfig) {
     hash_token(hasher, GROUPED_RUNNER_SCRIPT_FORMAT_VERSION);
     hash_token(hasher, &config.runner_name);
     hash_token(hasher, &config.runner_path);
-    match &config.autorun_profile_script {
-        Some(script_name) => {
-            hash_token(hasher, "autorun_profile_script");
-            hash_token(hasher, script_name);
-        }
-        None => hash_token(hasher, "no_autorun_profile_script"),
-    }
     hash_token(hasher, &config.begin_marker);
     hash_token(hasher, &config.passed_marker);
     hash_token(hasher, &config.failed_marker);
@@ -174,7 +224,63 @@ fn hash_file(hasher: &mut Sha256, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(bytes);
+}
+
 fn hash_token(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_le_bytes());
     hasher.update(value.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::{
+            cache::is_valid_rootfs_cache_image,
+            tests::{fake_case, fake_config},
+        },
+        *,
+    };
+
+    #[test]
+    fn asset_cache_isolates_cross_tool_providers() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared.img");
+        fs::write(&shared, b"rootfs").unwrap();
+        let case = fake_case(root.path(), "compiled");
+        let config = fake_config();
+        for pipeline in [CasePipeline::C, CasePipeline::Grouped, CasePipeline::Rust] {
+            let key = |emulated| {
+                case_asset_cache_key_with_lookup(
+                    "aarch64",
+                    "aarch64-unknown-none-softfloat",
+                    pipeline,
+                    &case,
+                    &shared,
+                    &config,
+                    |name| {
+                        (emulated && name == "qemu-aarch64-static").then(|| root.path().join(name))
+                    },
+                )
+                .unwrap()
+            };
+            // Switching either way must miss the previous provider's image;
+            // an unchanged provider must retain its cache hit.
+            for emulated in [false, true] {
+                let image = root.path().join(format!("{}.img", key(emulated)));
+                fs::File::create(&image)
+                    .unwrap()
+                    .set_len(1024 * 1024)
+                    .unwrap();
+                assert!(is_valid_rootfs_cache_image(
+                    &root.path().join(format!("{}.img", key(emulated)))
+                ));
+                assert!(!is_valid_rootfs_cache_image(
+                    &root.path().join(format!("{}.img", key(!emulated)))
+                ));
+                fs::remove_file(image).unwrap();
+            }
+        }
+    }
 }

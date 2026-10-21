@@ -101,6 +101,20 @@ pub(crate) fn board_names(workspace_root: &Path) -> anyhow::Result<Vec<String>> 
         .collect())
 }
 
+pub(crate) fn default_qemu_board(
+    workspace_root: &Path,
+    target: &str,
+    package: Option<&str>,
+) -> anyhow::Result<Option<Board>> {
+    Ok(board_default_list(workspace_root)?
+        .into_iter()
+        .find(|board| {
+            board.name.starts_with("qemu-")
+                && board.target == target
+                && package.is_none_or(|package| board.package == package)
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -156,23 +170,42 @@ log = "Info"
     }
 
     #[test]
-    fn load_board_accepts_dynamic_platform_template_without_plat_dyn_field() {
+    fn default_qemu_board_matches_package_and_target() {
         let root = tempdir().unwrap();
         write_workspace(root.path());
-        let path = board_dir(root.path()).unwrap().join("static.toml");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
+        write_board(
+            root.path(),
+            "qemu-aarch64",
             r#"
 package = "arceos-helloworld"
 target = "aarch64-unknown-none-softfloat"
 features = []
 log = "Info"
 "#,
+        );
+
+        let board = default_qemu_board(
+            root.path(),
+            "aarch64-unknown-none-softfloat",
+            Some("arceos-helloworld"),
         )
         .unwrap();
-
-        let board = load_board_file(&path).unwrap();
-        assert_eq!(board.target, "aarch64-unknown-none-softfloat");
+        assert_eq!(board.unwrap().name, "qemu-aarch64");
+        assert_eq!(
+            default_qemu_board(root.path(), "aarch64-unknown-none-softfloat", None)
+                .unwrap()
+                .unwrap()
+                .name,
+            "qemu-aarch64"
+        );
+        assert!(
+            default_qemu_board(
+                root.path(),
+                "aarch64-unknown-none-softfloat",
+                Some("another-package"),
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

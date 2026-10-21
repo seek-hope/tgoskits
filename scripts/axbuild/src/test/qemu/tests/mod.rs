@@ -1,47 +1,52 @@
-use std::{
-    env,
-    ffi::{OsStr, OsString},
-    sync::{LazyLock, Mutex},
-};
-
-mod boot;
 mod discovery;
 mod rendering;
 
-static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+use super::{BuildConfigRef, prepare_case_build_groups};
 
-struct TempEnvVar {
-    key: &'static str,
-    original: Option<OsString>,
-}
+#[test]
+fn prepare_build_groups_reuses_equal_cargo_identity_across_runtime_configs() {
+    use std::path::PathBuf;
 
-impl TempEnvVar {
-    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-        let original = env::var_os(key);
-        unsafe {
-            env::set_var(key, value);
-        }
-        Self { key, original }
+    use ostool::build::config::Cargo;
+
+    #[derive(Debug)]
+    struct Case {
+        build_group: String,
+        build_config_path: PathBuf,
     }
 
-    fn unset(key: &'static str) -> Self {
-        let original = env::var_os(key);
-        unsafe {
-            env::remove_var(key);
+    impl BuildConfigRef for Case {
+        fn build_group(&self) -> &str {
+            &self.build_group
         }
-        Self { key, original }
-    }
-}
 
-impl Drop for TempEnvVar {
-    fn drop(&mut self) {
-        match self.original.as_ref() {
-            Some(value) => unsafe {
-                env::set_var(self.key, value);
-            },
-            None => unsafe {
-                env::remove_var(self.key);
-            },
+        fn build_config_path(&self) -> &std::path::Path {
+            &self.build_config_path
         }
     }
+
+    let cases = vec![
+        Case {
+            build_group: "direct-acpi".into(),
+            build_config_path: "/tmp/direct/build.toml".into(),
+        },
+        Case {
+            build_group: "ovmf-acpi".into(),
+            build_config_path: "/tmp/ovmf/build.toml".into(),
+        },
+    ];
+    let cargo = Cargo {
+        package: "axvisor".into(),
+        target: "x86_64-unknown-none".into(),
+        ..Cargo::default()
+    };
+
+    let groups = prepare_case_build_groups(&cases, |_| Ok(((), cargo.clone())))
+        .expect("equal Cargo identities share one build group");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].group.cases.len(), 2);
+    assert_eq!(
+        groups[0].group.cases[1].build_config_path,
+        PathBuf::from("/tmp/ovmf/build.toml")
+    );
 }

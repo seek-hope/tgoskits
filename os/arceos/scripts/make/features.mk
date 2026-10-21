@@ -13,7 +13,7 @@
 
 ifeq ($(APP_TYPE),c)
   arceos_feature_prefix := ax-libc/
-  lib_features := fp-simd irq alloc multitask lockdep fs net fd pipe select epoll
+  lib_features := fp-simd alloc lockdep fs net fd pipe select epoll
 else
   arceos_feature_prefix := ax-std/
   lib_features :=
@@ -40,10 +40,6 @@ direct_feat :=
 
 ifeq ($(filter $(LOG),off error warn info debug trace),)
   $(error "LOG" must be one of "off", "error", "warn", "info", "debug", "trace")
-endif
-
-ifeq ($(DWARF),y)
-  arceos_feature += dwarf
 endif
 
 ifeq ($(shell test $(SMP) -gt 1; echo $$?),0)

@@ -1,17 +1,24 @@
 mod assets;
 mod board;
-mod discovery;
+pub(crate) mod discovery;
+mod guest_build;
+mod host_probe;
+mod http_probe;
+mod initramfs;
+mod ovmf;
 mod qemu;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 use std::path::Path;
 
 pub(crate) use types::{AxvisorQemuCase, BoardTestGroup};
 
-use super::{ArgsTest, Axvisor, TestCommand};
+pub(crate) use self::guest_build::prepare as prepare_guest_builds;
+use super::*;
 
 pub(crate) fn parse_target(
     arch: &Option<String>,
@@ -20,23 +27,38 @@ pub(crate) fn parse_target(
     discovery::parse_target(arch, target)
 }
 
-pub(crate) fn discover_qemu_cases(
+#[cfg(test)]
+fn discover_qemu_cases(
     workspace_root: &Path,
     group: &str,
     arch: &str,
     target: &str,
     selected_case: Option<&str>,
 ) -> anyhow::Result<Vec<AxvisorQemuCase>> {
-    discovery::discover_qemu_cases(workspace_root, group, arch, target, selected_case)
+    discovery::discover_qemu_cases(
+        discovery::CaseSource::Tests,
+        workspace_root,
+        group,
+        arch,
+        target,
+        selected_case,
+    )
 }
 
-pub(crate) fn discover_board_test_groups(
+#[cfg(test)]
+fn discover_board_test_groups(
     workspace_root: &Path,
     group: &str,
-    selected_case: Option<&str>,
-    board: Option<&str>,
+    selected_cases: &[String],
+    boards: &[String],
 ) -> anyhow::Result<Vec<BoardTestGroup>> {
-    discovery::discover_board_test_groups(workspace_root, group, selected_case, board)
+    discovery::discover_board_test_groups(
+        discovery::CaseSource::Tests,
+        workspace_root,
+        group,
+        selected_cases,
+        boards,
+    )
 }
 
 pub(super) async fn test(axvisor: &mut Axvisor, args: ArgsTest) -> anyhow::Result<()> {

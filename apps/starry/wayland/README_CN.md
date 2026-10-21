@@ -56,7 +56,7 @@ APK 注入 rootfs overlay。客体内脚本是 [`wayland-test.sh`](wayland-test.
 
 ## 使用 VNC 手动复现
 
-手动流程刻意绕过 app 测试里的 `shell_init_cmd`，直接启动同一个内核和 Alpine
+手动流程刻意绕过 app 测试里的 `shell_cmd`，直接启动同一个内核和 Alpine
 rootfs。这样可以在 StarryOS shell 中手动输入命令，并通过 VNC 与 GTK 窗口交互。
 直接启动的 riscv64 和 x86_64 流程进入客体后的 Weston 和 GTK 命令完全相同，只有
 宿主机侧的 QEMU 启动命令不同。aarch64 请使用后文 aarch64 说明中的辅助脚本。
@@ -79,7 +79,7 @@ cargo xtask starry app qemu -t wayland --arch "$ARCH"
 
 ```bash
 mkdir -p tmp/wayland-manual
-cp "tmp/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
+cp "target/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
 ```
 
 ### 第三步：用 VNC 显示启动 QEMU
@@ -107,7 +107,7 @@ qemu-system-riscv64 \
   -device virtio-gpu-pci \
   -device virtio-keyboard-pci \
   -device virtio-mouse-pci \
-  -device virtio-blk-pci,drive=disk0 \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
   -drive id=disk0,if=none,format=raw,file=tmp/wayland-manual/riscv64.img
 ```
 
@@ -125,7 +125,7 @@ args = [
   "-device", "virtio-gpu-pci",
   "-device", "virtio-keyboard-pci",
   "-device", "virtio-mouse-pci",
-  "-device", "virtio-blk-pci,drive=disk0",
+  "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/wayland-manual/x86_64.img",
 ]
 uefi = true
@@ -268,8 +268,13 @@ provision，之后复用已经 provision 好的镜像：
 STARRY_VNC=9 ./apps/starry/wayland/run-hvf.sh --no-build --vnc-only
 ```
 
+[`prebuild.sh`](prebuild.sh) 通过 HTTPS 预取包及签名索引；安装前使用基础 rootfs 的
+`/etc/apk/keys` 验证全部索引和 APK，再从签名离线仓库安装，认证失败即停止。
+旧脚本已 provision 的镜像不会自动重新认证，升级后需使用
+`--reprovision --provision-only` 从可信基础镜像重建。
+
 使用 `--reprovision` 可以丢弃并重新创建
-`tmp/axbuild/rootfs/rootfs-aarch64-wayland.img`。如果默认 4096 MiB 的手动镜像
+`target/axbuild/rootfs/rootfs-aarch64-wayland.img`。如果默认 4096 MiB 的手动镜像
 不合适，可以设置 `STARRY_WAYLAND_ROOTFS_MB`。辅助脚本需要宿主机提供 `debugfs`、
 `e2fsck`、`resize2fs`、`python3` 和 `qemu-system-aarch64`；在 macOS Homebrew
 环境下，脚本会自动加入常见 Homebrew 路径。
@@ -288,7 +293,7 @@ Cocoa 抢占终端焦点。
 - Wayland SHM 所需的 `memfd_create` 和 Unix socket fd 传递。
 - 合成器事件循环使用的 `eventfd`。
 - libinput 设备发现所需的 `/run/udev/data/` udev seed。
-- app build config 中启用 `starry-kernel/input` 和 `ax-runtime/display`。
+- app build config 中启用 `ax-runtime/display`。
 
 如果复制出的 rootfs 中还没有这些用户态包，可选的手动安装包流程还需要启用了可用
 客体网络的内核/QEMU 启动方式。

@@ -1,8 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Instant,
 };
 
@@ -12,12 +10,11 @@ use ostool::{build::config::Cargo, run::qemu::QemuConfig};
 use super::{
     ArgsTestQemu, PreparedStarryQemuCase, StarryQemuCase, StarryQemuCaseOutcome,
     StarryQemuCaseReport, StarryQemuCaseRequirements, StarryQemuRunReport,
-    discover_all_qemu_cases_with_archs, discover_qemu_cases, ensure_host_symbolize_output_matches,
-    finalize_qemu_case_run, parse_test_target, starry_case_asset_config,
-    start_qemu_case_host_http_server,
+    discover_all_qemu_cases_with_archs, discover_qemu_cases, finalize_qemu_case_run,
+    parse_test_target, starry_case_asset_config, start_qemu_case_host_http_server,
 };
 use crate::{
-    build::{append_encoded_rustflags, env_truthy},
+    build::{append_cargo_rustflags, env_truthy},
     context::{ResolvedStarryRequest, SnapshotPersistence},
     starry::{Starry, board, build, rootfs},
     test::{case, qemu as qemu_test, timing},
@@ -27,6 +24,10 @@ const AXTEST_RUSTFLAGS: &[&str] = &["--cfg", "axtest", "--check-cfg", "cfg(axtes
 
 impl Starry {
     pub(super) async fn test_qemu(&mut self, args: ArgsTestQemu) -> anyhow::Result<()> {
+        if args.build_config.is_some() || args.qemu_config.is_some() || args.rootfs.is_some() {
+            return self.run_external_qemu(args).await;
+        }
+
         if args.list && args.arch.is_none() && args.target.is_none() {
             let case_names = discover_all_qemu_cases_with_archs(
                 self.app.workspace_root(),
@@ -76,8 +77,11 @@ impl Starry {
                  qemu board config under os/StarryOS/configs/board"
             );
         }
-        let default_rootfs_path =
-            crate::image::storage::default_rootfs_path(self.app.workspace_root(), &request.arch)?;
+        let default_rootfs_path = crate::image::storage::default_rootfs_path(
+            self.app.workspace_root(),
+            self.app.target_dir(),
+            &request.arch,
+        )?;
         self.app.set_debug_mode(request.debug)?;
 
         let total = cases.len();
@@ -94,7 +98,11 @@ impl Starry {
             ],
         );
         let build_groups = qemu_test::prepare_case_build_groups(&cases, |build_config_path| {
-            Self::qemu_group_build_context(&request, build_config_path)
+            Self::qemu_group_build_context(
+                &request,
+                build_config_path,
+                self.app.workspace_context(),
+            )
         });
         timing_stage.finish();
         let build_groups = build_groups?;
@@ -150,13 +158,12 @@ impl Starry {
                 println!("[{completed}/{total}] starry qemu {case_name}");
 
                 let case_started = Instant::now();
+                let case_request = Self::request_for_qemu_case_build_config(
+                    &build_group.request,
+                    &case.build_config_path,
+                );
                 match self
-                    .run_qemu_case(
-                        &build_group.request,
-                        &build_group.cargo,
-                        case,
-                        &asset_config,
-                    )
+                    .run_qemu_case(&case_request, &build_group.cargo, case, &asset_config)
                     .await
                     .with_context(|| format!("starry qemu test failed for case `{case_name}`"))
                 {
@@ -219,6 +226,15 @@ impl Starry {
                     starry_case.case.display_name
                 )
             })?;
+            let host_initramfs = qemu_test::prepare_host_initramfs(
+                self.app.workspace_root(),
+                self.app.target_dir(),
+                &starry_case.case.case_dir,
+                &request.arch,
+                &mut qemu,
+            )?;
+            let diskless_host_initramfs =
+                host_initramfs && qemu_test::host_initramfs_without_rootfs_drive(&qemu);
             let timing_stage = timing::TimingStage::new(
                 "starry-qemu",
                 [
@@ -226,15 +242,25 @@ impl Starry {
                     ("phase", "prepare-qemu-config".to_string()),
                 ],
             );
-            qemu_test::apply_dynamic_platform_qemu_boot(&mut qemu, cargo);
-            Self::rewrite_qemu_case_managed_rootfs_paths(self.app.workspace_root(), &mut qemu)?;
-            let rootfs_path =
-                Self::qemu_case_rootfs_path(self.app.workspace_root(), &qemu, default_rootfs_path)?;
-            rootfs_paths.insert(rootfs_path.clone());
-            rootfs_paths.extend(Self::qemu_case_managed_rootfs_paths(
+            Self::rewrite_qemu_case_managed_rootfs_paths(
                 self.app.workspace_root(),
+                self.app.target_dir(),
+                &mut qemu,
+            )?;
+            let rootfs_path = Self::qemu_case_rootfs_path(
+                self.app.workspace_root(),
+                self.app.target_dir(),
                 &qemu,
-            )?);
+                default_rootfs_path,
+            )?;
+            if !diskless_host_initramfs {
+                rootfs_paths.insert(rootfs_path.clone());
+                rootfs_paths.extend(Self::qemu_case_managed_rootfs_paths(
+                    self.app.workspace_root(),
+                    self.app.target_dir(),
+                    &qemu,
+                )?);
+            }
             qemu_test::validate_grouped_qemu_commands(&qemu, &starry_case.case, "Starry")?;
             let requirements = Self::qemu_case_requirements(&qemu).with_context(|| {
                 format!(
@@ -250,6 +276,7 @@ impl Starry {
                 build_config_path: starry_case.build_config_path.clone(),
                 rootfs_path,
                 requirements,
+                diskless_host_initramfs,
             });
         }
 
@@ -291,6 +318,7 @@ impl Starry {
             let result = if rootfs_path == default_rootfs_path {
                 rootfs::ensure_rootfs_in_tmp_dir(
                     self.app.workspace_root(),
+                    self.app.target_dir(),
                     &request.arch,
                     &request.target,
                 )
@@ -299,6 +327,7 @@ impl Starry {
             } else {
                 crate::image::storage::ensure_optional_managed_rootfs(
                     self.app.workspace_root(),
+                    self.app.target_dir(),
                     &request.arch,
                     Some(rootfs_path),
                 )
@@ -312,34 +341,43 @@ impl Starry {
 
     pub(crate) fn qemu_case_rootfs_path(
         workspace_root: &Path,
+        target_dir: &Path,
         qemu: &QemuConfig,
         default_rootfs_path: &Path,
     ) -> anyhow::Result<PathBuf> {
-        Ok(Self::qemu_case_managed_rootfs_paths(workspace_root, qemu)?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| default_rootfs_path.to_path_buf()))
+        Ok(
+            Self::qemu_case_managed_rootfs_paths(workspace_root, target_dir, qemu)?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| default_rootfs_path.to_path_buf()),
+        )
     }
 
     pub(crate) fn qemu_case_managed_rootfs_paths(
         workspace_root: &Path,
+        target_dir: &Path,
         qemu: &QemuConfig,
     ) -> anyhow::Result<Vec<PathBuf>> {
         crate::rootfs::qemu::drive_file_paths(qemu)
             .into_iter()
             .filter_map(|path| {
-                crate::image::storage::resolve_managed_rootfs_path(workspace_root, &path)
-                    .transpose()
+                crate::image::storage::resolve_managed_rootfs_path(
+                    workspace_root,
+                    target_dir,
+                    &path,
+                )
+                .transpose()
             })
             .collect()
     }
 
     pub(crate) fn rewrite_qemu_case_managed_rootfs_paths(
         workspace_root: &Path,
+        target_dir: &Path,
         qemu: &mut QemuConfig,
     ) -> anyhow::Result<()> {
         crate::rootfs::qemu::rewrite_drive_file_paths(qemu, |path| {
-            crate::image::storage::resolve_managed_rootfs_path(workspace_root, path)
+            crate::image::storage::resolve_managed_rootfs_path(workspace_root, target_dir, path)
         })
     }
 
@@ -354,14 +392,15 @@ impl Starry {
     pub(crate) fn qemu_group_build_context(
         request: &ResolvedStarryRequest,
         build_config_path: &Path,
+        workspace: &crate::context::WorkspaceContext,
     ) -> anyhow::Result<(ResolvedStarryRequest, Cargo)> {
         let request = Self::request_for_qemu_case_build_config(request, build_config_path);
-        let mut cargo = build::load_cargo_config(&request)?;
+        let mut cargo = build::load_cargo_config(&request, workspace)?;
         if env_truthy(&cargo.env, "AXTEST") {
-            append_encoded_rustflags(&mut cargo, AXTEST_RUSTFLAGS);
+            append_cargo_rustflags(&mut cargo, AXTEST_RUSTFLAGS);
         }
         if crate::support::axtest_coverage::enabled(&cargo) {
-            crate::support::axtest_coverage::prepare_cargo(&mut cargo);
+            crate::support::axtest_coverage::prepare_starry_cargo(&mut cargo);
         }
 
         Ok((request, cargo))
@@ -391,52 +430,17 @@ impl Starry {
     ) -> anyhow::Result<()> {
         let case = &prepared_case.case;
         let mut qemu = prepared_case.qemu.clone();
-        case::apply_grouped_qemu_config(&mut qemu, case, &asset_config.grouped_runner);
+        case::apply_grouped_qemu_config(&mut qemu, case, &asset_config.grouped_execution);
+
+        qemu_test::append_target_backtrace_map(
+            self.app.target_dir(),
+            &request.target,
+            request.debug,
+            &mut qemu,
+        )?;
 
         qemu_test::apply_smp_qemu_arg(&mut qemu, Some(prepared_case.requirements.smp));
         qemu_test::apply_timeout_scale(&mut qemu);
-
-        let case_name = &case.name;
-        let auto_symbolize =
-            crate::build::build_info_enables_backtrace_path(&prepared_case.build_config_path);
-        if !case.host_symbolize_success_regex.is_empty() && !auto_symbolize {
-            bail!(
-                "Starry qemu case `{case_name}` requests host symbolize assertions but its build \
-                 config does not enable BACKTRACE=y or DWARF=y"
-            );
-        }
-
-        let keep_qemu_log = crate::backtrace::keep_qemu_log_from_env();
-        let elf = crate::backtrace::std_test_elf_path(
-            self.app.workspace_root(),
-            &request.target,
-            crate::context::STARRY_PACKAGE,
-            request.debug,
-        );
-        let stream_session = if auto_symbolize {
-            crate::backtrace::BacktraceSymbolizeSession::try_new(&elf, case_name)
-        } else {
-            None
-        };
-        let capture_backtrace = if auto_symbolize {
-            let dir = crate::context::axbuild_tmp_dir(self.app.workspace_root()).join("qemu-logs");
-            fs::create_dir_all(&dir)?;
-            Some(crate::backtrace::BacktraceQemuCapture {
-                log_path: dir.join(format!("starry-{case_name}-{}.log", request.target)),
-                stream_symbolize: stream_session.clone(),
-                suppress_terminal_raw_blocks: false,
-                write_log_during_capture: keep_qemu_log,
-                captured_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
-            })
-        } else {
-            None
-        };
-        let log_path = capture_backtrace
-            .as_ref()
-            .map(|capture| capture.log_path.clone());
-        let memory_blocks = capture_backtrace
-            .as_ref()
-            .map(|capture| capture.captured_blocks.clone());
 
         let prepare_stage = timing::TimingStage::new(
             "qemu-case",
@@ -446,7 +450,7 @@ impl Starry {
             ],
         );
         let prepared_assets_result = case::prepare_case_assets(
-            self.app.workspace_root(),
+            self.app.target_dir(),
             &request.arch,
             &request.target,
             case,
@@ -492,13 +496,17 @@ impl Starry {
                 ("phase", "patch-rootfs".to_string()),
             ],
         );
-        rootfs::patch_rootfs(
-            &mut qemu,
-            &prepared_assets.rootfs_path,
-            rootfs::RootfsPatchMode::EnsureDiskBootNet,
-        );
+        if !prepared_case.diskless_host_initramfs {
+            rootfs::patch_rootfs(
+                &mut qemu,
+                &prepared_assets.rootfs_path,
+                rootfs::RootfsPatchOptions {
+                    mode: rootfs::RootfsPatchMode::EnsureDiskBootNet,
+                    write_policy: rootfs::RootfsWritePolicy::Discard,
+                },
+            )?;
+        }
         timing_stage.finish();
-        qemu.args.extend(prepared_assets.extra_qemu_args.clone());
         let timing_stage = timing::TimingStage::new(
             "qemu-case",
             [
@@ -506,7 +514,6 @@ impl Starry {
                 ("phase", "apply-dynamic-boot".to_string()),
             ],
         );
-        qemu_test::apply_dynamic_platform_qemu_boot(&mut qemu, cargo);
         timing_stage.finish();
         let timing_stage = timing::TimingStage::new(
             "qemu-case",
@@ -522,7 +529,6 @@ impl Starry {
             &mut self.app,
             cargo,
             qemu,
-            capture_backtrace,
             &case.qemu_config_path,
             prepared_assets,
             case::RunPreparedQemuCaseOptions {
@@ -531,38 +537,6 @@ impl Starry {
             },
         )
         .await?;
-
-        if auto_symbolize && let Some(path) = log_path {
-            let blocks_snapshot = memory_blocks.and_then(|arc| arc.lock().ok().map(|b| b.clone()));
-            let symbolized_output = if !case.host_symbolize_success_regex.is_empty() {
-                match blocks_snapshot.as_deref() {
-                    Some(blocks) => crate::backtrace::symbolize_captured_blocks_to_string(
-                        &elf, case_name, blocks,
-                    )?,
-                    None => None,
-                }
-            } else {
-                None
-            };
-            let blocks_ref = blocks_snapshot.as_deref();
-            let outcome = crate::backtrace::maybe_symbolize_after_qemu(
-                &elf,
-                &path,
-                case_name,
-                keep_qemu_log,
-                stream_session.as_deref(),
-                blocks_ref,
-            )?;
-
-            if !case.host_symbolize_success_regex.is_empty() {
-                ensure_host_symbolize_output_matches(
-                    case_name,
-                    outcome,
-                    symbolized_output.as_deref(),
-                    &case.host_symbolize_success_regex,
-                )?;
-            }
-        }
 
         Ok(())
     }

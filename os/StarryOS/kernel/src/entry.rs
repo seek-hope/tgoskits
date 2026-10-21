@@ -3,24 +3,38 @@ use alloc::{
     sync::Arc,
 };
 
-use ax_fs_ng::vfs::FS_CONTEXT;
-use ax_kernel_guard::NoPreemptIrqSave;
-use ax_runtime::hal::cpu::uspace::UserContext;
-use ax_sync::Mutex;
-use ax_task::{AxTaskExt, spawn_task};
-use starry_process::{Pid, Process};
+use ax_fs_ng::vfs::current_fs_context;
+use ax_runtime::hal::cpu::user::UserContext;
 
 use crate::{
-    file::FD_TABLE,
-    mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
+    file::{FD_TABLE, FileTable, new_file_table_scope},
+    mm::{MmHandle, load_user_app, new_user_image_builder},
+    namespace::NsProxy,
     pseudofs::{self, dev::tty},
-    task::{ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task, spawn_alarm_task},
+    sync::{Mutex, RawSpinRwLock},
+    task::{
+        PidReservation, PidReservationKind, Process, ProcessData, ProcessDataInit, ProcessImage,
+        ROOT_PID_NS, Tgid, Thread, Tid, TidNumber, UserThreadOptions, new_user_task,
+        prepare_user_thread, spawn_alarm_task,
+    },
     tracepoint::tracepoint_init,
 };
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    init_candidates(&[args[0].clone()], &args[1..], envs);
+}
+
+/// Starts an init candidate on the root already selected during boot.
+pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) {
+    // Install task-context diagnostics and contention backoff before userspace.
+    crate::rdrive_osal::init();
+
+    crate::stop_machine::init();
+    crate::trap::init_handlers();
     static_keys::global_init();
+    crate::cgroup::init();
+
     tracepoint_init().expect("Failed to initialize tracepoints");
 
     crate::ebpf::init_ebpf();
@@ -28,33 +42,50 @@ pub fn init(args: &[String], envs: &[String]) {
     crate::kmod::init_kmod();
 
     pseudofs::mount_all().expect("Failed to mount pseudofs");
+    crate::file::epoll::start_epoll_notify_worker();
     spawn_alarm_task();
+    crate::mm::spawn_reclaimer_task();
     pseudofs::usbfs::start_event_pump();
 
     ax_alloc::register_page_reclaim_fn(ax_fs_ng::vfs::page_cache_reclaim);
 
-    let loc = FS_CONTEXT
-        .lock()
-        .resolve(&args[0])
-        .expect("Failed to resolve executable path");
+    let mut selected = None;
+    for candidate in paths {
+        let Ok(loc) = current_fs_context().lock().resolve(candidate) else {
+            continue;
+        };
+        let mut builder =
+            new_user_image_builder().expect("Failed to create unpublished user address space");
+        let mut args = alloc::vec![candidate.clone()];
+        args.extend_from_slice(init_args);
+        match load_user_app(
+            &mut builder,
+            loc.clone(),
+            candidate,
+            &args,
+            envs,
+            &crate::task::Cred::root(),
+        ) {
+            Ok(image) => {
+                selected = Some((loc, builder, image, args));
+                break;
+            }
+            Err(error) => warn!("Failed to execute init {candidate}: {error:?}"),
+        }
+    }
+    let (loc, image_builder, loaded_image, args) =
+        selected.unwrap_or_else(|| panic!("No working init found among candidates: {paths:?}"));
     let path = loc
         .absolute_path()
         .expect("Failed to get executable absolute path");
     let name = loc.name().into_owned();
 
-    let mut uspace = new_user_aspace_empty()
-        .and_then(|mut it| {
-            copy_from_kernel(&mut it)?;
-            Ok(it)
-        })
-        .expect("Failed to create user address space");
-
-    let (entry_vaddr, ustack_top, auxv) = load_user_app(&mut uspace, loc, &args[0], args, envs)
-        .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
+    let prepared_image = image_builder
+        .finish(loaded_image)
+        .expect("loaded init image token no longer matches its address space");
+    let (uspace, entry_vaddr, ustack_top, auxv) = prepared_image.into_parts();
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
-    let mut task = new_user_task(&name, uctx, 0);
-    task.ctx_mut().set_page_table_root(uspace.page_table_root());
 
     // PID 1 must really be 1: the init process is the root of the process
     // hierarchy and userspace (e.g. systemd's `getpid() == 1` system-manager
@@ -64,52 +95,89 @@ pub fn init(args: &[String], envs: &[String]) {
     // scheduler id untouched. `Thread::tid` is already decoupled from the
     // scheduler id (see its field doc), so this only requires the table keys to
     // follow the thread tid rather than `task.id()`.
-    const INIT_PID: Pid = 1;
-    let pid = INIT_PID;
-    let proc = Process::new_init(pid);
-    proc.add_thread(pid);
+    const INIT_PID: u32 = 1;
+    let reservation = PidReservation::reserve(&ROOT_PID_NS, PidReservationKind::ProcessLeader)
+        .expect("failed to reserve init PID identity");
+    let pid = reservation
+        .number_in(&ROOT_PID_NS)
+        .expect("init PID reservation has no root binding")
+        .get();
+    assert_eq!(pid, INIT_PID);
+    let identity = reservation.identity();
+    let tid_lease = identity
+        .acquire_role::<Tid>()
+        .expect("failed to acquire init TID role");
+    let tgid_lease = identity
+        .acquire_role::<Tgid>()
+        .expect("failed to acquire init TGID role");
+    let proc = Process::new_init(identity.clone()).expect("failed to prepare init process");
+    proc.add_thread(TidNumber::try_from(pid).expect("init TID must be non-zero"));
 
-    if let Err(err) = tty::bind_console_to(&proc) {
-        warn!("Failed to bind console tty: {err:?}");
-    }
+    // Initial console descriptors do not assign a controlling terminal to
+    // PID 1. A userspace session leader claims it with TIOCSCTTY.
 
     let proc = ProcessData::new(
         proc,
-        ProcessImage::new(path.to_string(), Arc::new(args.to_vec()), auxv),
-        Arc::new(Mutex::new(uspace)),
-        Arc::default(),
-        None,
-        pid,
-        false,
+        identity.clone(),
+        tgid_lease,
+        ProcessDataInit::new(
+            ProcessImage::new(
+                path.to_string(),
+                Arc::new(args.to_vec()),
+                Arc::new(envs.to_vec()),
+                auxv,
+                "/".to_string(),
+                "/".to_string(),
+            ),
+            MmHandle::from_arc(Arc::new(Mutex::new(uspace)))
+                .expect("init MM identity must be unique"),
+            Arc::default(),
+            NsProxy::new_root(),
+            None,
+            TidNumber::try_from(pid).expect("init TID must be non-zero"),
+        ),
     );
+    // SAFE-EXPECT: failing to attach init would violate the kernel's process accounting invariant.
+    crate::cgroup::attach_initial_process(&identity)
+        .expect("Failed to attach init process to cgroup root");
 
-    {
-        let mut scope = proc.scope.write();
-        crate::file::add_stdio(&mut FD_TABLE.scope_mut(&mut scope).write())
-            .expect("Failed to add stdio");
-    }
+    let mut scope = scope_local::Scope::new();
+    let mut fd_table = FileTable::new();
+    crate::file::add_stdio(&mut fd_table).expect("Failed to add stdio");
+    *FD_TABLE.scope_mut(&mut scope) = new_file_table_scope(Arc::new(RawSpinRwLock::new(fd_table)));
 
-    let thr = Thread::new(pid, proc, None, starry_signal::SignalSet::default());
-    *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
+    let thr = Thread::new(
+        identity.clone(),
+        tid_lease,
+        proc,
+        None,
+        starry_signal::SignalSet::default(),
+        scope,
+    )
+    .expect("failed to prepare init thread state");
+    let prepared_task = prepare_user_thread(
+        new_user_task(
+            uctx,
+            0,
+            TidNumber::try_from(pid).expect("init TID must be non-zero"),
+        ),
+        thr,
+        UserThreadOptions::new(&name).expect("failed to prepare init thread name"),
+    )
+    .expect("failed to prepare init task");
+    let staged_task = prepared_task.stage().expect("failed to stage init task");
+    let published_identity = reservation
+        .publish()
+        .expect("failed to publish init PID identity");
+    debug_assert!(Arc::ptr_eq(&published_identity, &identity));
+    staged_task.with_task(|task| task.as_thread().attach_pid_task(task));
+    tty::arm_console_irq();
+    let task = staged_task.activate();
 
-    let task = {
-        let _guard = NoPreemptIrqSave::new();
-        let task = spawn_task(task);
-        add_task_to_table(&task);
-        tty::arm_console_irq();
-        task
-    };
-
-    // TODO: wait for all processes to finish
-    let exit_code = task.join();
-    info!("Init process exited with code: {exit_code:?}");
-
-    let cx = FS_CONTEXT.lock();
-    cx.root_dir()
-        .unmount_all()
-        .expect("Failed to unmount all filesystems");
-    cx.root_dir()
-        .filesystem()
-        .flush()
-        .expect("Failed to flush rootfs");
+    // Reap the initial scheduler thread, which may exit while init's peers
+    // remain alive. Only do_exit's last-thread owner decides that init died.
+    // Userspace owns normal shutdown through reboot(2); the bootstrap thread
+    // must neither return nor poll a second process-lifecycle state here.
+    let _exit_code = task.join();
+    match crate::task::future::block_on(core::future::pending::<core::convert::Infallible>()) {}
 }

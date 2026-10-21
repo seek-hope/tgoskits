@@ -1,9 +1,12 @@
 //! AxVM-owned error contract.
 
-use alloc::{format, string::String};
-use core::fmt::Display;
+use std::{fmt::Display, format, string::String};
 
 use axaddrspace::AddrSpaceError;
+use axdevice::{DeviceManagerError, ResourcePlanningError};
+use axdevice_base::{DeviceError, IrqError, RegistryError};
+use axhvc::HyperCallError;
+use axvmconfig::AxVmConfigError;
 
 use crate::{VMId, VmStatus};
 
@@ -13,6 +16,37 @@ pub type AxVmResult<T = ()> = Result<T, AxVmError>;
 /// Errors reported by AxVM to a hypervisor application.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AxVmError {
+    /// Allocation-free hardware failure carried out of a CPU-bound scope.
+    #[error("virtualization operation {operation} failed: {source}")]
+    Backend {
+        operation: &'static str,
+        source: axvm_types::VmBackendError,
+    },
+    /// Carries native GIC facts out of a hardware binding without formatting.
+    #[cfg(target_arch = "aarch64")]
+    #[error("virtual interrupt operation {operation} failed: {source}")]
+    InterruptController {
+        operation: &'static str,
+        source: arm_vgic::VgicError,
+    },
+    /// A vCPU transition was rejected without formatting in a pinned scope.
+    #[error("invalid vCPU state: expected {expected:?}, observed {actual:?}")]
+    VcpuState {
+        expected: crate::VmVcpuState,
+        actual: crate::VmVcpuState,
+    },
+    /// The operation belongs to an execution period that has retired.
+    #[error("stale VM run {expected:?}; current run is {current:?}")]
+    StaleRun {
+        expected: crate::RunId,
+        current: Option<crate::RunId>,
+    },
+    /// The control endpoint no longer admits commands for this instance.
+    #[error("VM {vm:?} command entry is closed")]
+    EntryClosed { vm: crate::VmKey },
+    /// The command owner exited before publishing a final result.
+    #[error("VM operation {operation:?} was cancelled")]
+    OperationCancelled { operation: crate::OperationId },
     /// The VM configuration is internally inconsistent or malformed.
     #[error("invalid VM configuration: {detail}")]
     InvalidConfig { detail: String },
@@ -35,6 +69,15 @@ pub enum AxVmError {
         to: VmStatus,
         operation: &'static str,
     },
+    /// A lifecycle operation failed and its compensating cleanup also failed.
+    #[error(
+        "VM lifecycle operation {operation} failed: {primary}; rollback also failed: {rollback}"
+    )]
+    LifecycleRollback {
+        operation: &'static str,
+        primary: String,
+        rollback: String,
+    },
     /// No registered VM has the requested identifier.
     #[error("VM {vm_id} was not found")]
     VmNotFound { vm_id: VMId },
@@ -50,6 +93,9 @@ pub enum AxVmError {
         resource: &'static str,
         detail: String,
     },
+    /// A physical device is permanently owned by the host.
+    #[error("physical device {path} is a host-owned device")]
+    HostOwnedDevice { path: String },
     /// The requested operation is not implemented by this host or backend.
     #[error("unsupported VM operation {operation}: {detail}")]
     Unsupported {
@@ -95,9 +141,26 @@ pub enum AxVmError {
         operation: &'static str,
         detail: String,
     },
+    /// Deterministic virtual-device resource planning failed.
+    #[error(transparent)]
+    DeviceResourcePlanning(#[from] ResourcePlanningError),
+    /// Host-derived GIC firmware geometry is invalid.
+    #[error(transparent)]
+    GuestGicProfile(#[from] crate::machine::GuestGicProfileError),
+    /// Host-derived PLIC firmware geometry is invalid.
+    #[error(transparent)]
+    GuestPlicProfile(#[from] crate::machine::GuestPlicProfileError),
 }
 
 impl AxVmError {
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn interrupt_controller(
+        operation: &'static str,
+        source: arm_vgic::VgicError,
+    ) -> Self {
+        Self::InterruptController { operation, source }
+    }
+
     pub(crate) const fn invalid_transition(
         from: VmStatus,
         to: VmStatus,
@@ -107,6 +170,18 @@ impl AxVmError {
             from,
             to,
             operation,
+        }
+    }
+
+    pub(crate) fn lifecycle_rollback(
+        operation: &'static str,
+        primary: impl Display,
+        rollback: impl Display,
+    ) -> Self {
+        Self::LifecycleRollback {
+            operation,
+            primary: format!("{primary}"),
+            rollback: format!("{rollback}"),
         }
     }
 
@@ -196,9 +271,154 @@ impl AxVmError {
                 "guest address range",
                 format_args!("{operation} failed: {error}"),
             ),
-            AddrSpaceError::MappingState
+            AddrSpaceError::UnleasedBacking
+            | AddrSpaceError::MappingState
+            | AddrSpaceError::NeedsRepair
             | AddrSpaceError::Unmapped { .. }
             | AddrSpaceError::InsufficientAccess { .. } => Self::memory(operation, error),
+        }
+    }
+}
+
+impl From<DeviceError> for AxVmError {
+    fn from(error: DeviceError) -> Self {
+        match error {
+            DeviceError::InvalidInput { operation, detail } => {
+                Self::InvalidInput { operation, detail }
+            }
+            DeviceError::InvalidData { detail, .. } => Self::InvalidConfig { detail },
+            DeviceError::Unsupported { operation, detail } => {
+                Self::Unsupported { operation, detail }
+            }
+            DeviceError::OutOfMemory { operation } => Self::OutOfMemory { operation },
+            DeviceError::ResourceBusy {
+                operation,
+                resource,
+            } => {
+                Self::resource_conflict("device resource", format_args!("{operation}: {resource}"))
+            }
+            error => Self::device("access virtual device", error),
+        }
+    }
+}
+
+impl From<AxVmConfigError> for AxVmError {
+    fn from(error: AxVmConfigError) -> Self {
+        Self::invalid_config(error)
+    }
+}
+
+impl From<HyperCallError> for AxVmError {
+    fn from(error: HyperCallError) -> Self {
+        match error {
+            HyperCallError::InvalidCode(error) => Self::invalid_input("decode hypercall", error),
+            HyperCallError::Unsupported { code, detail } => Self::Unsupported {
+                operation: "execute hypercall",
+                detail: format!("hypercall {code:?}: {detail}"),
+            },
+            HyperCallError::InvalidParameter {
+                code,
+                parameter,
+                detail,
+            } => Self::InvalidInput {
+                operation: "execute hypercall",
+                detail: format!("hypercall {code:?} parameter {parameter}: {detail}"),
+            },
+            HyperCallError::InvalidState { code, detail } => Self::InvalidState {
+                operation: "execute hypercall",
+                detail: format!("hypercall {code:?}: {detail}"),
+            },
+            HyperCallError::ResourceNotFound {
+                code,
+                resource,
+                detail,
+            } => Self::resource_unavailable(
+                "hypercall resource",
+                format_args!("hypercall {code:?} could not find {resource}: {detail}"),
+            ),
+            HyperCallError::ResourceConflict {
+                code,
+                resource,
+                detail,
+            } => Self::resource_conflict(
+                "hypercall resource",
+                format_args!("hypercall {code:?} conflict for {resource}: {detail}"),
+            ),
+            HyperCallError::OutOfMemory { operation, .. } => Self::OutOfMemory { operation },
+            HyperCallError::GuestMemoryAccess {
+                code,
+                operation,
+                address,
+                detail,
+            } => Self::Memory {
+                operation,
+                detail: format!("hypercall {code:?} guest address {address:#x}: {detail}"),
+            },
+            HyperCallError::Internal {
+                code,
+                operation,
+                detail,
+            } => Self::Host {
+                operation,
+                detail: format!("hypercall {code:?}: {detail}"),
+            },
+        }
+    }
+}
+
+impl From<IrqError> for AxVmError {
+    fn from(error: IrqError) -> Self {
+        Self::interrupt("route virtual device interrupt", error)
+    }
+}
+
+impl From<RegistryError> for AxVmError {
+    fn from(error: RegistryError) -> Self {
+        match error {
+            RegistryError::AddressConflict { .. } => {
+                Self::resource_conflict("device address range", error)
+            }
+            RegistryError::IrqLineConflict { .. } => {
+                Self::resource_conflict("device IRQ line", error)
+            }
+            RegistryError::InvalidResource { .. } => {
+                Self::invalid_input("register virtual device", error)
+            }
+            RegistryError::InvalidState { .. } => {
+                Self::invalid_state("register virtual device", error)
+            }
+            RegistryError::BusKindNotSupported { .. } | RegistryError::ArchNotSupported { .. } => {
+                Self::unsupported("register virtual device", error)
+            }
+        }
+    }
+}
+
+impl From<DeviceManagerError> for AxVmError {
+    fn from(error: DeviceManagerError) -> Self {
+        match error {
+            DeviceManagerError::InvalidConfig { detail, .. } => Self::InvalidConfig { detail },
+            DeviceManagerError::InvalidInput { operation, detail } => {
+                Self::InvalidInput { operation, detail }
+            }
+            DeviceManagerError::ResourceNotFound {
+                operation,
+                resource,
+            } => Self::resource_unavailable(
+                "device resource",
+                format_args!("{operation}: {resource}"),
+            ),
+            DeviceManagerError::ResourceConflict { operation, detail } => {
+                Self::resource_conflict("device resource", format_args!("{operation}: {detail}"))
+            }
+            DeviceManagerError::OutOfMemory { operation } => Self::OutOfMemory { operation },
+            DeviceManagerError::Unsupported { operation, detail } => {
+                Self::Unsupported { operation, detail }
+            }
+            DeviceManagerError::Irq(error) => error.into(),
+            DeviceManagerError::Registry(error) => error.into(),
+            DeviceManagerError::Device(error) => error.into(),
+            error => Self::device("manage virtual devices", error),
         }
     }
 }
@@ -247,9 +467,15 @@ macro_rules! ax_err {
 pub(crate) use ax_err;
 pub(crate) use ax_err_type;
 
+impl From<crate::services::SignalError> for AxVmError {
+    fn from(error: crate::services::SignalError) -> Self {
+        Self::interrupt("runtime signal", error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloc::string::ToString;
+    use std::string::ToString;
 
     use super::*;
 
@@ -334,5 +560,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn configuration_errors_map_to_invalid_config() {
+        let config_error = AxVmConfigError::UnsupportedBootProtocol {
+            protocol: axvmconfig::VMBootProtocol::Uefi,
+            arch: "aarch64".to_string(),
+        };
+
+        let error: AxVmError = config_error.into();
+
+        assert!(matches!(error, AxVmError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("Uefi"));
+        assert!(error.to_string().contains("aarch64"));
+    }
+
+    #[test]
+    fn hypercall_errors_map_to_matching_axvm_domains() {
+        let code = axhvc::HyperCallCode::HIVCPublishChannel;
+        let invalid_code = AxVmError::from(HyperCallError::from(axhvc::InvalidHyperCallCode(0xff)));
+        let cases = [
+            AxVmError::from(HyperCallError::InvalidParameter {
+                code,
+                parameter: "shm_size_ptr",
+                detail: "unaligned".to_string(),
+            }),
+            AxVmError::from(HyperCallError::InvalidState {
+                code,
+                detail: "channel is unpublished".to_string(),
+            }),
+            AxVmError::from(HyperCallError::ResourceNotFound {
+                code,
+                resource: "IVC channel 7".to_string(),
+                detail: "not registered".to_string(),
+            }),
+            AxVmError::from(HyperCallError::ResourceConflict {
+                code,
+                resource: "IVC channel 7".to_string(),
+                detail: "already registered".to_string(),
+            }),
+            AxVmError::from(HyperCallError::OutOfMemory {
+                code,
+                operation: "allocate IVC frame",
+            }),
+            AxVmError::from(HyperCallError::GuestMemoryAccess {
+                code,
+                operation: "write IVC result",
+                address: 0x4000,
+                detail: "unmapped".to_string(),
+            }),
+            AxVmError::from(HyperCallError::Unsupported {
+                code,
+                detail: "disabled".to_string(),
+            }),
+            AxVmError::from(HyperCallError::Internal {
+                code,
+                operation: "map IVC frame",
+                detail: "mapping failed".to_string(),
+            }),
+        ];
+
+        assert!(matches!(invalid_code, AxVmError::InvalidInput { .. }));
+        assert!(invalid_code.to_string().contains("0xff"));
+        assert!(matches!(cases[0], AxVmError::InvalidInput { .. }));
+        assert!(matches!(cases[1], AxVmError::InvalidState { .. }));
+        assert!(matches!(cases[2], AxVmError::ResourceUnavailable { .. }));
+        assert!(matches!(cases[3], AxVmError::ResourceConflict { .. }));
+        assert!(matches!(cases[4], AxVmError::OutOfMemory { .. }));
+        assert!(matches!(cases[5], AxVmError::Memory { .. }));
+        assert!(matches!(cases[6], AxVmError::Unsupported { .. }));
+        assert!(matches!(cases[7], AxVmError::Host { .. }));
     }
 }

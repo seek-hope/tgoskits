@@ -21,6 +21,9 @@ pub type AddrSpaceResult<T = ()> = Result<T, AddrSpaceError>;
 /// Failures reported while managing or accessing a guest address space.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AddrSpaceError {
+    /// Copying an allocation mapping would lose its frame ownership.
+    #[error("translation snapshot requires explicitly leased backing")]
+    UnleasedBacking,
     /// A guest address range lies outside the configured address space.
     #[error(
         "guest address range [{start:#x}, +{size:#x}) is outside [{space_start:#x}, \
@@ -63,6 +66,10 @@ pub enum AddrSpaceError {
     /// The mapping layer is not in a state that permits the operation.
     #[error("guest address mapping state does not permit the operation")]
     MappingState,
+    /// A partially applied mapping could not be proven restored and must be
+    /// quarantined until the nested page-table owner repairs it.
+    #[error("guest address mapping requires repair before reuse")]
+    NeedsRepair,
     /// A guest address cannot be translated.
     #[error("guest address {address:#x} is not mapped")]
     Unmapped {
@@ -92,6 +99,7 @@ impl From<MappingError> for AddrSpaceError {
             MappingError::InvalidParam => Self::InvalidMapping,
             MappingError::AlreadyExists => Self::MappingConflict,
             MappingError::BadState => Self::MappingState,
+            MappingError::NeedsRepair => Self::NeedsRepair,
         }
     }
 }

@@ -15,12 +15,14 @@
 #[cfg(feature = "pinctrl")]
 mod fixed_regulator;
 #[cfg(feature = "rockchip-soc")]
-mod rockchip;
-#[cfg(feature = "rockchip-dwmmc")]
+pub(crate) mod rockchip;
+#[cfg(any(feature = "rk3588-cpufreq", feature = "rockchip-dwmmc"))]
 pub mod scmi;
 #[cfg(feature = "starfive-soc")]
 mod starfive;
 
+#[cfg(feature = "rk3588-cpufreq-thermal-test")]
+pub use rockchip::cpufreq::set_test_cpu_temperature_mc;
 #[cfg(feature = "rockchip-soc")]
 pub use rockchip::{RockchipFdtPinctrlParser, RockchipPinCtrl};
 
@@ -48,3 +50,6 @@ impl RockchipPinCtrl {
         )))
     }
 }
+
+#[cfg(feature = "pwm")]
+mod cv181x_clock;

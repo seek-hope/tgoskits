@@ -1,6 +1,7 @@
+use ax_sync::RawSpinLock;
+
 use crate::{
     X86AccessWidth, X86GuestPhysAddr, X86GuestPhysAddrRange, X86VlapicError, X86VlapicResult,
-    lock::SpinMutex as Mutex,
 };
 
 const IOAPIC_BASE: usize = 0xfec0_0000;
@@ -24,18 +25,24 @@ const REDIRECTION_ENTRY_REMOTE_IRR: u64 = 1 << 14;
 const REDIRECTION_ENTRY_DELIVERY_MODE_MASK: u64 = 0b111 << 8;
 
 #[derive(Debug)]
-struct IoApicState {
+/// Mutable IO APIC model owned by the interrupt-controller task.
+///
+/// All redirection, remote-IRR and level bookkeeping is updated through
+/// `&mut self` so a source event and its EOI completion cannot interleave.
+pub struct IoApicCore {
     selector: u32,
     redirection_table: [u64; REDIRECTION_ENTRY_COUNT],
     pending_level: [bool; REDIRECTION_ENTRY_COUNT],
+    input_level: [bool; REDIRECTION_ENTRY_COUNT],
 }
 
-impl IoApicState {
+impl IoApicCore {
     const fn new() -> Self {
         Self {
             selector: 0,
             redirection_table: [REDIRECTION_ENTRY_MASKED; REDIRECTION_ENTRY_COUNT],
             pending_level: [false; REDIRECTION_ENTRY_COUNT],
+            input_level: [false; REDIRECTION_ENTRY_COUNT],
         }
     }
 
@@ -70,31 +77,37 @@ impl IoApicState {
         })
     }
 
-    fn end_of_interrupt(&mut self, vector: u8) -> Option<IoApicEoi> {
-        for gsi in 0..REDIRECTION_ENTRY_COUNT {
-            let matched = {
-                let entry = &mut self.redirection_table[gsi];
-                if (*entry & 0xff) as u8 != vector
-                    || *entry & REDIRECTION_ENTRY_TRIGGER_MODE == 0
-                    || *entry & REDIRECTION_ENTRY_REMOTE_IRR == 0
-                {
-                    false
-                } else {
-                    *entry &= !REDIRECTION_ENTRY_REMOTE_IRR;
-                    true
-                }
-            };
-            if !matched {
-                continue;
-            }
-
-            let pending = core::mem::take(&mut self.pending_level[gsi])
-                .then(|| self.interrupt_for_entry(gsi))
-                .flatten();
-            return Some(IoApicEoi { gsi, pending });
+    fn complete_gsi(&mut self, gsi: usize) -> Option<IoApicEoi> {
+        let entry = self.redirection_table.get_mut(gsi)?;
+        if *entry & REDIRECTION_ENTRY_TRIGGER_MODE == 0
+            || *entry & REDIRECTION_ENTRY_REMOTE_IRR == 0
+        {
+            return None;
         }
+        // Use the source identity captured at delivery time. The guest may
+        // have masked or reprogrammed the entry before the EOI exit reaches
+        // the controller owner, but the old remote-IRR bit still belongs to
+        // this GSI and must be retired.
+        *entry &= !REDIRECTION_ENTRY_REMOTE_IRR;
+        let pending = (self.input_level[gsi] || core::mem::take(&mut self.pending_level[gsi]))
+            .then(|| self.interrupt_for_entry(gsi))
+            .flatten();
+        Some(IoApicEoi { gsi, pending })
+    }
 
-        None
+    fn end_of_interrupt(&mut self, vector: u8) -> Option<IoApicEoi> {
+        (0..REDIRECTION_ENTRY_COUNT)
+            .find(|&gsi| {
+                let entry = self.redirection_table[gsi];
+                (entry & 0xff) as u8 == vector
+                    && entry & REDIRECTION_ENTRY_TRIGGER_MODE != 0
+                    && entry & REDIRECTION_ENTRY_REMOTE_IRR != 0
+            })
+            .and_then(|gsi| self.complete_gsi(gsi))
+    }
+
+    fn end_of_interrupt_for_gsi(&mut self, gsi: usize) -> Option<IoApicEoi> {
+        self.complete_gsi(gsi)
     }
 }
 
@@ -120,7 +133,7 @@ pub struct IoApicEoi {
 pub struct EmulatedIoApic {
     base: X86GuestPhysAddr,
     size: usize,
-    state: Mutex<IoApicState>,
+    state: RawSpinLock<IoApicCore>,
 }
 
 impl EmulatedIoApic {
@@ -129,7 +142,7 @@ impl EmulatedIoApic {
         Self {
             base,
             size: size.unwrap_or(IOAPIC_SIZE),
-            state: Mutex::new(IoApicState::new()),
+            state: RawSpinLock::new(IoApicCore::new()),
         }
     }
 
@@ -140,7 +153,7 @@ impl EmulatedIoApic {
 
     /// Return the guest interrupt vector programmed for a GSI.
     pub fn vector_for_gsi(&self, gsi: usize) -> Option<u8> {
-        let state = self.state.lock();
+        let state = self.state.lock_irqsave();
         let entry = *state.redirection_table.get(gsi)?;
         if entry & REDIRECTION_ENTRY_MASKED != 0 {
             return None;
@@ -161,21 +174,49 @@ impl EmulatedIoApic {
 
     /// Assert an IO APIC input line and return the interrupt to inject.
     pub fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt> {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
+        state.interrupt_for_entry(gsi)
+    }
+
+    /// Updates one IO APIC input line and returns a newly routable interrupt.
+    ///
+    /// Level-triggered inputs remain asserted across guest EOI. Deasserting a
+    /// line before EOI cancels any deferred redelivery.
+    pub fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        let mut state = self.state.lock_irqsave();
+        let input = state.input_level.get_mut(gsi)?;
+        let was_asserted = core::mem::replace(input, asserted);
+        if !asserted {
+            state.pending_level[gsi] = false;
+            return None;
+        }
+        if was_asserted {
+            if state.redirection_table[gsi] & REDIRECTION_ENTRY_REMOTE_IRR != 0 {
+                state.pending_level[gsi] = true;
+                return None;
+            }
+            return state.interrupt_for_entry(gsi);
+        }
         state.interrupt_for_entry(gsi)
     }
 
     /// Process an EOI broadcast from the local APIC.
     pub fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         state.end_of_interrupt(vector)
+    }
+
+    /// Completes a guest EOI for a source GSI retained by the delivery token.
+    pub fn end_of_interrupt_for_gsi(&self, gsi: usize) -> Option<IoApicEoi> {
+        let mut state = self.state.lock_irqsave();
+        state.end_of_interrupt_for_gsi(gsi)
     }
 
     fn offset(&self, addr: X86GuestPhysAddr) -> usize {
         addr.as_usize() - self.base.as_usize()
     }
 
-    fn read_selected_register(state: &IoApicState) -> X86VlapicResult<u32> {
+    fn read_selected_register(state: &IoApicCore) -> X86VlapicResult<u32> {
         match state.selector {
             IOAPIC_ID => Ok(IOAPIC_ID_VALUE),
             IOAPIC_VER => Ok(IOAPIC_VERSION_VALUE),
@@ -199,7 +240,7 @@ impl EmulatedIoApic {
         }
     }
 
-    fn write_selected_register(state: &mut IoApicState, value: u32) -> X86VlapicResult {
+    fn write_selected_register(state: &mut IoApicCore, value: u32) -> X86VlapicResult {
         match state.selector {
             IOAPIC_ID | IOAPIC_VER | IOAPIC_ARB => Ok(()),
             reg @ IOREDTBL_BASE..=0x3f => {
@@ -234,52 +275,6 @@ impl EmulatedIoApic {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_iowin(state: &mut IoApicState, value: u32) {
-        EmulatedIoApic::write_selected_register(state, value).unwrap();
-    }
-
-    fn select(state: &mut IoApicState, reg: u32) {
-        state.selector = reg;
-    }
-
-    fn program_level_gsi(state: &mut IoApicState, gsi: usize, vector: u8) {
-        select(state, IOREDTBL_BASE + (gsi as u32) * 2);
-        write_iowin(state, REDIRECTION_ENTRY_TRIGGER_MODE as u32 | vector as u32);
-        select(state, IOREDTBL_BASE + (gsi as u32) * 2 + 1);
-        write_iowin(state, 0);
-    }
-
-    #[test]
-    fn eoi_reports_gsi_and_deferred_level_interrupt() {
-        let mut state = IoApicState::new();
-        program_level_gsi(&mut state, 18, 0x51);
-
-        assert_eq!(
-            state.interrupt_for_entry(18),
-            Some(IoApicInterrupt {
-                vector: 0x51,
-                level_triggered: true,
-            })
-        );
-        assert_eq!(state.interrupt_for_entry(18), None);
-
-        assert_eq!(
-            state.end_of_interrupt(0x51),
-            Some(IoApicEoi {
-                gsi: 18,
-                pending: Some(IoApicInterrupt {
-                    vector: 0x51,
-                    level_triggered: true,
-                }),
-            })
-        );
-    }
-}
-
 impl Default for EmulatedIoApic {
     fn default() -> Self {
         Self::new_default()
@@ -306,7 +301,7 @@ impl EmulatedIoApic {
         }
 
         let offset = self.offset(addr);
-        let state = self.state.lock();
+        let state = self.state.lock_irqsave();
         match offset {
             IOREGSEL => Ok(state.selector as usize),
             IOWIN => Ok(Self::read_selected_register(&state)? as usize),
@@ -329,7 +324,7 @@ impl EmulatedIoApic {
         }
 
         let offset = self.offset(addr);
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         match offset {
             IOREGSEL => {
                 state.selector = val as u32;
@@ -341,5 +336,107 @@ impl EmulatedIoApic {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_iowin(state: &mut IoApicCore, value: u32) {
+        EmulatedIoApic::write_selected_register(state, value).unwrap();
+    }
+
+    fn select(state: &mut IoApicCore, reg: u32) {
+        state.selector = reg;
+    }
+
+    fn program_level_gsi(state: &mut IoApicCore, gsi: usize, vector: u8) {
+        select(state, IOREDTBL_BASE + (gsi as u32) * 2);
+        write_iowin(state, REDIRECTION_ENTRY_TRIGGER_MODE as u32 | vector as u32);
+        select(state, IOREDTBL_BASE + (gsi as u32) * 2 + 1);
+        write_iowin(state, 0);
+    }
+
+    #[test]
+    fn eoi_reports_gsi_and_deferred_level_interrupt() {
+        let mut state = IoApicCore::new();
+        program_level_gsi(&mut state, 18, 0x51);
+
+        assert_eq!(
+            state.interrupt_for_entry(18),
+            Some(IoApicInterrupt {
+                vector: 0x51,
+                level_triggered: true,
+            })
+        );
+        assert_eq!(state.interrupt_for_entry(18), None);
+
+        assert_eq!(
+            state.end_of_interrupt(0x51),
+            Some(IoApicEoi {
+                gsi: 18,
+                pending: Some(IoApicInterrupt {
+                    vector: 0x51,
+                    level_triggered: true,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn asserted_level_is_redelivered_after_eoi_until_lowered() {
+        let ioapic = EmulatedIoApic::default();
+        {
+            let mut state = ioapic.state.lock_irqsave();
+            program_level_gsi(&mut state, 4, 0x34);
+        }
+
+        assert_eq!(
+            ioapic.set_gsi_level(4, true),
+            Some(IoApicInterrupt {
+                vector: 0x34,
+                level_triggered: true,
+            })
+        );
+        assert_eq!(
+            ioapic.end_of_interrupt(0x34).and_then(|eoi| eoi.pending),
+            Some(IoApicInterrupt {
+                vector: 0x34,
+                level_triggered: true,
+            })
+        );
+
+        ioapic.set_gsi_level(4, false);
+        assert_eq!(
+            ioapic.end_of_interrupt(0x34).and_then(|eoi| eoi.pending),
+            None
+        );
+    }
+
+    #[test]
+    fn source_eoi_survives_vector_reprogramming() {
+        let mut state = IoApicCore::new();
+        program_level_gsi(&mut state, 4, 0x34);
+        assert_eq!(
+            state.interrupt_for_entry(4),
+            Some(IoApicInterrupt {
+                vector: 0x34,
+                level_triggered: true,
+            })
+        );
+
+        // Model a guest rewrite racing with the deferred EOI path. The
+        // remote-IRR bit still belongs to GSI 4 even though its current vector
+        // no longer matches the vector observed at guest delivery.
+        state.redirection_table[4] = (state.redirection_table[4] & !0xff) | u64::from(0x35_u8);
+        assert_eq!(
+            state.end_of_interrupt_for_gsi(4),
+            Some(IoApicEoi {
+                gsi: 4,
+                pending: None,
+            })
+        );
+        assert_eq!(state.end_of_interrupt(0x34), None);
     }
 }

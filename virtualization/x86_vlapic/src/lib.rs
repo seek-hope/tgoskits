@@ -23,17 +23,19 @@ extern crate log;
 
 mod consts;
 pub mod host;
+#[cfg(test)]
+mod host_lock_provider;
+#[cfg(test)]
 mod lock;
 mod pit;
 mod regs;
-mod serial;
 mod timer;
+mod timer_registration;
 mod types;
 mod utils;
 mod vioapic;
 mod vlapic;
-
-use core::{cell::UnsafeCell, marker::PhantomData};
+mod vpic;
 
 use crate::{
     consts::{x2apic::x2apic_msr_access_reg, xapic::xapic_mmio_access_reg_offset},
@@ -48,50 +50,33 @@ static VIRTUAL_APIC_ACCESS_PAGE: APICAccessPage = APICAccessPage([0; X86_PAGE_SI
 
 /// A emulated local APIC device.
 pub struct EmulatedLocalApic<H: host::X86VlapicHostOps> {
-    vlapic_regs: UnsafeCell<VirtualApicRegs<H>>,
-    _host: PhantomData<fn() -> H>,
+    /// The vLAPIC state is owned by exactly one vCPU task.
+    ///
+    /// Keeping the backend as a direct field makes that ownership visible in
+    /// the Rust API: operations that change guest state require `&mut self`,
+    /// so a caller cannot access the same vLAPIC concurrently through shared
+    /// references or an interior-mutable escape hatch.
+    vlapic_regs: VirtualApicRegs<H>,
 }
 
 pub use self::{
-    host::X86VlapicHostOps,
+    host::{X86VlapicHostOps, X86VlapicRuntimeOps},
     pit::EmulatedPit,
-    serial::EmulatedSerialPort,
     types::{
         X86AccessWidth, X86GuestPhysAddr, X86GuestPhysAddrRange, X86HostPhysAddr, X86HostVirtAddr,
-        X86InterruptVector, X86MsrAddr, X86MsrAddrRange, X86Port, X86PortRange, X86TimerCallback,
-        X86VcpuId, X86VlapicError, X86VlapicResult, X86VmId,
+        X86InterruptVector, X86MsrAddr, X86MsrAddrRange, X86Port, X86PortRange, X86TimerAction,
+        X86TimerCallback, X86VcpuId, X86VlapicError, X86VlapicResult, X86VmId,
     },
     vioapic::{EmulatedIoApic, IoApicEoi, IoApicInterrupt},
+    vpic::{EmulatedPic, PicInterruptClaim},
 };
 
 impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
     /// Create a new `EmulatedLocalApic`.
-    pub fn new(vm_id: X86VmId, vcpu_id: X86VcpuId) -> Self {
+    pub fn new(runtime: H::Runtime, vm_id: X86VmId, vcpu_id: X86VcpuId) -> Self {
         EmulatedLocalApic {
-            vlapic_regs: UnsafeCell::new(VirtualApicRegs::new(vm_id, vcpu_id)),
-            _host: PhantomData,
+            vlapic_regs: VirtualApicRegs::new(runtime, vm_id, vcpu_id),
         }
-    }
-
-    fn get_vlapic_regs(&self) -> &VirtualApicRegs<H> {
-        unsafe { &*self.vlapic_regs.get() }
-    }
-
-    /// Returns mutable access to the virtual APIC register state.
-    ///
-    /// # Safety
-    ///
-    /// `vlapic_regs` is stored in an [`UnsafeCell`] because the vLAPIC MMIO/MSR
-    /// handlers are exposed through shared device references. Callers must
-    /// guarantee that no two execution contexts call this method, or otherwise
-    /// mutate/read the same [`VirtualApicRegs`], concurrently. In the current
-    /// Axvisor x86 path each `EmulatedLocalApic` is owned by one vCPU and vLAPIC
-    /// register accesses are handled synchronously on that vCPU's run path; any
-    /// cross-vCPU interrupt requests are funneled through the vCPU task instead
-    /// of directly mutating another vCPU's local APIC registers.
-    #[allow(clippy::mut_from_ref)]
-    fn get_mut_vlapic_regs(&self) -> &mut VirtualApicRegs<H> {
-        unsafe { &mut *self.vlapic_regs.get() }
     }
 }
 
@@ -112,28 +97,58 @@ impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
     /// The processor uses the virtual-APIC page to virtualize certain accesses to APIC registers and to manage virtual interrupts;
     /// see Chapter 30.
     pub fn virtual_apic_page_addr(&self) -> X86HostPhysAddr {
-        self.get_vlapic_regs().virtual_apic_page_addr()
+        self.vlapic_regs.virtual_apic_page_addr()
     }
 
     /// Returns the current IA32_APIC_BASE MSR value.
     pub fn apic_base(&self) -> u64 {
-        self.get_vlapic_regs().apic_base()
+        self.vlapic_regs.apic_base()
     }
 
     /// Sets the IA32_APIC_BASE MSR value.
-    pub fn set_apic_base(&self, value: u64) -> X86VlapicResult {
-        self.get_mut_vlapic_regs().set_apic_base(value)
+    pub fn set_apic_base(&mut self, value: u64) -> X86VlapicResult {
+        self.vlapic_regs.set_apic_base(value)
     }
 
     /// Record that the local APIC accepted an interrupt.
-    pub fn accept_interrupt(&self, vector: u8, level_triggered: bool) {
-        self.get_mut_vlapic_regs()
-            .accept_interrupt(vector, level_triggered);
+    pub fn accept_interrupt(&mut self, vector: u8, level_triggered: bool) {
+        self.vlapic_regs.accept_interrupt(vector, level_triggered);
+    }
+
+    /// Returns whether the local APIC priority permits accepting `vector`.
+    pub fn can_accept_interrupt(&self, vector: u8) -> bool {
+        self.vlapic_regs.can_accept_interrupt(vector)
+    }
+
+    /// Returns whether the local APIC timer has an edge awaiting vCPU entry.
+    pub fn has_pending_timer_interrupt(&self) -> bool {
+        self.vlapic_regs.has_pending_timer_interrupt()
+    }
+
+    /// Coalesces expired local APIC timer periods into one pending vector.
+    pub fn take_pending_timer_interrupt(&mut self) -> Option<u8> {
+        self.vlapic_regs.take_pending_timer_interrupt()
+    }
+
+    /// Quiesces the local APIC timer for a task-side VM suspend while retaining
+    /// the guest registers, canonical deadline and pending edge.
+    pub fn suspend_timer(&mut self) -> X86VlapicResult {
+        self.vlapic_regs.suspend_timer()
+    }
+
+    /// Reinstalls the local APIC timer quiesced by [`Self::suspend_timer`].
+    pub fn resume_timer(&mut self) -> X86VlapicResult {
+        self.vlapic_regs.resume_timer()
+    }
+
+    /// Cancels the local APIC timer and retires its guest-visible state.
+    pub fn stop_timer(&mut self) -> X86VlapicResult {
+        self.vlapic_regs.stop_timer()
     }
 
     /// Process a guest EOI and return the vector that needs an IO APIC EOI broadcast.
-    pub fn handle_eoi(&self) -> Option<u8> {
-        self.get_mut_vlapic_regs().handle_eoi()
+    pub fn handle_eoi(&mut self) -> Option<u8> {
+        self.vlapic_regs.handle_eoi()
     }
 
     /// Returns the xAPIC MMIO range.
@@ -153,12 +168,12 @@ impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
     ) -> X86VlapicResult<usize> {
         debug!("EmulatedLocalApic::handle_mmio_read: addr={addr:?}, width={width:?}");
         let reg_off = xapic_mmio_access_reg_offset(addr);
-        self.get_vlapic_regs().handle_read(reg_off, width)
+        self.vlapic_regs.handle_read(reg_off, width)
     }
 
     /// Handles an xAPIC MMIO write.
     pub fn handle_mmio_write(
-        &self,
+        &mut self,
         addr: X86GuestPhysAddr,
         width: X86AccessWidth,
         val: usize,
@@ -167,7 +182,7 @@ impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
             "EmulatedLocalApic::handle_mmio_write: addr={addr:?}, width={width:?}, val={val:#x}"
         );
         let reg_off = xapic_mmio_access_reg_offset(addr);
-        self.get_mut_vlapic_regs().handle_write(reg_off, val, width)
+        self.vlapic_regs.handle_write(reg_off, val, width)
     }
 
     /// Returns the x2APIC MSR range.
@@ -187,18 +202,18 @@ impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
     ) -> X86VlapicResult<usize> {
         debug!("EmulatedLocalApic::handle_msr_read: addr={addr:?}, width={width:?}");
         let reg_off = x2apic_msr_access_reg(addr);
-        self.get_vlapic_regs().handle_read(reg_off, width)
+        self.vlapic_regs.handle_read(reg_off, width)
     }
 
     /// Handles an x2APIC MSR write.
     pub fn handle_msr_write(
-        &self,
+        &mut self,
         addr: X86MsrAddr,
         width: X86AccessWidth,
         val: usize,
     ) -> X86VlapicResult {
         debug!("EmulatedLocalApic::handle_msr_write: addr={addr:?}, width={width:?}, val={val:#x}");
         let reg_off = x2apic_msr_access_reg(addr);
-        self.get_mut_vlapic_regs().handle_write(reg_off, val, width)
+        self.vlapic_regs.handle_write(reg_off, val, width)
     }
 }

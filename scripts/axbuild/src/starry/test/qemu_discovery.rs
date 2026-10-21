@@ -48,6 +48,7 @@ pub(crate) fn discover_qemu_cases(
             target,
             Some(direct_case),
             None,
+            None,
         );
     }
 
@@ -57,6 +58,7 @@ pub(crate) fn discover_qemu_cases(
         target,
         selection.parent_case.as_deref(),
         selection.grouped_subcase_filter,
+        selection.ltp_case_id.as_deref(),
     )
 }
 
@@ -66,8 +68,9 @@ fn load_qemu_cases_for_selection(
     target: &str,
     selected_case: Option<&str>,
     grouped_subcase_filter: Option<BTreeSet<String>>,
+    ltp_case_id: Option<&str>,
 ) -> anyhow::Result<Vec<StarryQemuCase>> {
-    qemu_test::discover_qemu_cases(
+    let cases = qemu_test::discover_qemu_cases(
         test_suite_dir,
         arch,
         target,
@@ -76,8 +79,13 @@ fn load_qemu_cases_for_selection(
         "qemu",
     )?
     .into_iter()
-    .map(|case| load_qemu_case(case, grouped_subcase_filter.clone()))
-    .collect()
+    .map(|case| load_qemu_case(case, arch, grouped_subcase_filter.clone(), ltp_case_id))
+    .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut expanded = Vec::new();
+    for case in cases {
+        expanded.extend(super::qemu_profiles::expand(case)?);
+    }
+    Ok(expanded)
 }
 
 pub(crate) fn direct_starry_qemu_case_exists(
@@ -99,6 +107,7 @@ pub(crate) struct StarryQemuCaseSelection {
     pub(crate) parent_case: Option<String>,
     pub(crate) grouped_subcase_filter: Option<BTreeSet<String>>,
     pub(crate) prefer_direct_case: Option<String>,
+    pub(crate) ltp_case_id: Option<String>,
 }
 
 pub(crate) fn parse_starry_qemu_case_selection(
@@ -109,10 +118,19 @@ pub(crate) fn parse_starry_qemu_case_selection(
             parent_case: None,
             grouped_subcase_filter: None,
             prefer_direct_case: None,
+            ltp_case_id: None,
         };
     };
 
     let parts = selected_case.split('/').collect::<Vec<_>>();
+    if let ["qemu", "system", "ltp-syscalls", ltp_case_id] = parts.as_slice() {
+        return StarryQemuCaseSelection {
+            parent_case: Some("qemu/system".to_string()),
+            grouped_subcase_filter: Some(BTreeSet::from(["ltp-syscalls".to_string()])),
+            prefer_direct_case: None,
+            ltp_case_id: Some((*ltp_case_id).to_string()),
+        };
+    }
     let mapped = match parts.as_slice() {
         [group, subcase]
             if is_starry_qemu_system_group(group)
@@ -136,6 +154,7 @@ pub(crate) fn parse_starry_qemu_case_selection(
             parent_case: Some(parent_case),
             grouped_subcase_filter: Some(BTreeSet::from([subcase.to_string()])),
             prefer_direct_case,
+            ltp_case_id: None,
         };
     }
 
@@ -143,6 +162,7 @@ pub(crate) fn parse_starry_qemu_case_selection(
         parent_case: Some(selected_case.to_string()),
         grouped_subcase_filter: None,
         prefer_direct_case: None,
+        ltp_case_id: None,
     }
 }
 
@@ -152,7 +172,9 @@ fn is_starry_qemu_system_group(group: &str) -> bool {
 
 fn load_qemu_case(
     case: qemu_test::DiscoveredQemuCase,
+    arch: &str,
     grouped_subcase_filter: Option<BTreeSet<String>>,
+    ltp_case_id: Option<&str>,
 ) -> anyhow::Result<StarryQemuCase> {
     let build_group = case.build_group;
     let build_config_path = case.build_config_path;
@@ -168,11 +190,48 @@ fn load_qemu_case(
         test_case.grouped_subcase_filter =
             Some(resolve_grouped_subcase_filter(&test_case, filter)?);
     }
+    if let Some(ltp_case_id) = ltp_case_id {
+        validate_ltp_case_id(&test_case, arch, ltp_case_id)?;
+        test_case.ltp_case_id = Some(ltp_case_id.to_string());
+    }
     Ok(StarryQemuCase {
         case: test_case,
         build_group,
         build_config_path,
     })
+}
+
+fn validate_ltp_case_id(case: &TestQemuCase, arch: &str, ltp_case_id: &str) -> anyhow::Result<()> {
+    if ltp_case_id.is_empty()
+        || !ltp_case_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid LTP testcase id `{ltp_case_id}`; expected letters, digits or underscores");
+    }
+
+    let ltp_dir = case.case_dir.join("ltp-syscalls");
+    let common = ltp_dir.join("cases.txt");
+    let arch_cases = ltp_dir.join(format!("cases-{arch}.txt"));
+    for manifest in [&common, &arch_cases] {
+        if !manifest.is_file() {
+            if manifest == &common {
+                bail!("missing LTP testcase manifest {}", manifest.display());
+            }
+            continue;
+        }
+        let contents = fs::read_to_string(manifest).with_context(|| {
+            format!(
+                "failed to read LTP testcase manifest {}",
+                manifest.display()
+            )
+        })?;
+        if contents.lines().any(|name| name == ltp_case_id) {
+            return Ok(());
+        }
+    }
+
+    bail!("unknown LTP testcase `{ltp_case_id}` for Starry qemu architecture `{arch}`")
 }
 
 fn resolve_grouped_subcase_filter(

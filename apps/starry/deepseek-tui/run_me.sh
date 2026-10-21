@@ -15,7 +15,7 @@ Options:
   --rootfs              Prepare legacy standalone rootfs (builds assets if needed)
   --smoke               Run offline smoke test through starry app qemu
   --test                Run online C prime test through starry app qemu
-  --shell               Boot interactive QEMU shell
+  --shell               Run offline CLI smoke checks (legacy option name)
   --api-key KEY         DeepSeek API key (for online rootfs/test)
   --proxy URL           Proxy URL (for online rootfs/test)
   -h, --help            Show this help
@@ -41,7 +41,7 @@ rootfs_offline() {
 rootfs_online() {
     echo "=== Prepare online rootfs ==="
     local args=()
-    args+=(--output-rootfs "tmp/axbuild/rootfs/rootfs-x86_64-deepseek-online.img")
+    args+=(--output-rootfs "target/axbuild/rootfs/rootfs-x86_64-deepseek-online.img")
     if [[ -n "$api_key" ]]; then
         args+=(--api-key "$api_key")
     fi
@@ -86,7 +86,7 @@ shell() {
     if [[ -n "$proxy" ]]; then
         env_args+=("DEEPSEEK_ONLINE_PROXY=$proxy")
     fi
-    echo "=== Interactive QEMU shell ==="
+    echo "=== Offline CLI smoke checks ==="
     run_app_qemu apps/starry/deepseek-tui/qemu-x86_64-shell.toml "${env_args[@]}"
 }
 

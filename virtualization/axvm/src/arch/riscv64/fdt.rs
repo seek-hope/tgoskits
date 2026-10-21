@@ -1,28 +1,26 @@
-//! RISC-V compatibility facade and target-specific guest FDT policy.
+//! RISC-V-specific guest device-tree policy.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
-use crate::{
-    AxVmResult,
-    boot::{BootImageProvider, fdt::GuestDtbImage},
-    config::AxVMConfig,
-};
-
-#[path = "../../boot/fdt/core/mod.rs"]
-pub(crate) mod core;
-
-pub use core::{
-    parse_passthrough_devices_address, parse_reserved_memory_regions, parse_vm_interrupt,
-    reserve_excluded_device_ranges, set_phys_cpu_sets, setup_guest_fdt_from_vmm, try_get_host_fdt,
-    update_fdt, update_provided_fdt,
-};
+use crate::{AxVmResult, boot::fdt::core};
 
 pub(crate) fn guest_fdt_policy() -> core::GuestFdtPolicy {
     core::GuestFdtPolicy {
         patch_runtime: super::capabilities::patch_runtime_fdt,
         patch_provided: super::capabilities::patch_provided_fdt,
         decode_interrupt: super::capabilities::decode_plic_source,
+        resolve_cpu_index: super::capabilities::resolve_cpu_index,
+        host_cpu_count: super::capabilities::host_cpu_count,
+        guest_cpu_execution_property,
     }
+}
+
+fn guest_cpu_execution_property(name: &str) -> bool {
+    core::tree::is_guest_cpu_execution_property(name)
+        || matches!(
+            name,
+            "riscv,isa" | "riscv,isa-base" | "riscv,isa-extensions" | "mmu-type"
+        )
 }
 
 pub(crate) fn host_fdt_bootarg() -> usize {
@@ -49,12 +47,4 @@ pub(super) fn ensure_chosen_from_host(
     };
     guest.copy_subtree_from(host_fdt, host_chosen, guest.inner().root_id(), false)?;
     Ok(guest.finish())
-}
-
-pub fn handle_fdt_operations(
-    vm_config: &mut AxVMConfig,
-    vm_create_config: &mut axvmconfig::AxVMCrateConfig,
-    provider: &dyn BootImageProvider,
-) -> AxVmResult<Option<GuestDtbImage>> {
-    core::prepare_dtb_guest(vm_config, vm_create_config, provider)
 }

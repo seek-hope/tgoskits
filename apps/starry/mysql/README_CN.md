@@ -18,7 +18,7 @@ MySQL rootfs 准备流程必须以 `root` 身份运行，或者由具备 passwor
 cargo xtask starry app qemu -t mysql --arch x86_64
 ```
 
-生成后的镜像会缓存在 `tmp/axbuild/rootfs/rootfs-x86_64-mysql.img`，下载内容会缓存在
+生成后的镜像会缓存在 `target/axbuild/rootfs/rootfs-x86_64-mysql.img`，下载内容会缓存在
 `target/mysql`，但当前 `prebuild.sh` 在检查、扩容、挂载和刷新镜像时仍然需要
 root 权限。
 
@@ -26,7 +26,7 @@ root 权限。
 
 `prebuild.sh` 在宿主机或容器中、QEMU 启动前执行：
 
-1. 使用 `wget --no-check-certificate` 准备 `tmp/axbuild/rootfs/rootfs-x86_64-debian.img.tar.xz`。
+1. 使用 `wget --no-check-certificate` 准备 `target/axbuild/rootfs/rootfs-x86_64-debian.img.tar.xz`。
 2. 从 Debian rootfs 压缩包解出 MySQL 专用 rootfs。
 3. 将专用镜像扩容到 `5G`。
 4. 使用 `wget --no-check-certificate` 下载 MySQL 8.4.6；如果已有 `MYSQL_TARBALL` 或 `mysql.tar.xz`，则直接复用。
@@ -38,25 +38,19 @@ root 权限。
 QEMU 使用生成后的 rootfs：
 
 ```text
-tmp/axbuild/rootfs/rootfs-x86_64-mysql.img
+target/axbuild/rootfs/rootfs-x86_64-mysql.img
 ```
 
-## 交互模式
+## 指定测试配置
 
-如果需要进入 MySQL 客户端手动执行 SQL，可以使用交互配置：
+`qemu-x86_64-interactive.toml` 保留原文件名，现与默认入口一样执行完整 MySQL SQL 测例，不再自动进入手动交互客户端：
 
 ```bash
 cargo xtask starry app qemu -t mysql --arch x86_64 \
   --qemu-config qemu-x86_64-interactive.toml
 ```
 
-进入 guest 后会自动运行：
-
-```sh
-/usr/bin/mysql-interactive.sh
-```
-
-这个脚本会在 `/opt/mysql/data` 尚未初始化时执行初始化，随后后台启动 `mysqld`，等待 socket 可连接，最后进入 MySQL 交互客户端。退出 MySQL 客户端使用 `exit`，退出 QEMU 使用 `Ctrl-a x`。
+该配置通过 `shell_check_steps` 执行 `/usr/bin/mysql-test.sh`，匹配 `MYSQL_TEST_PASSED` 后退出；遇到 `MYSQL_TEST_FAILED` 或内核错误则失败，整体超时为 2400 秒。
 
 ## Guest 测试流程
 

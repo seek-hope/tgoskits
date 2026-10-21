@@ -1,0 +1,645 @@
+//! Merge machine defaults and configured virtual devices into one graph.
+
+use super::*;
+
+/// The machine-derived request and its non-user-configurable fixed identity.
+#[derive(Clone, Debug)]
+pub struct DefaultVirtualDeviceIntent {
+    pub request: VirtualDeviceRequest,
+    pub fixed_resources: FixedDeviceBindings,
+    pub firmware_identity: Option<DeviceFirmwareBinding>,
+}
+
+pub(crate) fn append_configured_devices(
+    config: &crate::config::AxVMConfig,
+    nodes: &mut Vec<DeviceNodeSpec>,
+    default_controller_node: &DeviceNodeId,
+    default_controller: InterruptControllerId,
+    default_pci_host_key: Option<PciHostKey>,
+) -> AxVmResult {
+    let base_context = DeviceInstantiationContext::new()
+        .with_vm_id(config.id())
+        .with_default_wired_controller(default_controller_node.clone(), default_controller);
+    let base_context = default_pci_host_key.map_or(base_context.clone(), |host| {
+        base_context.clone().with_default_pci_host_key(host)
+    });
+    let default = default_serial_intent(config, default_controller)?;
+    let request = config
+        .virtual_device_requests()
+        .iter()
+        .find(|request| request.id == "console0")
+        .unwrap_or(&default.request);
+    if !crate::machine::is_serial_model(&request.model) {
+        return Err(AxVmError::invalid_config(
+            "console0 must use a registered virtual serial model",
+        ));
+    }
+    let compatible =
+        request.model == default.request.model && !request.options.contains_key("address");
+    let (fixed_resources, firmware_binding) = if compatible {
+        (
+            default.fixed_resources.clone(),
+            default.firmware_identity.clone().unwrap_or_default(),
+        )
+    } else {
+        (FixedDeviceBindings::default(), DeviceFirmwareBinding::None)
+    };
+    let context = base_context.clone().with_serial_defaults(
+        config.serial_profile(),
+        config.serial_backend_factory(),
+        fixed_resources,
+        firmware_binding,
+        true,
+    );
+    nodes.push(
+        config
+            .virtual_device_catalog()
+            .instantiate_node(request, &context)
+            .map_err(configured_error)?,
+    );
+
+    let mut host_console_owners = usize::from(serial_uses_host_console(request, true)?);
+    for request in config
+        .virtual_device_requests()
+        .iter()
+        .filter(|request| request.id != "console0")
+    {
+        let context = if crate::machine::is_serial_model(&request.model) {
+            if serial_uses_host_console(request, false)? {
+                host_console_owners += 1;
+            }
+            base_context.clone().with_serial_defaults(
+                crate::machine::default_serial_profile(&request.model),
+                config.serial_backend_factory(),
+                FixedDeviceBindings::default(),
+                DeviceFirmwareBinding::None,
+                false,
+            )
+        } else {
+            base_context.clone()
+        };
+        nodes.push(
+            config
+                .virtual_device_catalog()
+                .instantiate_node(request, &context)
+                .map_err(configured_error)?,
+        );
+    }
+    if host_console_owners > 1 {
+        return Err(AxVmError::invalid_config(
+            "only one virtual serial device may own the host console backend",
+        ));
+    }
+    Ok(())
+}
+
+fn default_serial_intent(
+    config: &crate::config::AxVMConfig,
+    default_controller: InterruptControllerId,
+) -> AxVmResult<DefaultVirtualDeviceIntent> {
+    let profile = config.serial_profile();
+    let registers = ResourceSlot::new("registers")?;
+    let irq = ResourceSlot::new("irq")?;
+    let fixed_resources = match profile.transport {
+        crate::machine::GuestSerialTransport::Port { base, length } => {
+            FixedDeviceBindings::default().with_pio(registers, base, length)
+        }
+        crate::machine::GuestSerialTransport::Mmio { base, length, .. } => {
+            FixedDeviceBindings::default().with_mmio(registers, base as u64, length as u64)
+        }
+    }
+    .with_wired(
+        irq,
+        FixedWiredBinding {
+            controller: default_controller,
+            input: ControllerInputId::new(profile.irq),
+            trigger: InterruptTrigger::LevelTriggered,
+            sharing: InterruptSharing::Exclusive,
+        },
+    );
+    Ok(DefaultVirtualDeviceIntent {
+        request: VirtualDeviceRequest {
+            id: "console0".into(),
+            model: crate::machine::serial_model_name(profile).into(),
+            options: Default::default(),
+        },
+        fixed_resources,
+        firmware_identity: config
+            .serial_firmware_identity()
+            .map(GuestSerialFirmwareIdentity::binding),
+    })
+}
+
+fn serial_uses_host_console(request: &VirtualDeviceRequest, default: bool) -> AxVmResult<bool> {
+    if !crate::machine::is_serial_model(&request.model) {
+        return Ok(false);
+    }
+    let Some(backend) = request.options.get("backend") else {
+        return Ok(default);
+    };
+    let backend = backend.as_table().ok_or_else(|| {
+        AxVmError::invalid_config(std::format!(
+            "virtual serial '{}' backend must be a table",
+            request.id
+        ))
+    })?;
+    let backend_type = backend
+        .get("type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            AxVmError::invalid_config(std::format!(
+                "virtual serial '{}' backend requires string field 'type'",
+                request.id
+            ))
+        })?;
+    Ok(backend_type == "host-console")
+}
+
+fn configured_error(error: ConfiguredDeviceError) -> AxVmError {
+    AxVmError::invalid_config(std::format!("{error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, vec};
+
+    use axdevice_base::{IrqResult, VirtualInterruptController, WiredIrqInput, WiredIrqSink};
+
+    use super::*;
+    use crate::config::{AxVMConfig, AxVMConfigParams, PhysCpuList};
+
+    struct TestInterruptController;
+    struct TestInterruptSink;
+
+    impl WiredIrqSink for TestInterruptSink {
+        fn set_level(&self, _input: ControllerInputId, _asserted: bool) -> IrqResult {
+            Ok(())
+        }
+
+        fn pulse(&self, _input: ControllerInputId) -> IrqResult {
+            Ok(())
+        }
+    }
+
+    impl VirtualInterruptController for TestInterruptController {
+        fn id(&self) -> InterruptControllerId {
+            InterruptControllerId::new(0)
+        }
+
+        fn wired_input(
+            &self,
+            input: ControllerInputId,
+            trigger: InterruptTrigger,
+        ) -> IrqResult<WiredIrqInput> {
+            Ok(WiredIrqInput::new(
+                self.id(),
+                input,
+                trigger,
+                Arc::new(TestInterruptSink),
+            ))
+        }
+    }
+
+    struct TestInterruptControllerModel;
+
+    impl DeviceModel for TestInterruptControllerModel {
+        fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
+            Ok(DeviceRequirements::new())
+        }
+
+        fn firmware(&self) -> DeviceFirmwareSpec {
+            DeviceFirmwareSpec::None
+        }
+
+        fn build(
+            &self,
+            _context: &mut DeviceBuildContext<'_>,
+        ) -> DeviceManagerResult<DeviceBundle> {
+            let controller: Arc<dyn VirtualInterruptController> = Arc::new(TestInterruptController);
+            Ok(DeviceBundle::from_registration(
+                DeviceRegistration::InterruptController(ControllerRegistration::new(
+                    InterruptControllerId::new(0),
+                    controller,
+                )),
+            ))
+        }
+    }
+
+    fn test_interrupt_controller_node(id: DeviceNodeId) -> DeviceNodeSpec {
+        DeviceNodeSpec::virtual_device(id, Arc::new(TestInterruptControllerModel))
+    }
+
+    fn registered_catalog() -> Arc<ConfiguredDeviceCatalog> {
+        let mut catalog = ConfiguredDeviceCatalog::new();
+        crate::machine::register_devices(&mut catalog).unwrap();
+        Arc::new(catalog)
+    }
+
+    #[test]
+    fn console_override_and_extra_serial_share_deterministic_planning() {
+        let config = AxVMConfig::new(AxVMConfigParams {
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            virtual_device_catalog: registered_catalog(),
+            virtual_device_requests: vec![
+                VirtualDeviceRequest {
+                    id: "serial1".into(),
+                    model: "uart16550-mmio".into(),
+                    options: Default::default(),
+                },
+                VirtualDeviceRequest {
+                    id: "console0".into(),
+                    model: "pl011-mmio".into(),
+                    options: [("address".into(), toml::Value::Integer(0x1000_2000))]
+                        .into_iter()
+                        .collect(),
+                },
+            ],
+            ..Default::default()
+        });
+        let controller = DeviceNodeId::new("controller").unwrap();
+        let mut nodes = vec![DeviceNodeSpec::firmware_only(controller.clone())];
+        append_configured_devices(
+            &config,
+            &mut nodes,
+            &controller,
+            InterruptControllerId::new(0),
+            None,
+        )
+        .unwrap();
+
+        let mut graph = DeviceGraphBuilder::new();
+        for node in nodes {
+            graph.add(node).unwrap();
+        }
+        let mut pools = ResourcePools::new();
+        pools.add_auto_mmio(0x1000_0000..0x1001_0000).unwrap();
+        pools.allow_fixed_mmio(0x1000_0000..0x1001_0000).unwrap();
+        pools
+            .add_auto_controller_inputs(
+                InterruptControllerId::new(0),
+                ControllerInputId::new(16)..ControllerInputId::new(32),
+            )
+            .unwrap();
+        let graph = graph.declare().unwrap().resolve(pools).unwrap();
+        let registers = ResourceSlot::new("registers").unwrap();
+        let irq = ResourceSlot::new("irq").unwrap();
+
+        let console = graph
+            .resources_for(&DeviceNodeId::new("console0").unwrap())
+            .unwrap();
+        assert_eq!(console.mmio(&registers).unwrap(), (0x1000_2000, 0x1000));
+        assert_eq!(console.wired_irq(&irq).unwrap().input().value(), 16);
+
+        let serial = graph
+            .resources_for(&DeviceNodeId::new("serial1").unwrap())
+            .unwrap();
+        assert_eq!(serial.mmio(&registers).unwrap(), (0x1000_0000, 0x100));
+        assert_eq!(serial.wired_irq(&irq).unwrap().input().value(), 17);
+    }
+
+    #[test]
+    fn configured_emulated_devices_never_share_a_guest_page() {
+        // Board regression: a VM publishing a virtio-blk disk together with a
+        // virtio-net NIC failed device preparation with `emulated device range
+        // [...] conflicts with emulated device range [...]`, because both
+        // 0x200-byte windows were packed into one 4 KiB guest page. The layout
+        // owns an emulated device by page, so the two windows must be planned
+        // onto distinct pages.
+        let config = AxVMConfig::new(AxVMConfigParams {
+            id: 1,
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            virtual_device_catalog: registered_catalog(),
+            virtual_device_requests: vec![
+                // The console publishes an explicit page-aligned address, as the
+                // board guest configuration does.
+                VirtualDeviceRequest {
+                    id: "console0".into(),
+                    model: "pl011-mmio".into(),
+                    options: [("address".into(), toml::Value::Integer(0x0900_0000))]
+                        .into_iter()
+                        .collect(),
+                },
+                VirtualDeviceRequest {
+                    id: "disk0".into(),
+                    model: "virtio-blk".into(),
+                    options: [
+                        ("backend".into(), toml::Value::String("ramdisk".into())),
+                        ("capacity".into(), toml::Value::String("1MiB".into())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                VirtualDeviceRequest {
+                    id: "nic0".into(),
+                    model: "virtio-net".into(),
+                    options: [(
+                        "guest_mac".into(),
+                        toml::Value::Array(
+                            [0x52, 0x54, 0x00, 0x54, 0x02, 0x01]
+                                .into_iter()
+                                .map(toml::Value::Integer)
+                                .collect(),
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            ],
+            ..Default::default()
+        });
+        let controller = DeviceNodeId::new("controller").unwrap();
+        let mut nodes = vec![DeviceNodeSpec::firmware_only(controller.clone())];
+        append_configured_devices(
+            &config,
+            &mut nodes,
+            &controller,
+            InterruptControllerId::new(0),
+            None,
+        )
+        .unwrap();
+
+        let mut builder = DeviceGraphBuilder::new();
+        for node in nodes {
+            builder.add(node).unwrap();
+        }
+        let mut pools = ResourcePools::new();
+        pools.add_auto_mmio(0x0b00_0000..0x1000_0000).unwrap();
+        pools.allow_fixed_mmio(0x0900_0000..0x0900_1000).unwrap();
+        pools
+            .add_auto_controller_inputs(
+                InterruptControllerId::new(0),
+                ControllerInputId::new(32)..ControllerInputId::new(36),
+            )
+            .unwrap();
+        let graph = builder.declare().unwrap().resolve(pools).unwrap();
+
+        let page = ax_memory_addr::PAGE_SIZE_4K as u64;
+        let registers = ResourceSlot::new("mmio").unwrap();
+        let mut pages = vec![];
+        for id in ["disk0", "nic0"] {
+            let resources = graph
+                .resources_for(&DeviceNodeId::new(id).unwrap())
+                .unwrap();
+            let (base, size) = resources.mmio(&registers).unwrap();
+            assert!(
+                base % page + size <= page,
+                "{id} emulated window {base:#x}+{size:#x} crosses a guest page boundary"
+            );
+            pages.push(base & !(page - 1));
+        }
+        assert_ne!(
+            pages[0], pages[1],
+            "two emulated device windows share guest page {:#x}",
+            pages[0]
+        );
+    }
+
+    #[test]
+    fn host_selected_console_keeps_identity_and_irq_until_address_is_overridden() {
+        use crate::machine::{
+            GuestSerialFdtIdentity, GuestSerialModel, GuestSerialProfile, GuestSerialTransport,
+        };
+
+        let host = GuestSerialProfile {
+            model: GuestSerialModel::Uart16550,
+            transport: GuestSerialTransport::Mmio {
+                base: 0x1000_3000,
+                length: 0x100,
+                register_shift: 2,
+                register_width: axdevice_base::AccessWidth::Dword,
+            },
+            irq: 21,
+            clock_hz: 24_000_000,
+        };
+        let identity = GuestSerialFirmwareIdentity::Fdt(GuestSerialFdtIdentity {
+            node_path: "/serial@10003000".into(),
+            node_phandle: Some(9),
+            interrupt_parent: 1,
+            interrupt_specifier: vec![0, 21, 4],
+            stdout_path: "/serial@10003000:115200".into(),
+            clock_references: vec![],
+        });
+        for address in [None, Some(0x1000_4000)] {
+            let mut config = AxVMConfig::new(AxVMConfigParams {
+                phys_cpu_ls: PhysCpuList::new(1, None, None),
+                virtual_device_catalog: registered_catalog(),
+                virtual_device_requests: address
+                    .map(|address| {
+                        vec![VirtualDeviceRequest {
+                            id: "console0".into(),
+                            model: "uart16550-mmio".into(),
+                            options: [("address".into(), toml::Value::Integer(address))]
+                                .into_iter()
+                                .collect(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                ..Default::default()
+            });
+            config
+                .replace_machine_serial(host, Some(identity.clone()))
+                .unwrap();
+            let controller = DeviceNodeId::new("controller").unwrap();
+            let mut nodes = vec![DeviceNodeSpec::firmware_only(controller.clone())];
+            append_configured_devices(
+                &config,
+                &mut nodes,
+                &controller,
+                InterruptControllerId::new(0),
+                None,
+            )
+            .unwrap();
+            let mut graph = DeviceGraphBuilder::new();
+            for node in nodes {
+                graph.add(node).unwrap();
+            }
+            let mut pools = ResourcePools::new();
+            pools.allow_fixed_mmio(0x1000_3000..0x1000_5000).unwrap();
+            pools
+                .allow_fixed_controller_inputs(
+                    InterruptControllerId::new(0),
+                    ControllerInputId::new(21)..ControllerInputId::new(22),
+                )
+                .unwrap();
+            pools
+                .add_auto_controller_inputs(
+                    InterruptControllerId::new(0),
+                    ControllerInputId::new(16)..ControllerInputId::new(32),
+                )
+                .unwrap();
+            let graph = graph.declare().unwrap().resolve(pools).unwrap();
+            let console = crate::machine::resolved_serial_devices(&graph)
+                .unwrap()
+                .into_iter()
+                .find(|serial| serial.id() == "console0")
+                .unwrap();
+            assert_eq!(
+                console.profile().transport,
+                GuestSerialTransport::Mmio {
+                    base: address.unwrap_or(0x1000_3000) as usize,
+                    length: 0x100,
+                    register_shift: 2,
+                    register_width: axdevice_base::AccessWidth::Dword,
+                }
+            );
+            assert_eq!(console.profile().irq, address.map_or(21, |_| 16));
+            assert_eq!(console.profile().clock_hz, 24_000_000);
+            assert_eq!(
+                console.firmware_binding(),
+                &address.map_or_else(
+                    || DeviceFirmwareBinding::FdtNode("/serial@10003000".into()),
+                    |_| DeviceFirmwareBinding::None,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn serial_address_rejects_port_overflow_and_conflicting_windows() {
+        let config = AxVMConfig::new(AxVMConfigParams {
+            virtual_device_catalog: registered_catalog(),
+            virtual_device_requests: vec![VirtualDeviceRequest {
+                id: "console0".into(),
+                model: "uart16550-pio".into(),
+                options: [("address".into(), toml::Value::Integer(0x1_0000))]
+                    .into_iter()
+                    .collect(),
+            }],
+            ..Default::default()
+        });
+        let controller = DeviceNodeId::new("controller").unwrap();
+        let error = append_configured_devices(
+            &config,
+            &mut vec![],
+            &controller,
+            InterruptControllerId::new(0),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("address exceeds"));
+
+        let config = AxVMConfig::new(AxVMConfigParams {
+            virtual_device_catalog: registered_catalog(),
+            virtual_device_requests: vec![
+                VirtualDeviceRequest {
+                    id: "console0".into(),
+                    model: "uart16550-mmio".into(),
+                    options: [("address".into(), toml::Value::Integer(0x1000_3000))]
+                        .into_iter()
+                        .collect(),
+                },
+                VirtualDeviceRequest {
+                    id: "serial1".into(),
+                    model: "uart16550-mmio".into(),
+                    options: [("address".into(), toml::Value::Integer(0x1000_3000))]
+                        .into_iter()
+                        .collect(),
+                },
+            ],
+            ..Default::default()
+        });
+        let mut nodes = vec![DeviceNodeSpec::firmware_only(controller.clone())];
+        append_configured_devices(
+            &config,
+            &mut nodes,
+            &controller,
+            InterruptControllerId::new(0),
+            None,
+        )
+        .unwrap();
+        let mut graph = DeviceGraphBuilder::new();
+        for node in nodes {
+            graph.add(node).unwrap();
+        }
+        let mut pools = ResourcePools::new();
+        pools.allow_fixed_mmio(0x1000_3000..0x1000_3100).unwrap();
+        pools
+            .add_auto_controller_inputs(
+                InterruptControllerId::new(0),
+                ControllerInputId::new(16)..ControllerInputId::new(32),
+            )
+            .unwrap();
+        assert!(graph.declare().unwrap().resolve(pools).is_err());
+    }
+
+    #[test]
+    fn ivc_channel_uses_resolved_notify_irq_and_planned_mmio_aperture() {
+        let config = AxVMConfig::new(AxVMConfigParams {
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            virtual_device_catalog: registered_catalog(),
+            virtual_device_requests: vec![VirtualDeviceRequest {
+                id: "ivc0".into(),
+                model: "ivc-channel".into(),
+                options: Default::default(),
+            }],
+            ..Default::default()
+        });
+        let controller = DeviceNodeId::new("controller").unwrap();
+        let mut nodes = vec![test_interrupt_controller_node(controller.clone())];
+        append_configured_devices(
+            &config,
+            &mut nodes,
+            &controller,
+            InterruptControllerId::new(0),
+            None,
+        )
+        .unwrap();
+
+        let mut graph = DeviceGraphBuilder::new();
+        for node in nodes {
+            graph.add(node).unwrap();
+        }
+        let mut pools = ResourcePools::new();
+        pools
+            .add_auto_mmio(0x4000_0000..0x4000_0000 + super::devices::IVC_CHANNEL_SHARED_RANGE_SIZE)
+            .unwrap();
+        let serial = config.serial_profile();
+        match serial.transport {
+            crate::machine::GuestSerialTransport::Port { base, length } => {
+                pools.allow_fixed_pio(base..base + length).unwrap();
+            }
+            crate::machine::GuestSerialTransport::Mmio { base, length, .. } => {
+                pools
+                    .allow_fixed_mmio(base as u64..(base + length) as u64)
+                    .unwrap();
+            }
+        }
+        let irq = serial.irq;
+        pools
+            .allow_fixed_controller_inputs(
+                InterruptControllerId::new(0),
+                ControllerInputId::new(irq)..ControllerInputId::new(irq + 1),
+            )
+            .unwrap();
+        pools
+            .add_auto_controller_inputs(
+                InterruptControllerId::new(0),
+                ControllerInputId::new(32)..ControllerInputId::new(36),
+            )
+            .unwrap();
+        let graph = graph.declare().unwrap().resolve(pools).unwrap();
+
+        let registers = ResourceSlot::new("registers").unwrap();
+        let notify = ResourceSlot::new("notify").unwrap();
+        let ivc = graph
+            .resources_for(&DeviceNodeId::new("ivc0").unwrap())
+            .unwrap();
+        assert_eq!(
+            ivc.mmio(&registers).unwrap(),
+            (0x4000_0000, super::devices::IVC_CHANNEL_SHARED_RANGE_SIZE,)
+        );
+        assert_eq!(ivc.wired_irq(&notify).unwrap().input().value(), 32);
+
+        let mut runtime = DeviceRuntimeBuilder::new(Default::default());
+        for node in graph.nodes() {
+            runtime
+                .build_graph_node(node, graph.resource_plan())
+                .unwrap();
+        }
+        let runtime = runtime.finish(graph.resource_plan()).unwrap();
+        assert_eq!(
+            crate::runtime::ivc::alloc_guest_binding(&runtime, 0x1000).unwrap(),
+            GuestPhysAddr::from_usize(0x4000_0000)
+        );
+    }
+}

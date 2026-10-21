@@ -26,6 +26,14 @@
 #define SYSLOG_ACTION_SIZE_UNREAD 9
 #define SYSLOG_ACTION_SIZE_BUFFER 10
 
+_Static_assert(sizeof(unsigned long) >= 8,
+               "StarryOS syscall ABI tests require a 64-bit unsigned long");
+
+static unsigned long with_nonzero_upper_syslog_len(unsigned long low_word)
+{
+    return (1UL << 32) | low_word;
+}
+
 static int run_in_child(void (*func)(void)) {
     pid_t pid = fork();
     if (pid < 0)
@@ -55,6 +63,12 @@ static void child_syslog_eperm(void) {
     if (__fail != setup_failures)
         return;
 
+    CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ, NULL, 0),
+              EPERM, "non-root READ checks privilege before null buffer");
+    CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, tmp, -1),
+              EPERM, "non-root READ_ALL checks privilege before negative length");
+    CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ_CLEAR, NULL, 0),
+              EPERM, "non-root READ_CLEAR checks privilege before null buffer");
     CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ, tmp, (int)sizeof(tmp)),
               EPERM, "non-root READ returns EPERM");
     CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, tmp, (int)sizeof(tmp)),
@@ -98,6 +112,11 @@ int main(void) {
     CHECK(size_unread >= 0, "SIZE_UNREAD is non-negative");
     CHECK(size_unread <= size_buffer, "SIZE_UNREAD does not exceed SIZE_BUFFER");
 
+    CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ, NULL, 0), EINVAL,
+              "READ rejects a null buffer with EINVAL");
+    CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, buf, -1), EINVAL,
+              "READ_ALL rejects a negative length with EINVAL");
+
     long read_all = syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, buf, (int)sizeof(buf));
     CHECK(read_all >= 0, "READ_ALL returns a non-negative length");
     CHECK(read_all <= (long)sizeof(buf), "READ_ALL respects destination buffer length");
@@ -106,6 +125,9 @@ int main(void) {
         CHECK(memcmp(buf, (unsigned char[128]){ [0 ... 127] = 0xA5 }, sizeof(buf)) == 0,
               "READ_ALL leaves buffer unchanged when nothing is copied");
     }
+    CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, buf,
+                      with_nonzero_upper_syslog_len(0)),
+              0, "READ_ALL narrows an upper-word length to int");
 
     long size_unread_after_read_all = syscall(SYS_syslog, SYSLOG_ACTION_SIZE_UNREAD, NULL, 0);
     CHECK(size_unread_after_read_all == size_unread,
@@ -128,10 +150,12 @@ int main(void) {
               "CONSOLE_OFF returns 0");
     CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_ON, NULL, 0), 0,
               "CONSOLE_ON returns 0");
-    CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL, 1), 7,
-              "CONSOLE_LEVEL returns the previous level");
-    CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL, 7), 1,
-              "CONSOLE_LEVEL updates and reports the old level");
+    CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL,
+                      with_nonzero_upper_syslog_len(1)),
+              7, "CONSOLE_LEVEL narrows an upper-word level to int");
+    CHECK_RET(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL,
+                      with_nonzero_upper_syslog_len(7)),
+              1, "CONSOLE_LEVEL updates and reports the old narrowed level");
     CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL, 0), EINVAL,
               "CONSOLE_LEVEL rejects level 0 with EINVAL");
     CHECK_ERR(syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL, 9), EINVAL,

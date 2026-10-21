@@ -1,0 +1,16 @@
+# Select the test shell on existing board images without replacing their init files.
+cmdline = 'root=/dev/mmcblk0p3 rootfstype=ext4 rootwait rw console=ttyS0,1500000n8 earlycon=uart8250,mmio32,0x2ad40000 init=/bin/sh HOME=/root USER=root HOSTNAME=starry -- -c "cd /root; export PS1=$USER@$HOSTNAME:~#; exec /bin/sh -i"'
+board_type = "Rock-4D"
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?i)segmentation fault",
+  "(?i)SIGSEGV",
+  "exit with code: 139",
+  "failed to determine root device",
+]
+timeout = 300
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:~#"
+shell_cmd = "echo STARRY_ROCK4D_BOOT_OK"
+success_regex = ["(?m)^STARRY_ROCK4D_BOOT_OK\\s*$"]

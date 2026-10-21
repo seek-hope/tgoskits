@@ -1,47 +1,14 @@
-use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
+use std::{format, string::String, vec::Vec};
 
-use ax_kspin::SpinNoIrq as Mutex;
-use ax_lazyinit::LazyInit;
-use axvmconfig::AxVMCrateConfig;
+use ax_std::os::arceos::{driver as ax_driver, modules::ax_hal};
+use axvmconfig::GuestConfig;
 
 use super::UEFI_FIRMWARE_FDT_BASE;
-use crate::{
-    AxVMRef, AxVmResult, ax_err_type,
-    config::{AxVMConfig, PassThroughDeviceConfig},
-};
-
-static LOONGARCH_GUEST_IRQ_ROUTES: LazyInit<Mutex<BTreeMap<usize, Vec<LoongArchGuestIrqRoute>>>> =
-    LazyInit::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LoongArchGuestIrqRoute {
-    pub physical_irq: usize,
-    pub guest_vector: usize,
-}
-
-pub fn init() {
-    LOONGARCH_GUEST_IRQ_ROUTES.init_once(Mutex::new(BTreeMap::new()));
-}
-
-pub fn store_guest_irq_routes(vm_id: usize, routes: Vec<LoongArchGuestIrqRoute>) {
-    let mut cache_lock = LOONGARCH_GUEST_IRQ_ROUTES
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock();
-    cache_lock.insert(vm_id, routes);
-}
-
-pub fn get_guest_irq_routes(vm_id: usize) -> Vec<LoongArchGuestIrqRoute> {
-    LOONGARCH_GUEST_IRQ_ROUTES
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .get(&vm_id)
-        .cloned()
-        .unwrap_or_default()
-}
+use crate::{config::*, *};
 
 pub fn prepare_uefi_fdt_config(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &mut AxVMCrateConfig,
+    vm_create_config: &mut GuestConfig,
 ) -> AxVmResult {
     info!(
         "VM[{}] uses LoongArch UEFI boot protocol, keeping firmware FDT at {:#x}",
@@ -54,13 +21,19 @@ pub fn prepare_uefi_fdt_config(
     Ok(())
 }
 
-pub fn prepare_uefi_runtime_config(vm: &AxVMRef, vm_create_config: &AxVMCrateConfig) {
-    store_guest_irq_routes(vm.id(), super::guest_irq_routes(vm, vm_create_config));
+pub fn prepare_direct_fdt_config(vm_config: &mut AxVMConfig, vm_create_config: &mut GuestConfig) {
+    info!(
+        "VM[{}] uses LoongArch direct boot protocol, loading FDT at {:#x}",
+        vm_config.id(),
+        UEFI_FIRMWARE_FDT_BASE
+    );
+    vm_config.set_dtb_load_gpa(UEFI_FIRMWARE_FDT_BASE.into());
+    vm_create_config.kernel.dtb_load_addr = Some(UEFI_FIRMWARE_FDT_BASE);
 }
 
 fn expand_root_passthrough(
     vm_config: &mut AxVMConfig,
-    vm_create_config: &AxVMCrateConfig,
+    vm_create_config: &GuestConfig,
 ) -> AxVmResult {
     let has_root_passthrough = vm_config
         .pass_through_devices()
@@ -79,12 +52,11 @@ fn expand_root_passthrough(
         .into_iter()
         .filter(|range| !passthrough_range_is_occupied(range, vm_create_config))
     {
-        vm_config.add_pass_through_device(PassThroughDeviceConfig {
+        vm_config.add_pass_through_device(HostDeviceAssignment {
             name: range.name,
             base_gpa: range.base,
             base_hpa: range.base,
             length: range.size,
-            irq_id: 0,
         });
         added += 1;
     }
@@ -101,18 +73,13 @@ fn expand_root_passthrough(
 
 fn passthrough_range_is_occupied(
     range: &AcpiPassthroughRange,
-    vm_create_config: &AxVMCrateConfig,
+    vm_create_config: &GuestConfig,
 ) -> bool {
     vm_create_config
         .kernel
         .memory_regions
         .iter()
         .any(|memory| ranges_overlap(range.base, range.size, memory.gpa, memory.size))
-        || vm_create_config
-            .devices
-            .emu_devices
-            .iter()
-            .any(|device| ranges_overlap(range.base, range.size, device.base_gpa, device.length))
 }
 
 fn ranges_overlap(base: usize, size: usize, other_base: usize, other_size: usize) -> bool {
@@ -156,10 +123,6 @@ fn acpi_passthrough_ranges(
                 range.size,
             )?;
         }
-    }
-
-    if let Some(range) = acpi.serial_console_memory_range() {
-        add_acpi_passthrough_range(&mut ranges, "acpi-spcr-uart".into(), range.base, range.size)?;
     }
 
     for (index, region) in acpi.pci_ecam_regions().iter().enumerate() {

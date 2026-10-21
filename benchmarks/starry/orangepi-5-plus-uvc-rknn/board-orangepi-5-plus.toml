@@ -1,0 +1,39 @@
+# Select the test shell on the board rootfs instead of its systemd init,
+# which cannot finish booting without kernel uevent netlink support.
+cmdline = 'root=/dev/mmcblk0p2 rw console=ttyS2,1500000 earlycon=uart8250,mmio32,0xfeb50000 rootwait rootfstype=ext4 init=/bin/sh HOME=/root USER=root HOSTNAME=starry -- -c "cd /root; export PS1=$USER@$HOSTNAME:~#; exec /bin/sh -i"'
+board_type = "OrangePi-5-Plus"
+dtb_file = "os/StarryOS/configs/board/orangepi-5-plus.dtb"
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?i)segmentation fault",
+  "(?i)Meet (unsupported|unknown) .*target",
+  "(?i)failed to check rknpu hardware version",
+  "(?m)^uvc-fps: error: .*$",
+  "(?m)^uvc-fps: save error: .*$",
+  "(?m)^rknn_init fail!.*$",
+  "(?m)^read_image fail!.*$",
+  "(?m)^inference_yolov8_model fail!.*$",
+  "(?m)^UVC_RKNN_STREAM_FAILED",
+  # `init.sh` also reports a mode selection or bench-path failure through this
+  # marker, so a mis-set `UVC_RKNN_MODE` fails instead of waiting for the
+  # timeout.
+  "(?m)^UVC_RKNN_BENCH_FAILED",
+  "(?m)^(uvc_init|uvc_open|uvc_start_streaming|uvc_get_device_list) failed: .*$",
+  "(?m)^dlopen libuvc\\.so failed: .*$",
+  "(?i)error while loading shared libraries",
+  "(?i)(uvc-fps|rknn_yolov8_image|rknn_yolov8_stream|sh): .*not found",
+]
+timeout = 120
+
+# Run the benchmark from the existing Starry shell instead of the Linux
+# rootfs init. The latter starts systemd on this board image and leaves the
+# serial shell unavailable for the app runner.
+
+[[shell_check_steps]]
+shell_prefix = "root@starry:"
+shell_cmd = '''
+export UVC_RKNN_MODE=smoke
+'''
+success_regex = [
+  "(?m)^UVC_RKNN_STREAM_DONE\\s*$",
+]

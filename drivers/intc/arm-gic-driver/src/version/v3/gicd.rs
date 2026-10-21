@@ -1,12 +1,13 @@
 use core::hint::spin_loop;
 
-use aarch64_cpu::asm::barrier;
+use log::warn;
 use tock_registers::{interfaces::*, register_bitfields, register_structs, registers::*};
 
 use crate::{
-    IntId,
+    IntId, arch,
     define::{SPI_RANGE, Trigger},
     v3::Affinity,
+    version::IrqVecReadable,
 };
 
 /// Access context for CTLR register operations
@@ -96,6 +97,11 @@ const GICD_ICACTIVER: usize = 0x0380;
 const GICD_IPRIORITYR: usize = 0x0400;
 const GICD_ICFGR: usize = 0x0c00;
 
+/// Bits of `GICD_IROUTER<n>` that select the target: Aff0..Aff3 and the
+/// Interrupt_Routing_Mode bit. Reserved bits are excluded so a read-back still
+/// compares equal to the value that was just stored.
+const IROUTER_TARGET_MASK: u64 = 0xff | (0xff << 8) | (0xff << 16) | (1u64 << 31) | (0xffu64 << 32);
+
 #[inline(always)]
 fn reg32_addr(base: *const DistributorReg, offset: usize, index: usize) -> *mut u32 {
     (base as usize + offset + index * core::mem::size_of::<u32>()) as *mut u32
@@ -108,6 +114,9 @@ fn reg8_addr(base: *const DistributorReg, offset: usize, index: usize) -> *mut u
 
 #[inline(always)]
 fn mmio_write32(addr: *mut u32, value: u32) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (addr, value);
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             "str {value:w}, [{addr}]",
@@ -120,6 +129,9 @@ fn mmio_write32(addr: *mut u32, value: u32) {
 
 #[inline(always)]
 fn mmio_write8(addr: *mut u8, value: u8) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (addr, value);
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             "strb {value:w}, [{addr}]",
@@ -391,12 +403,25 @@ impl DistributorReg {
         write_reg32_range(self, GICD_ICFGR, num_regs, 0);
     }
 
-    /// Set interrupt routing (affinity) using IROUTER registers
-    pub fn set_interrupt_route(&self, intid: u32, aff: Option<Affinity>) {
+    /// Set interrupt routing (affinity) using IROUTER registers.
+    ///
+    /// A write to `GICD_IROUTER<n>` is architecturally UNPREDICTABLE while SPI
+    /// `n` is enabled, and RK3588 drops such a write. An enabled SPI is
+    /// therefore masked, the distributor write is retired, the route is stored,
+    /// and the previous enable bit is restored.
+    ///
+    /// A route that already selects the requested target returns before that
+    /// cycle: the distributor state cannot change, and masking a live source
+    /// only adds jitter to its interrupt.
+    pub fn set_interrupt_route(
+        &self,
+        intid: u32,
+        aff: Option<Affinity>,
+    ) -> Result<(), &'static str> {
         // Check if this is a valid SPI in the standard range
         if !SPI_RANGE.contains(&intid) {
             // TODO: Check for Extended SPI support in TYPER2 register when extended range is used
-            return; // Only SPIs (32-1019) can be routed currently
+            return Ok(()); // Only SPIs (32-1019) can be routed currently
         }
 
         // Calculate IROUTER register index
@@ -404,7 +429,7 @@ impl DistributorReg {
         let router_idx = (intid - 32) as usize;
 
         if router_idx >= self.IROUTER.len() {
-            return; // Out of range for IROUTER registers
+            return Ok(()); // Out of range for IROUTER registers
         }
 
         let mut route_value = 0u64;
@@ -428,7 +453,43 @@ impl DistributorReg {
                 route_value |= 1u64 << 31;
             }
         }
+        // `Some` stores specific affinities with Interrupt_Routing_Mode = 0 and
+        // `None` stores the any-participating-PE mode, so the mode bit cannot
+        // be confused with a specific affinity whose levels are all zero.
+        if self.IROUTER[router_idx].get() & IROUTER_TARGET_MASK == route_value {
+            return Ok(());
+        }
+        let was_enabled = self.ISENABLER.get_irq_bit(intid);
+        if was_enabled {
+            self.irq_disable(intid);
+            // A timed-out RWP still leaves the SPI disabled. Skip the route
+            // write rather than store IROUTER while the previous enable may
+            // still be retiring, but restore the enable bit: a source the guest
+            // already allowed to interrupt must not stay masked forever, and
+            // its previous route is still programmed.
+            if let Err(error) = self.wait_for_rwp() {
+                self.irq_enable(intid);
+                warn!(
+                    "GICv3 SPI {intid} route update aborted while masking; affinity={aff:?}: \
+                     {error}"
+                );
+                return Err(error);
+            }
+        }
         self.IROUTER[router_idx].set(route_value);
+        let wait_result = if was_enabled {
+            self.wait_for_rwp()
+        } else {
+            Ok(())
+        };
+        if was_enabled {
+            self.irq_enable(intid);
+        }
+        if let Err(error) = wait_result {
+            warn!("GICv3 SPI {intid} route update did not retire; affinity={aff:?}: {error}");
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Get interrupt routing information
@@ -487,41 +548,9 @@ impl DistributorReg {
         }
     }
 
-    /// Configure non-maskable interrupt
-    pub fn set_nmi(&self, intid: u32, nmi: bool) {
-        if (32..1020).contains(&intid) {
-            let reg_idx = (intid / 32) as usize;
-            let bit_idx = intid % 32;
-
-            if reg_idx < self.INMIR.len() {
-                let current = self.INMIR[reg_idx].get();
-                if nmi {
-                    self.INMIR[reg_idx].set(current | (1 << bit_idx));
-                } else {
-                    self.INMIR[reg_idx].set(current & !(1 << bit_idx));
-                }
-            }
-        }
-    }
-
-    /// Check if interrupt is configured as NMI
-    pub fn is_nmi(&self, intid: u32) -> bool {
-        if (32..1020).contains(&intid) {
-            let reg_idx = (intid / 32) as usize;
-            let bit_idx = intid % 32;
-
-            if reg_idx < self.INMIR.len() {
-                let current = self.INMIR[reg_idx].get();
-                return (current & (1 << bit_idx)) != 0;
-            }
-        }
-        false
-    }
-
     /// Check if Extended SPI range is supported
     pub fn has_extended_spi(&self) -> bool {
-        // Check if TYPER2.ESPI is implemented and set
-        self.TYPER2.read(TYPER2::NMI) != 0 // Using NMI bit as placeholder since ESPI is not defined yet
+        self.TYPER.is_set(TYPER::ESPI)
     }
 
     /// Get the Extended SPI range if supported
@@ -549,7 +578,9 @@ impl DistributorReg {
         let current = Affinity::current();
         for i in SPI_RANGE.start..max_interrupts {
             // Set all SPIs to route to current CPU
-            self.set_interrupt_route(i, Some(current));
+            if let Err(error) = self.set_interrupt_route(i, Some(current)) {
+                warn!("GICv3 failed to route SPI {i} to {current:?}: {error}");
+            }
         }
     }
 
@@ -588,7 +619,7 @@ impl DistributorReg {
                 return Err("GICv3 Distributor CTLR RWP wait timeout.");
             }
         }
-        barrier::isb(barrier::SY);
+        arch::isb();
         Ok(())
     }
 }
@@ -640,6 +671,10 @@ register_bitfields! [
         ITLinesNumber OFFSET(0) NUMBITS(5) [],
         /// Number of CPU interfaces implemented minus one
         CPUNumber OFFSET(5) NUMBITS(3) [],
+        /// Extended SPI range supported
+        ESPI OFFSET(8) NUMBITS(1) [],
+        /// Non-maskable interrupt property supported
+        NMI OFFSET(9) NUMBITS(1) [],
         /// Indicates whether the GIC implements Security Extensions
         SecurityExtn OFFSET(10) NUMBITS(1) [
             SingleSecurity = 0,
@@ -665,12 +700,12 @@ register_bitfields! [
 
     /// Type Modifier Register
     pub TYPER2 [
+        /// Virtual PE identifier width
+        VID OFFSET(0) NUMBITS(5) [],
         /// Virtual LPIs supported
-        VIL OFFSET(0) NUMBITS(1) [],
-        /// Virtual command queue interface supported
-        VID OFFSET(1) NUMBITS(5) [],
-        /// NMI support
-        NMI OFFSET(6) NUMBITS(1) [],
+        VIL OFFSET(7) NUMBITS(1) [],
+        /// Support for SGIs without an active state
+        nASSGIcap OFFSET(8) NUMBITS(1) [],
     ],
 
     /// Status Register
@@ -768,3 +803,124 @@ register_bitfields! [
         Aff3 OFFSET(32) NUMBITS(8) [],
     ],
 ];
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    /// `DistributorReg` ends at the last `IROUTER` entry plus eight bytes, so
+    /// one aligned window backs every register the struct maps.
+    const DISTRIBUTOR_WINDOW: usize = 0x8000;
+
+    /// Fake distributor window. `IROUTER` is a 64-bit register, so the backing
+    /// store must be 8-byte aligned for the volatile accesses.
+    #[repr(align(8))]
+    struct FakeDistributor([u8; DISTRIBUTOR_WINDOW]);
+
+    impl FakeDistributor {
+        fn new() -> std::boxed::Box<Self> {
+            std::boxed::Box::new(Self([0; DISTRIBUTOR_WINDOW]))
+        }
+
+        fn regs(&self) -> &DistributorReg {
+            // Safety: the window is aligned for `DistributorReg`'s widest
+            // register and large enough for every field it maps.
+            unsafe { &*(self.0.as_ptr().cast::<DistributorReg>()) }
+        }
+    }
+
+    /// The first SPI: `IROUTER[0]`, `ISENABLER[1]` and `ICENABLER[1]`.
+    const SPI: u32 = 32;
+    const SPI_REG: usize = (SPI / 32) as usize;
+    const SPI_BIT: u32 = 1 << (SPI % 32);
+
+    fn affinity(aff0: u8) -> Affinity {
+        Affinity {
+            aff0,
+            ..Default::default()
+        }
+    }
+
+    /// The periodic guest-entry retarget must be free when the distributor
+    /// already selects the CPU that is about to enter the guest.
+    #[test]
+    fn already_routed_spi_is_left_untouched() {
+        let distributor = FakeDistributor::new();
+        let regs = distributor.regs();
+        // Reserved `IROUTER` bits survive a skipped store, so a surviving
+        // non-zero bit proves the register was not rewritten.
+        const RESERVED: u64 = 1 << 40;
+        regs.IROUTER[0].set(affinity(1).aff0 as u64 | RESERVED);
+        // The guest owns the enable bit; the driver must not disturb it.
+        regs.irq_enable(SPI);
+
+        assert!(regs.set_interrupt_route(SPI, Some(affinity(1))).is_ok());
+
+        assert_eq!(
+            regs.ICENABLER[SPI_REG].get(),
+            0,
+            "a route that is already correct must not mask the SPI"
+        );
+        assert_eq!(
+            regs.IROUTER[0].get(),
+            affinity(1).aff0 as u64 | RESERVED,
+            "a route that is already correct must not be rewritten"
+        );
+    }
+
+    /// Any-participating-PE routing shares no affinity bits with a specific
+    /// target, so the mode bit has to take part in the comparison.
+    #[test]
+    fn any_pe_route_is_not_confused_with_a_specific_affinity() {
+        let distributor = FakeDistributor::new();
+        let regs = distributor.regs();
+        regs.IROUTER[0].set(1u64 << 31);
+
+        assert!(regs.set_interrupt_route(SPI, Some(affinity(0))).is_ok());
+
+        assert_eq!(
+            regs.IROUTER[0].get(),
+            0,
+            "specific routing must replace any-participating-PE mode"
+        );
+
+        assert!(regs.set_interrupt_route(SPI, None).is_ok());
+
+        assert_eq!(
+            regs.IROUTER[0].get(),
+            1u64 << 31,
+            "any-participating-PE mode must replace specific routing"
+        );
+    }
+
+    /// A genuinely different route keeps the mask, retire, store and unmask
+    /// sequence, because `IROUTER` is not writable while the SPI is enabled.
+    #[test]
+    fn different_route_masks_and_rewrites_router() {
+        let distributor = FakeDistributor::new();
+        let regs = distributor.regs();
+        regs.IROUTER[0].set(4);
+        // The restore stores the enable bit by itself, so a second bit in the
+        // same register disappears exactly when that store runs. A fake window
+        // cannot model ICENABLER clearing ISENABLER, and that store is what
+        // proves the SPI is not left masked.
+        const NEIGHBOUR_BIT: u32 = 1 << 1;
+        regs.ISENABLER[SPI_REG].set(SPI_BIT | NEIGHBOUR_BIT);
+
+        assert!(regs.set_interrupt_route(SPI, Some(affinity(1))).is_ok());
+
+        assert_eq!(regs.IROUTER[0].get(), 1);
+        assert_eq!(
+            regs.ICENABLER[SPI_REG].get(),
+            SPI_BIT,
+            "an enabled SPI is masked before the IROUTER store"
+        );
+        assert_eq!(
+            regs.ISENABLER[SPI_REG].get(),
+            SPI_BIT,
+            "the SPI is enabled again after the route is stored"
+        );
+    }
+}

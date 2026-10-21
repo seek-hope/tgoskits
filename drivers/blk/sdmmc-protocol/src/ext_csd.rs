@@ -116,6 +116,63 @@ impl ExtCsd {
             other => MmcTiming::Unknown(other),
         }
     }
+
+    /// Extended CSD structure revision.
+    pub fn revision(&self) -> u8 {
+        self.raw[ext_csd::REV]
+    }
+
+    /// Volatile write-cache capacity in KiB.
+    ///
+    /// The cache-size field was introduced with eMMC 4.5 (EXT_CSD revision
+    /// 6). Older cards must be treated as having no controllable cache.
+    pub fn cache_size_kib(&self) -> u32 {
+        if self.revision() < 6 {
+            return 0;
+        }
+        let offset = ext_csd::CACHE_SIZE;
+        u32::from_le_bytes([
+            self.raw[offset],
+            self.raw[offset + 1],
+            self.raw[offset + 2],
+            self.raw[offset + 3],
+        ])
+    }
+
+    /// Whether a non-empty volatile write cache is currently enabled.
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_size_kib() != 0 && self.raw[ext_csd::CACHE_CTRL] & 1 != 0
+    }
+
+    /// Whether the card implements the eMMC command queue protocol.
+    pub fn command_queue_supported(&self) -> bool {
+        self.revision() >= 8
+            && self.raw[ext_csd::CMDQ_SUPPORT] & 1 != 0
+            && self.command_queue_depth() > 2
+    }
+
+    /// Number of data-task slots implemented by the card.
+    ///
+    /// JESD84 encodes the maximum zero-based task index. CQHCI reserves its
+    /// final host slot for direct commands, so callers still need to clamp
+    /// this value to the host's data-slot count.
+    pub fn command_queue_depth(&self) -> usize {
+        usize::from(self.raw[ext_csd::CMDQ_DEPTH] & 0x1f) + 1
+    }
+
+    /// Whether command queue mode is currently selected on the card.
+    pub fn command_queue_enabled(&self) -> bool {
+        self.raw[ext_csd::CMDQ_MODE_EN] & 1 != 0
+    }
+
+    #[cfg(any(feature = "sdio", test))]
+    pub(crate) fn set_cache_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.raw[ext_csd::CACHE_CTRL] |= 1;
+        } else {
+            self.raw[ext_csd::CACHE_CTRL] &= !1;
+        }
+    }
 }
 
 impl DeviceType {
@@ -178,5 +235,46 @@ mod tests {
         let e = ExtCsd::from_bytes(raw);
         assert_eq!(e.bus_width(), MmcBusWidth::Sdr8);
         assert_eq!(e.timing(), MmcTiming::Hs200);
+    }
+
+    #[test]
+    fn cache_flush_requires_a_nonzero_enabled_cache() {
+        let mut raw = [0u8; 512];
+        raw[192] = 6;
+        raw[249..253].copy_from_slice(&1024u32.to_le_bytes());
+        let mut ext_csd = ExtCsd::from_bytes(raw);
+
+        assert_eq!(ext_csd.cache_size_kib(), 1024);
+        assert!(!ext_csd.cache_enabled());
+
+        ext_csd.set_cache_enabled(true);
+        assert!(ext_csd.cache_enabled());
+    }
+
+    #[test]
+    fn command_queue_fields_decode_capability_depth_and_mode() {
+        let mut raw = [0u8; 512];
+        raw[ext_csd::REV] = 8;
+        raw[ext_csd::CMDQ_SUPPORT] = 1;
+        raw[ext_csd::CMDQ_DEPTH] = 30;
+        raw[ext_csd::CMDQ_MODE_EN] = 1;
+        let ext_csd = ExtCsd::from_bytes(raw);
+
+        assert!(ext_csd.command_queue_supported());
+        assert_eq!(ext_csd.command_queue_depth(), 31);
+        assert!(ext_csd.command_queue_enabled());
+    }
+
+    #[test]
+    fn command_queue_rejects_pre_51_and_inefficient_depths() {
+        let mut raw = [0u8; 512];
+        raw[ext_csd::REV] = 7;
+        raw[ext_csd::CMDQ_SUPPORT] = 1;
+        raw[ext_csd::CMDQ_DEPTH] = 31;
+        assert!(!ExtCsd::from_bytes(raw).command_queue_supported());
+
+        raw[ext_csd::REV] = 8;
+        raw[ext_csd::CMDQ_DEPTH] = 1;
+        assert!(!ExtCsd::from_bytes(raw).command_queue_supported());
     }
 }

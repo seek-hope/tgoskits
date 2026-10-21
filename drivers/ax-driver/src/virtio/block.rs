@@ -1,727 +1,630 @@
+//! Interrupt-driven VirtIO MMIO block registration for the shared block runtime.
+
 extern crate alloc;
 
 use alloc::{boxed::Box, format, sync::Arc, vec};
 use core::{
-    cell::UnsafeCell,
-    hint::spin_loop,
-    sync::atomic::{AtomicBool, Ordering},
+    mem::{self, ManuallyDrop},
+    slice,
+    time::Duration,
 };
 
-use ax_kernel_guard::NoPreemptIrqSave;
-use rdrive::{DriverGeneric, PlatformDevice, probe::OnProbeError};
-#[cfg(feature = "pci")]
-use virtio_drivers::transport::DeviceType;
+use ax_sync::RawSpinLock;
+use bitflags::bitflags;
+use dma_api::{
+    DmaCoherency, DmaConstraints, DmaDeviceInfo, DmaDirection, DmaDomainId, InFlightDma,
+};
+use mmio_api::MmioRaw;
+use rdif_block::{
+    BatchSubmitDisposition, BatchSubmitResult, BlkError, BlockController, CompletedRequest,
+    CompletionSink, ControlEvent, ControllerEvent, ControllerState, ControllerUpdate, DeviceInfo,
+    DriverGeneric, HardIrqHandler, HardwareQueue, IrqAck, IrqEndpoint, IrqQueueMask,
+    OwnedRequestBatch, QueueInfo, QueueLimits, RequestId, RequestOp, SubmissionSink,
+    validate_owned_request,
+};
+use rdrive::{PlatformDevice, probe::OnProbeError};
 use virtio_drivers::{
     Error as VirtIoError,
-    device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk},
-    transport::{InterruptStatus, Transport},
+    queue::VirtQueue,
+    transport::{DeviceStatus, Transport},
 };
 
-use crate::{
-    BindingInfo, binding_info_from_fdt, block::PlatformDeviceBlock, virtio::VirtIoHalImpl,
-};
-#[cfg(feature = "pci")]
-use crate::{PciIrqRequirement, binding_info_from_pci};
+use crate::{binding_info_from_fdt, block::PlatformDeviceBlock, virtio::VirtIoHalImpl};
 
-// Keep one IRQ-driven completion large enough to amortize the interrupt/drain
-// wake cost while preserving the intentionally conservative max_inflight=1.
-const VIRTIO_BLK_DMA_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-const VIRTIO_BLK_QUEUE_ID: usize = 0;
-const VIRTIO_BLK_IRQ_SOURCE_ID: usize = 0;
+const INTERRUPT_STATUS: usize = 0x60;
+const INTERRUPT_ACK: usize = 0x64;
+const QUEUE_INTERRUPT: u32 = 1;
+const CONFIGURATION_CHANGE_INTERRUPT: u32 = 2;
+const SECTOR_SIZE: usize = 512;
+// An unwritten response must not be mistaken for a successful completion.
+const RESPONSE_UNWRITTEN: u8 = 3;
+const QUEUE_SIZE: usize = 16;
+const RESET_RETRY_DELAY: Duration = Duration::from_millis(1);
 
-#[cfg(feature = "pci")]
-model_register!(
-    name: "VirtIO Block",
-    level: ProbeLevel::PostKernel,
-    priority: ProbePriority::DEFAULT,
-    probe_kinds: &[ProbeKind::Pci {
-        on_probe: probe_pci,
-    }],
-);
-
-#[cfg(feature = "pci")]
-fn probe_pci(mut probe: rdrive::probe::pci::ProbePci<'_>) -> Result<(), OnProbeError> {
-    let transport = crate::pci::take_virtio_transport(probe.endpoint_mut(), DeviceType::Block)?;
-    let info = binding_info_from_pci(probe.info(), PciIrqRequirement::Required)?;
-    register_transport_with_info(probe.into_platform_device(), transport, info)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetState {
+    Running,
+    Resetting,
+    Stopped,
 }
 
-model_register!(
-    name: "VirtIO MMIO Block",
-    level: ProbeLevel::PostKernel,
-    priority: ProbePriority::DEFAULT,
-    probe_kinds: &[ProbeKind::Fdt {
-        compatibles: &["virtio,mmio"],
-        on_probe: probe_fdt,
-    }],
-);
-
-fn probe_fdt(probe: rdrive::register::ProbeFdt<'_>) -> Result<(), OnProbeError> {
-    let (info, plat_dev) = probe.into_parts();
-    let binding_info = binding_info_from_fdt(&info)?;
-    let (ty, transport) = crate::virtio::probe_fdt_mmio_device(&info)?;
-    if ty != DeviceType::Block {
-        return Err(OnProbeError::NotMatch);
-    }
-    register_transport_with_info(plat_dev, transport, binding_info)
-}
-
-pub fn register_transport<T: Transport + 'static>(
-    plat_dev: PlatformDevice,
+// Only task-context control and queue endpoints acquire this lock. The hard
+// IRQ endpoint owns separate interrupt registers and never takes this lock.
+struct TransportControl<T: Transport> {
     transport: T,
-) -> Result<(), OnProbeError> {
-    register_transport_with_info(plat_dev, transport, BindingInfo::empty())
+    state: ResetState,
 }
 
-fn register_transport_with_info<T: Transport + 'static>(
-    plat_dev: PlatformDevice,
-    transport: T,
-    info: BindingInfo,
-) -> Result<(), OnProbeError> {
-    let dev = VirtIoBlkDevice::new(transport)
-        .map_err(|err| OnProbeError::other(format!("failed to initialize virtio-blk: {err:?}")))?;
-    plat_dev.register_block_with_info(
-        BlockDevice {
-            dev: Some(Arc::new(dev)),
-            queue_created: false,
-            irq_handler_taken: false,
-        },
-        info,
-    );
-    log::info!("registered virtio block device");
-    Ok(())
-}
-
-struct VirtIoBlkDevice<T: Transport + 'static> {
-    inner: UnsafeCell<VirtIoBlkInner<T>>,
-    access_active: AtomicBool,
-    irq_ack_pending: AtomicBool,
-    irq_enabled: AtomicBool,
-}
-
-struct VirtIoBlkInner<T: Transport + 'static> {
-    raw: VirtIOBlk<VirtIoHalImpl, T>,
-    inflight: Option<InflightRequest>,
-    next_request_id: usize,
-}
-
-unsafe impl<T: Transport + 'static> Send for VirtIoBlkDevice<T> {}
-unsafe impl<T: Transport + 'static> Sync for VirtIoBlkDevice<T> {}
-
-impl<T: Transport + 'static> VirtIoBlkDevice<T> {
-    fn new(transport: T) -> Result<Self, VirtIoError> {
-        let mut raw = VirtIOBlk::new(transport)?;
-        raw.disable_interrupts();
-        Ok(Self {
-            inner: UnsafeCell::new(VirtIoBlkInner {
-                raw,
-                inflight: None,
-                next_request_id: 1,
-            }),
-            access_active: AtomicBool::new(false),
-            irq_ack_pending: AtomicBool::new(false),
-            irq_enabled: AtomicBool::new(false),
-        })
+impl<T: Transport> TransportControl<T> {
+    fn ensure_running(&self) -> Result<(), BlkError> {
+        if self.state == ResetState::Running {
+            Ok(())
+        } else {
+            Err(BlkError::Io)
+        }
     }
 
-    fn with_task<R>(&self, f: impl FnOnce(&mut VirtIoBlkInner<T>) -> R) -> R {
-        let _irq_guard = NoPreemptIrqSave::new();
-        let _active = VirtioBlkAccessGuard::enter_task(&self.access_active);
-        // SAFETY: `access_active` serializes all mutable access to the raw
-        // transport, and task-side callers keep local IRQ/preemption disabled.
-        let inner = unsafe { &mut *self.inner.get() };
-        self.flush_pending_irq_ack(inner);
-        let ret = f(inner);
-        self.flush_pending_irq_ack(inner);
-        ret
-    }
-
-    fn enable_irq(&self) {
-        self.irq_enabled.store(true, Ordering::Release);
-        self.with_task(|inner| inner.raw.enable_interrupts());
-    }
-
-    fn disable_irq(&self) {
-        self.irq_enabled.store(false, Ordering::Release);
-        self.with_task(|inner| inner.raw.disable_interrupts());
-    }
-
-    fn is_irq_enabled(&self) -> bool {
-        self.irq_enabled.load(Ordering::Acquire)
-    }
-
-    fn handle_irq(&self) -> rdif_block::Event {
-        virtio_blk_irq_event(
-            &self.access_active,
-            &self.irq_ack_pending,
-            self.is_irq_enabled(),
-            || {
-                // SAFETY: `virtio_blk_irq_event` calls this closure only while
-                // holding the IRQ-side access guard.
-                let inner = unsafe { &mut *self.inner.get() };
-                inner.raw.ack_interrupt()
-            },
-        )
-    }
-
-    fn flush_pending_irq_ack(&self, inner: &mut VirtIoBlkInner<T>) {
-        if self.irq_ack_pending.swap(false, Ordering::AcqRel) {
-            let _ = inner.raw.ack_interrupt();
+    fn stop(&mut self) -> ControllerState {
+        if self.state == ResetState::Running {
+            // Serialize descriptor publication and notification against reset.
+            self.state = ResetState::Resetting;
+            self.transport.set_status(DeviceStatus::empty());
+        }
+        if self.state == ResetState::Resetting && self.transport.get_status().is_empty() {
+            // VirtIO 1.2 section 2.4: status zero confirms that the device will
+            // no longer notify or interact with queues until reinitialized.
+            self.state = ResetState::Stopped;
+        }
+        if self.state == ResetState::Stopped {
+            ControllerState::Shutdown
+        } else {
+            ControllerState::RegisterPending {
+                retry_after: RESET_RETRY_DELAY,
+            }
         }
     }
 }
 
-struct BlockDevice<T: Transport + 'static> {
-    dev: Option<Arc<VirtIoBlkDevice<T>>>,
-    queue_created: bool,
-    irq_handler_taken: bool,
+bitflags! {
+    #[derive(Clone, Copy, Debug)]
+    struct BlockFeatures: u64 {
+        const READ_ONLY = 1 << 5;
+        const FLUSH = 1 << 9;
+        const VERSION_1 = 1 << 32;
+    }
 }
 
-impl<T: Transport + 'static> DriverGeneric for BlockDevice<T> {
+struct RawBlock<T: Transport> {
+    control: Arc<RawSpinLock<TransportControl<T>>>,
+    queue: ManuallyDrop<VirtQueue<VirtIoHalImpl, QUEUE_SIZE>>,
+    device: DeviceInfo,
+    flush_supported: bool,
+}
+
+impl<T: Transport> RawBlock<T> {
+    fn new(mut transport: T) -> Result<Self, VirtIoError> {
+        let features = transport
+            .begin_init(BlockFeatures::READ_ONLY | BlockFeatures::FLUSH | BlockFeatures::VERSION_1);
+        // Legacy MMIO has no FEATURES_OK handshake. Modern devices may reject
+        // the proposed subset; do not configure queues or publish a controller
+        // until the device has accepted it (VirtIO 1.2 section 3.1).
+        if !transport.requires_legacy_layout() {
+            let status = transport.get_status();
+            if !status.contains(DeviceStatus::FEATURES_OK) {
+                transport.set_status(status | DeviceStatus::FAILED);
+                return Err(VirtIoError::Unsupported);
+            }
+        }
+        let capacity = transport.read_consistent(|| {
+            let low: u32 = transport.read_config_space(0)?;
+            let high: u32 = transport.read_config_space(4)?;
+            Ok(u64::from(low) | (u64::from(high) << 32))
+        })?;
+        let queue = VirtQueue::new(&mut transport, 0, false, false)?;
+        transport.finish_init();
+        let mut device = DeviceInfo::new(capacity, SECTOR_SIZE);
+        device.read_only = features.contains(BlockFeatures::READ_ONLY);
+        device.name = Some("virtio-blk");
+        Ok(Self {
+            control: Arc::new(RawSpinLock::new(TransportControl {
+                transport,
+                state: ResetState::Running,
+            })),
+            queue: ManuallyDrop::new(queue),
+            device,
+            flush_supported: features.contains(BlockFeatures::FLUSH),
+        })
+    }
+
+    fn submit(
+        &mut self,
+        op: RequestOp,
+        header: &[u8; 16],
+        response: &mut [u8; 1],
+        data: Option<&InFlightDma>,
+    ) -> Result<u16, VirtIoError> {
+        // SAFETY: The pending request owns this in-flight backing before add()
+        // can publish its descriptor. The queue task does not access its bytes.
+        let buffer = data.map(|data| unsafe {
+            slice::from_raw_parts_mut(data.cpu_ptr().as_ptr(), data.len().get())
+        });
+        let token = match (op, buffer) {
+            (RequestOp::Read, Some(buffer)) => {
+                // SAFETY: The pending request keeps all three buffers at their
+                // original addresses until this token is consumed.
+                unsafe { self.queue.add(&[header], &mut [buffer, response])? }
+            }
+            (RequestOp::Write, Some(buffer)) => {
+                // SAFETY: The pending request keeps all three buffers at their
+                // original addresses until this token is consumed.
+                unsafe { self.queue.add(&[header, buffer], &mut [response])? }
+            }
+            (RequestOp::Flush, None) => {
+                // SAFETY: The pending request retains both boxed buffers until
+                // the matching used-ring entry is reclaimed.
+                unsafe { self.queue.add(&[header], &mut [response])? }
+            }
+            _ => return Err(VirtIoError::InvalidParam),
+        };
+        Ok(token)
+    }
+
+    fn complete(&mut self, pending: &mut PendingRequest) -> Result<(), VirtIoError> {
+        // SAFETY: The sole queue owner has observed this exact used-ring token;
+        // each slice uses the same boxed storage or DMA backing as at add().
+        unsafe {
+            match pending.op {
+                RequestOp::Read => {
+                    let data = pending.data.as_ref().ok_or(VirtIoError::InvalidParam)?;
+                    let buffer =
+                        slice::from_raw_parts_mut(data.cpu_ptr().as_ptr(), data.len().get());
+                    self.queue.pop_used(
+                        pending.token,
+                        &[&pending.header[..]],
+                        &mut [buffer, &mut pending.response[..]],
+                    )?;
+                }
+                RequestOp::Write => {
+                    let data = pending.data.as_ref().ok_or(VirtIoError::InvalidParam)?;
+                    let buffer = slice::from_raw_parts(data.cpu_ptr().as_ptr(), data.len().get());
+                    self.queue.pop_used(
+                        pending.token,
+                        &[&pending.header[..], buffer],
+                        &mut [&mut pending.response[..]],
+                    )?;
+                }
+                RequestOp::Flush => {
+                    self.queue.pop_used(
+                        pending.token,
+                        &[&pending.header[..]],
+                        &mut [&mut pending.response[..]],
+                    )?;
+                }
+            }
+        }
+        match pending.response[0] {
+            0 => Ok(()),
+            2 => Err(VirtIoError::Unsupported),
+            _ => Err(VirtIoError::IoError),
+        }
+    }
+}
+
+impl<T: Transport> Drop for RawBlock<T> {
+    fn drop(&mut self) {
+        // Drop must never spin waiting for hardware. If the single reset
+        // observation is inconclusive, ManuallyDrop retains the DMA rings.
+        if self.control.lock().stop() == ControllerState::Shutdown {
+            // SAFETY: Reset completion was observed under the same lock that
+            // excludes publication. No endpoint can restart this transport.
+            unsafe { ManuallyDrop::drop(&mut self.queue) };
+        }
+    }
+}
+
+pub fn register_fdt_transport<T: Transport + Send + 'static>(
+    info: &rdrive::register::FdtInfo<'_>,
+    platform: PlatformDevice,
+    transport: T,
+) -> Result<(), OnProbeError> {
+    let binding = binding_info_from_fdt(info)?;
+    if binding.irq().is_none() {
+        return Err(OnProbeError::other("virtio-blk requires a wired IRQ"));
+    }
+    let dma_coherency = crate::binding_resolver::dma_coherency_from_fdt(info);
+    if dma_coherency != DmaCoherency::Coherent {
+        return Err(OnProbeError::other(
+            "virtio-blk requires coherent DMA until its HAL provides cache maintenance",
+        ));
+    }
+    let reg = info
+        .node
+        .regs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| OnProbeError::other("virtio-blk MMIO registers missing"))?;
+    let irq_regs =
+        axklib::mmio::ioremap_raw(reg.address.into(), reg.size.unwrap_or(0x1000) as usize)
+            .map_err(|err| OnProbeError::other(format!("virtio-blk IRQ MMIO mapping: {err:?}")))?;
+    if irq_regs.size() < INTERRUPT_ACK + size_of::<u32>() {
+        return Err(OnProbeError::other("virtio-blk MMIO registers too short"));
+    }
+    let raw = RawBlock::<T>::new(transport)
+        .map_err(|err| OnProbeError::other(format!("virtio-blk initialization: {err:?}")))?;
+    let device = raw.device;
+    let dma = DmaDeviceInfo::new(
+        DmaDomainId::Direct,
+        dma_coherency,
+        DmaConstraints::new(u64::MAX),
+    );
+    let controller = VirtioBlockController {
+        control: Arc::clone(&raw.control),
+        raw: Some(raw),
+        irq_regs: Some(irq_regs),
+        device,
+        dma,
+        started: false,
+    };
+    platform.register_block_with_info(controller, binding);
+    Ok(())
+}
+
+// Start transfers the bootstrap queue and IRQ mapping to their sole owners.
+struct VirtioBlockController<T: Transport + Send + 'static> {
+    raw: Option<RawBlock<T>>,
+    irq_regs: Option<MmioRaw>,
+    device: DeviceInfo,
+    dma: DmaDeviceInfo,
+    started: bool,
+    control: Arc<RawSpinLock<TransportControl<T>>>,
+}
+
+impl<T: Transport + Send + 'static> DriverGeneric for VirtioBlockController<T> {
     fn name(&self) -> &str {
         "virtio-blk"
     }
 }
 
-impl<T: Transport + 'static> rdif_block::Interface for BlockDevice<T> {
-    fn device_info(&self) -> rdif_block::DeviceInfo {
-        let blocks = self
-            .dev
-            .as_ref()
-            .map(|dev| dev.with_task(|inner| inner.raw.capacity()))
-            .unwrap_or(0);
-        rdif_block::DeviceInfo {
-            name: Some("virtio-blk"),
-            ..rdif_block::DeviceInfo::new(blocks, SECTOR_SIZE)
-        }
+impl<T: Transport + Send + 'static> BlockController for VirtioBlockController<T> {
+    fn device_info(&self) -> DeviceInfo {
+        self.device
     }
 
-    fn queue_limits(&self) -> rdif_block::QueueLimits {
-        rdif_block::QueueLimits {
-            dma_domain: dma_api::DmaDomainId::legacy_global(),
-            dma_mask: u64::MAX,
-            dma_alignment: 0x1000,
-            max_inflight: 1,
-            max_blocks_per_request: (VIRTIO_BLK_DMA_BUFFER_SIZE / SECTOR_SIZE) as u32,
-            max_segments: 1,
-            max_segment_size: VIRTIO_BLK_DMA_BUFFER_SIZE,
-            supported_flags: rdif_block::RequestFlags::NONE,
-            supports_flush: false,
-            supports_discard: false,
-            supports_write_zeroes: false,
-        }
+    fn max_io_queues(&self) -> usize {
+        1
     }
 
-    fn create_queue(&mut self) -> Option<Box<dyn rdif_block::IQueue>> {
-        if self.queue_created {
-            return None;
+    fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
+        match event {
+            ControllerEvent::Start { target_queues } if target_queues > 0 && !self.started => {
+                self.control.lock().ensure_running()?;
+                let raw = self.raw.take().ok_or(BlkError::InvalidRequest)?;
+                let regs = self.irq_regs.take().ok_or(BlkError::InvalidRequest)?;
+                self.started = true;
+                let mut limits = QueueLimits::simple(SECTOR_SIZE, self.dma);
+                limits.supports_flush = raw.flush_supported;
+                let queue = VirtioBlockQueue {
+                    raw: Some(raw),
+                    pending: None,
+                    next_id: 0,
+                    info: QueueInfo {
+                        id: 0,
+                        device: self.device,
+                        limits,
+                    },
+                };
+                let irq = IrqEndpoint::new(
+                    0,
+                    IrqQueueMask::from_queue(0),
+                    Box::new(VirtioBlockIrq { regs }),
+                );
+                Ok(ControllerUpdate::with_resources(
+                    ControllerState::Ready,
+                    vec![Box::new(queue)],
+                    vec![irq],
+                )
+                .with_device_info(self.device))
+            }
+            ControllerEvent::OnlineSmp { .. } | ControllerEvent::Rearm { source_id: 0 }
+                if self.started =>
+            {
+                self.control.lock().ensure_running()?;
+                Ok(ControllerUpdate::state(ControllerState::Ready))
+            }
+            ControllerEvent::Irq(event) if self.started => {
+                if event.bits() & u64::from(CONFIGURATION_CHANGE_INTERRUPT) == 0 {
+                    self.control.lock().ensure_running()?;
+                    return Ok(ControllerUpdate::state(ControllerState::Ready));
+                }
+                // The shared block runtime freezes geometry once queues become
+                // ready. Stop the transport instead of continuing with stale
+                // capacity after an unsupported live configuration change.
+                self.started = false;
+                Ok(ControllerUpdate::state(self.control.lock().stop()))
+            }
+            ControllerEvent::QuiesceIrqs
+            | ControllerEvent::Watchdog { .. }
+            | ControllerEvent::Shutdown => {
+                // Quiescing IRQs starts the reset as well: VirtIO has no
+                // transport-wide interrupt mask. The runtime waits for this
+                // transition before asking queues to return their DMA backing.
+                self.started = false;
+                Ok(ControllerUpdate::state(self.control.lock().stop()))
+            }
+            ControllerEvent::RegisterRetry
+                if self.control.lock().state == ResetState::Resetting =>
+            {
+                Ok(ControllerUpdate::state(self.control.lock().stop()))
+            }
+            _ => Err(BlkError::InvalidRequest),
         }
-        self.dev.as_ref().map(|dev| {
-            self.queue_created = true;
-            Box::new(BlockQueue {
-                id: 0,
-                raw: Arc::clone(dev),
-            }) as _
-        })
-    }
-
-    fn enable_irq(&self) {
-        if let Some(dev) = &self.dev {
-            dev.enable_irq();
-        }
-    }
-
-    fn disable_irq(&self) {
-        if let Some(dev) = &self.dev {
-            dev.disable_irq();
-        }
-    }
-
-    fn is_irq_enabled(&self) -> bool {
-        self.dev.as_ref().is_some_and(|dev| dev.is_irq_enabled())
-    }
-
-    fn irq_sources(&self) -> rdif_block::IrqSourceList {
-        if self.dev.is_none() {
-            return vec![];
-        }
-        let mut queues = rdif_block::IdList::none();
-        queues.insert(VIRTIO_BLK_QUEUE_ID);
-        vec![rdif_block::IrqSourceInfo::new(
-            VIRTIO_BLK_IRQ_SOURCE_ID,
-            queues,
-        )]
-    }
-
-    fn take_irq_handler(&mut self, source_id: usize) -> Option<rdif_block::BIrqHandler> {
-        if source_id != VIRTIO_BLK_IRQ_SOURCE_ID || self.irq_handler_taken {
-            return None;
-        }
-        self.irq_handler_taken = true;
-        self.dev.as_ref().map(|dev| {
-            Box::new(VirtioBlkIrqHandler {
-                inner: Arc::clone(dev),
-            }) as _
-        })
     }
 }
 
-struct BlockQueue<T: Transport + 'static> {
-    id: usize,
-    raw: Arc<VirtIoBlkDevice<T>>,
+// One IRQ registration owns this endpoint. Only it reads and clears the
+// interrupt status; the queue task accesses other registers.
+struct VirtioBlockIrq {
+    regs: MmioRaw,
 }
 
-// SAFETY: Submitted request segments are retained only in the single in-flight
-// slot and are released when the matching `poll_request` reports a terminal
-// result.
-unsafe impl<T: Transport + 'static> rdif_block::IQueue for BlockQueue<T> {
-    fn id(&self) -> usize {
-        self.id
-    }
-
-    fn info(&self) -> rdif_block::QueueInfo {
-        let blocks = self.raw.with_task(|inner| inner.raw.capacity());
-        rdif_block::QueueInfo {
-            id: self.id,
-            device: rdif_block::DeviceInfo {
-                name: Some("virtio-blk"),
-                ..rdif_block::DeviceInfo::new(blocks, SECTOR_SIZE)
+impl HardIrqHandler for VirtioBlockIrq {
+    fn ack(&mut self) -> IrqAck {
+        let status: u32 = self.regs.read(INTERRUPT_STATUS);
+        if status == 0 {
+            return IrqAck::spurious(0);
+        }
+        self.regs.write(INTERRUPT_ACK, status);
+        IrqAck::cleared(
+            if status & QUEUE_INTERRUPT != 0 {
+                IrqQueueMask::from_queue(0)
+            } else {
+                IrqQueueMask::none()
             },
-            limits: rdif_block::QueueLimits {
-                dma_domain: dma_api::DmaDomainId::legacy_global(),
-                dma_mask: u64::MAX,
-                dma_alignment: 0x1000,
-                max_inflight: 1,
-                max_blocks_per_request: (VIRTIO_BLK_DMA_BUFFER_SIZE / SECTOR_SIZE) as u32,
-                max_segments: 1,
-                max_segment_size: VIRTIO_BLK_DMA_BUFFER_SIZE,
-                supported_flags: rdif_block::RequestFlags::NONE,
-                supports_flush: false,
-                supports_discard: false,
-                supports_write_zeroes: false,
-            },
-        }
-    }
-
-    fn submit_request(
-        &mut self,
-        request: rdif_block::Request<'_>,
-    ) -> Result<rdif_block::RequestId, rdif_block::BlkError> {
-        rdif_block::validate_request(self.info(), &request)?;
-        self.raw.with_task(|inner| inner.submit_request(request))
-    }
-
-    fn poll_request(
-        &mut self,
-        request: rdif_block::RequestId,
-    ) -> Result<rdif_block::RequestStatus, rdif_block::BlkError> {
-        self.raw.with_task(|inner| inner.poll_request(request))
+            ControlEvent::new(0, u64::from(status & CONFIGURATION_CHANGE_INTERRUPT)),
+        )
     }
 }
 
-impl<T: Transport + 'static> VirtIoBlkInner<T> {
-    fn submit_request(
-        &mut self,
-        request: rdif_block::Request<'_>,
-    ) -> Result<rdif_block::RequestId, rdif_block::BlkError> {
-        if self.inflight.is_some() {
-            return Err(rdif_block::BlkError::Retry);
-        }
-
-        let op = match request.op {
-            rdif_block::RequestOp::Read => InflightOp::Read,
-            rdif_block::RequestOp::Write => InflightOp::Write,
-            rdif_block::RequestOp::Flush
-            | rdif_block::RequestOp::Discard
-            | rdif_block::RequestOp::WriteZeroes => return Err(rdif_block::BlkError::NotSupported),
-        };
-        let segment = request
-            .segments
-            .first()
-            .copied()
-            .ok_or(rdif_block::BlkError::InvalidRequest)?;
-        let mut buffer = InflightBuffer::from_segment(segment);
-        let mut storage = Box::<InflightStorage>::default();
-        let token = match op {
-            InflightOp::Read => {
-                // SAFETY: RDIF requires request segments to remain valid and
-                // exclusively owned until the matching `poll_request` returns a
-                // terminal result.
-                unsafe {
-                    self.raw.read_blocks_nb(
-                        request.lba as usize,
-                        &mut storage.req,
-                        buffer.as_mut_slice(),
-                        &mut storage.resp,
-                    )
-                }
-            }
-            InflightOp::Write => {
-                // SAFETY: See the read path above; virtio retains the segment
-                // until `complete_write_blocks` consumes the descriptor.
-                unsafe {
-                    self.raw.write_blocks_nb(
-                        request.lba as usize,
-                        &mut storage.req,
-                        buffer.as_slice(),
-                        &mut storage.resp,
-                    )
-                }
-            }
-        }
-        .map_err(map_virtio_err_to_blk_err)?;
-
-        let request_id = self.alloc_request_id();
-        self.inflight = Some(InflightRequest {
-            id: request_id,
-            token,
-            op,
-            storage,
-            buffer,
-        });
-        Ok(request_id)
-    }
-
-    fn poll_request(
-        &mut self,
-        request: rdif_block::RequestId,
-    ) -> Result<rdif_block::RequestStatus, rdif_block::BlkError> {
-        let inflight_key = self
-            .inflight
-            .as_ref()
-            .map(|inflight| (inflight.id, inflight.token));
-        if classify_completion_poll(inflight_key, request, self.raw.peek_used())?
-            == rdif_block::RequestStatus::Pending
-        {
-            return Ok(rdif_block::RequestStatus::Pending);
-        }
-
-        let mut inflight = self
-            .inflight
-            .take()
-            .ok_or(rdif_block::BlkError::InvalidRequest)?;
-        let result = match inflight.op {
-            InflightOp::Read => {
-                // SAFETY: `inflight` owns the same request metadata and buffer
-                // raw parts that were passed to `read_blocks_nb`.
-                unsafe {
-                    self.raw.complete_read_blocks(
-                        inflight.token,
-                        &inflight.storage.req,
-                        inflight.buffer.as_mut_slice(),
-                        &mut inflight.storage.resp,
-                    )
-                }
-            }
-            InflightOp::Write => {
-                // SAFETY: `inflight` owns the same request metadata and buffer
-                // raw parts that were passed to `write_blocks_nb`.
-                unsafe {
-                    self.raw.complete_write_blocks(
-                        inflight.token,
-                        &inflight.storage.req,
-                        inflight.buffer.as_slice(),
-                        &mut inflight.storage.resp,
-                    )
-                }
-            }
-        };
-        result.map_err(map_virtio_completion_err_to_blk_err)?;
-        Ok(rdif_block::RequestStatus::Complete)
-    }
-
-    fn alloc_request_id(&mut self) -> rdif_block::RequestId {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        rdif_block::RequestId::new(id)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InflightOp {
-    Read,
-    Write,
-}
-
-struct InflightRequest {
-    id: rdif_block::RequestId,
+struct PendingRequest {
+    id: RequestId,
     token: u16,
-    op: InflightOp,
-    storage: Box<InflightStorage>,
-    buffer: InflightBuffer,
+    op: RequestOp,
+    header: Box<[u8; 16]>,
+    response: Box<[u8; 1]>,
+    data: Option<InFlightDma>,
 }
 
-#[derive(Default)]
-struct InflightStorage {
-    req: BlkReq,
-    resp: BlkResp,
-}
-
-impl InflightRequest {
-    #[cfg(test)]
-    fn req_addr(&self) -> usize {
-        core::ptr::addr_of!(self.storage.req) as usize
-    }
-
-    #[cfg(test)]
-    fn resp_addr(&self) -> usize {
-        core::ptr::addr_of!(self.storage.resp) as usize
-    }
-}
-
-impl InflightStorage {
-    #[cfg(test)]
-    fn req_addr(&self) -> usize {
-        core::ptr::addr_of!(self.req) as usize
-    }
-
-    #[cfg(test)]
-    fn resp_addr(&self) -> usize {
-        core::ptr::addr_of!(self.resp) as usize
-    }
-}
-
-#[derive(Clone, Copy)]
-struct InflightBuffer {
-    virt: *mut u8,
-    len: usize,
-}
-
-impl InflightBuffer {
-    fn from_segment(segment: rdif_block::Segment<'_>) -> Self {
-        Self {
-            virt: segment.virt,
-            len: segment.len,
-        }
-    }
-
-    unsafe fn as_slice(&self) -> &[u8] {
-        // SAFETY: Callers uphold the RDIF request lifetime until completion.
-        unsafe { core::slice::from_raw_parts(self.virt.cast_const(), self.len) }
-    }
-
-    unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: Callers uphold exclusive RDIF request ownership until
-        // completion.
-        unsafe { core::slice::from_raw_parts_mut(self.virt, self.len) }
-    }
-}
-
-struct VirtioBlkIrqHandler<T: Transport + 'static> {
-    inner: Arc<VirtIoBlkDevice<T>>,
-}
-
-impl<T: Transport + 'static> rdif_block::IrqHandler for VirtioBlkIrqHandler<T> {
-    fn handle_irq(&mut self) -> rdif_block::Event {
-        self.inner.handle_irq()
-    }
-}
-
-struct VirtioBlkAccessGuard<'a>(&'a AtomicBool);
-
-impl<'a> VirtioBlkAccessGuard<'a> {
-    fn enter_task(active: &'a AtomicBool) -> Self {
-        Self::enter(active)
-    }
-
-    fn try_enter_irq(active: &'a AtomicBool) -> Option<Self> {
-        active
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-            .then_some(Self(active))
-    }
-
-    fn enter(active: &'a AtomicBool) -> Self {
-        while active
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            spin_loop();
-        }
-        Self(active)
-    }
-}
-
-impl Drop for VirtioBlkAccessGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-fn virtio_blk_irq_event(
-    access_active: &AtomicBool,
-    irq_ack_pending: &AtomicBool,
-    irq_enabled: bool,
-    ack_status: impl FnOnce() -> InterruptStatus,
-) -> rdif_block::Event {
-    if !irq_enabled {
-        return rdif_block::Event::none();
-    }
-    let Some(_active) = VirtioBlkAccessGuard::try_enter_irq(access_active) else {
-        irq_ack_pending.store(true, Ordering::Release);
-        return rdif_block::Event::none();
+fn validate_request_direction(request: &rdif_block::OwnedRequest) -> Result<(), BlkError> {
+    let Some(data) = request.data.as_ref() else {
+        return Ok(());
     };
-    irq_ack_pending.store(false, Ordering::Release);
-    virtio_blk_event_from_irq_status(true, ack_status())
-}
-
-fn virtio_blk_event_from_irq_status(
-    irq_enabled: bool,
-    status: InterruptStatus,
-) -> rdif_block::Event {
-    if !irq_enabled || !status.contains(InterruptStatus::QUEUE_INTERRUPT) {
-        return rdif_block::Event::none();
-    }
-    rdif_block::Event::from_queue_bits(1 << VIRTIO_BLK_QUEUE_ID)
-}
-
-fn classify_completion_poll(
-    inflight: Option<(rdif_block::RequestId, u16)>,
-    request: rdif_block::RequestId,
-    used_token: Option<u16>,
-) -> Result<rdif_block::RequestStatus, rdif_block::BlkError> {
-    let Some((inflight_request, inflight_token)) = inflight else {
-        return Err(rdif_block::BlkError::InvalidRequest);
+    let matches_operation = match request.op {
+        RequestOp::Read => matches!(
+            data.direction(),
+            DmaDirection::FromDevice | DmaDirection::Bidirectional
+        ),
+        RequestOp::Write => matches!(
+            data.direction(),
+            DmaDirection::ToDevice | DmaDirection::Bidirectional
+        ),
+        RequestOp::Flush => false,
     };
-    if inflight_request != request {
-        return Err(rdif_block::BlkError::InvalidRequest);
-    }
-    if used_token == Some(inflight_token) {
-        Ok(rdif_block::RequestStatus::Complete)
+    if matches_operation {
+        Ok(())
     } else {
-        Ok(rdif_block::RequestStatus::Pending)
+        Err(BlkError::InvalidRequest)
     }
 }
 
-fn map_virtio_err_to_blk_err(err: VirtIoError) -> rdif_block::BlkError {
-    match err {
-        VirtIoError::QueueFull | VirtIoError::NotReady => rdif_block::BlkError::Retry,
-        VirtIoError::WrongToken
-        | VirtIoError::ConfigSpaceTooSmall
-        | VirtIoError::ConfigSpaceMissing => rdif_block::BlkError::Other("bad internal state"),
-        VirtIoError::AlreadyUsed => rdif_block::BlkError::Other("already exists"),
-        VirtIoError::InvalidParam => rdif_block::BlkError::InvalidRequest,
-        VirtIoError::DmaError => rdif_block::BlkError::NoMemory,
-        VirtIoError::IoError => rdif_block::BlkError::Io,
-        VirtIoError::Unsupported => rdif_block::BlkError::NotSupported,
-        VirtIoError::SocketDeviceError(_) => rdif_block::BlkError::Other("socket error"),
-    }
+// One task owns the queue and in-flight backing. The IRQ endpoint never
+// accesses request memory; the transport is shared under the control lock.
+struct VirtioBlockQueue<T: Transport + Send + 'static> {
+    raw: Option<RawBlock<T>>,
+    pending: Option<PendingRequest>,
+    next_id: usize,
+    info: QueueInfo,
 }
 
-fn map_virtio_completion_err_to_blk_err(err: VirtIoError) -> rdif_block::BlkError {
-    match map_virtio_err_to_blk_err(err) {
-        rdif_block::BlkError::Retry => rdif_block::BlkError::Io,
-        err => err,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
-
-    use alloc::boxed::Box;
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    use rdif_block::{BlkError, RequestId, RequestStatus};
-    use virtio_drivers::transport::InterruptStatus;
-
-    use super::{
-        InflightBuffer, InflightOp, InflightRequest, SECTOR_SIZE, VIRTIO_BLK_DMA_BUFFER_SIZE,
-        VirtioBlkAccessGuard, classify_completion_poll, virtio_blk_event_from_irq_status,
-        virtio_blk_irq_event,
-    };
-
-    #[test]
-    fn queue_interrupt_is_required_for_irq_event() {
-        assert!(
-            virtio_blk_event_from_irq_status(true, InterruptStatus::empty()).is_empty(),
-            "shared IRQ callbacks without a virtio queue interrupt must not wake block queues"
-        );
-        assert!(
-            virtio_blk_event_from_irq_status(true, InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT)
-                .is_empty(),
-            "config-only interrupts must not be reported as block completions"
-        );
-        assert!(
-            virtio_blk_event_from_irq_status(false, InterruptStatus::QUEUE_INTERRUPT).is_empty(),
-            "disabled completion IRQs must not report queue readiness"
-        );
-
-        let event = virtio_blk_event_from_irq_status(true, InterruptStatus::QUEUE_INTERRUPT);
-        assert!(event.queues.contains(0));
-        assert!(!event.is_empty());
+impl<T: Transport + Send + 'static> HardwareQueue for VirtioBlockQueue<T> {
+    fn id(&self) -> usize {
+        self.info.id
     }
 
-    #[test]
-    fn busy_task_access_defers_irq_ack_without_ready_event() {
-        let access_active = AtomicBool::new(false);
-        let irq_ack_pending = AtomicBool::new(false);
-        let _task_guard = VirtioBlkAccessGuard::enter_task(&access_active);
-
-        let event = virtio_blk_irq_event(&access_active, &irq_ack_pending, true, || {
-            InterruptStatus::QUEUE_INTERRUPT
-        });
-
-        assert!(event.is_empty());
-        assert!(irq_ack_pending.load(Ordering::Acquire));
+    fn info(&self) -> QueueInfo {
+        self.info
     }
 
-    #[test]
-    fn poll_stays_pending_until_matching_token_is_used() {
-        let request_id = RequestId::new(7);
-        let token = 3;
-
-        assert_eq!(
-            classify_completion_poll(Some((request_id, token)), request_id, None),
-            Ok(RequestStatus::Pending)
-        );
-        assert_eq!(
-            classify_completion_poll(Some((request_id, token)), request_id, Some(token + 1)),
-            Ok(RequestStatus::Pending)
-        );
-        assert_eq!(
-            classify_completion_poll(Some((request_id, token)), request_id, Some(token)),
-            Ok(RequestStatus::Complete)
-        );
-        assert_eq!(
-            classify_completion_poll(Some((request_id, token)), RequestId::new(8), Some(token)),
-            Err(BlkError::InvalidRequest)
-        );
-    }
-
-    #[test]
-    fn submitted_descriptor_storage_must_not_move_into_inflight_slot() {
-        let storage = Box::<super::InflightStorage>::default();
-        let submitted_req_addr = storage.req_addr();
-        let submitted_resp_addr = storage.resp_addr();
-        let inflight = InflightRequest {
-            id: RequestId::new(1),
-            token: 0,
-            op: InflightOp::Read,
-            storage,
-            buffer: InflightBuffer {
-                virt: core::ptr::NonNull::<u8>::dangling().as_ptr(),
-                len: SECTOR_SIZE,
-            },
+    fn submit_batch_owned(
+        &mut self,
+        requests: &mut OwnedRequestBatch,
+        sink: &mut dyn SubmissionSink,
+    ) -> BatchSubmitResult {
+        let Some(raw) = self.raw.as_ref() else {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(BlkError::Io));
         };
-
-        assert_eq!(
-            inflight.req_addr(),
-            submitted_req_addr,
-            "virtio descriptors must keep pointing at the same BlkReq storage until completion"
-        );
-        assert_eq!(
-            inflight.resp_addr(),
-            submitted_resp_addr,
-            "virtio descriptors must keep pointing at the same BlkResp storage until completion"
-        );
+        if let Err(error) = raw.control.lock().ensure_running() {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(error));
+        }
+        if self.pending.is_some() {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::QueueFull);
+        }
+        let Some(request) = requests.front() else {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Continue);
+        };
+        if let Err(error) = validate_owned_request(self.info, request) {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(error));
+        }
+        if let Err(error) = validate_request_direction(request) {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(error));
+        }
+        let mut header = Box::new([0_u8; 16]);
+        let response = Box::new([RESPONSE_UNWRITTEN; 1]);
+        let request_type: u32 = match request.op {
+            RequestOp::Read => 0,
+            RequestOp::Write => 1,
+            RequestOp::Flush => 4,
+        };
+        header[..4].copy_from_slice(&request_type.to_le_bytes());
+        // Flush addresses the whole device and requires sector zero.
+        if request.is_data_op() {
+            header[8..].copy_from_slice(&request.lba.to_le_bytes());
+        }
+        let Some(raw) = self.raw.as_mut() else {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(BlkError::Io));
+        };
+        let control = Arc::clone(&raw.control);
+        let control = control.lock();
+        if let Err(error) = control.ensure_running() {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::Fatal(error));
+        }
+        let descriptors_needed = if request.is_data_op() { 3 } else { 2 };
+        if raw.queue.available_desc() < descriptors_needed {
+            return BatchSubmitResult::new(0, BatchSubmitDisposition::QueueFull);
+        }
+        let mut request = requests
+            .pop_front()
+            .expect("validated front request remains present");
+        // SAFETY: This queue exclusively owns the prepared backing and retains
+        // the in-flight value before publishing its descriptor.
+        let data = request
+            .data
+            .take()
+            .map(|data| unsafe { data.into_in_flight() });
+        let mut pending = PendingRequest {
+            id: RequestId::new(self.next_id),
+            token: 0,
+            op: request.op,
+            header,
+            response,
+            data,
+        };
+        let token = match raw.submit(
+            pending.op,
+            &pending.header,
+            &mut pending.response,
+            pending.data.as_ref(),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                // VirtQueue::add returns errors before advancing the available
+                // ring, so this backing was never exposed to the device.
+                request.data = pending.data.take().map(|data| {
+                    // SAFETY: add() failed before publishing a descriptor;
+                    // hardware has no path to this backing.
+                    unsafe { data.complete_after_quiesce() }
+                        .into_cpu_buffer()
+                        .prepare_for_device()
+                });
+                requests.push_front(request);
+                let disposition = if error == VirtIoError::QueueFull {
+                    BatchSubmitDisposition::QueueFull
+                } else {
+                    BatchSubmitDisposition::Fatal(BlkError::Io)
+                };
+                return BatchSubmitResult::new(0, disposition);
+            }
+        };
+        pending.token = token;
+        let id = pending.id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending = Some(pending);
+        drop(control);
+        sink.accepted(id);
+        BatchSubmitResult::new(1, BatchSubmitDisposition::Continue)
     }
 
-    #[test]
-    fn irq_driven_path_uses_large_requests_to_amortize_completion_wakes() {
-        assert!(
-            VIRTIO_BLK_DMA_BUFFER_SIZE >= 4 * 1024 * 1024,
-            "max_inflight=1 IRQ-driven completion needs large request chunks"
-        );
+    fn commit_submissions(&mut self) -> Result<(), BlkError> {
+        let raw = self.raw.as_mut().ok_or(BlkError::Io)?;
+        let mut control = raw.control.lock();
+        control.ensure_running()?;
+        if raw.queue.should_notify() {
+            control.transport.notify(0);
+        }
+        Ok(())
+    }
+
+    fn drain_completions(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
+        let Some(raw) = self.raw.as_mut() else {
+            return Err(BlkError::Io);
+        };
+        let Some(pending) = self.pending.as_mut() else {
+            return Ok(());
+        };
+        match raw.queue.peek_used() {
+            None => return Ok(()),
+            Some(token) if token != pending.token => return Err(BlkError::Io),
+            Some(_) => {}
+        }
+        let control = Arc::clone(&raw.control);
+        let control = control.lock();
+        control.ensure_running()?;
+        let result = raw.complete(pending);
+        if !matches!(
+            result,
+            Ok(()) | Err(VirtIoError::IoError | VirtIoError::Unsupported)
+        ) {
+            return Err(BlkError::Io);
+        }
+        let pending = self
+            .pending
+            .take()
+            .expect("completion still owns pending request");
+        // SAFETY: pop_used consumed the matching token; hardware can no longer
+        // access this request's data, including when its response reported I/O failure.
+        let data = pending
+            .data
+            .map(|data| unsafe { data.complete_after_quiesce() });
+        drop(control);
+        sink.complete(CompletedRequest::new(
+            pending.id,
+            result.map_err(|_| BlkError::Io),
+            data,
+        ));
+        Ok(())
+    }
+
+    fn shutdown(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
+        if let Some(raw) = self.raw.as_ref()
+            && raw.control.lock().state != ResetState::Stopped
+        {
+            return Err(BlkError::TimedOut);
+        }
+        // A reset invalidates the used ring. Do not fabricate a used token or
+        // call pop_used for an aborted request. VirtIoHalImpl uses direct
+        // mappings (unshare is a no-op), so no bounce mappings need unwinding.
+        self.raw.take();
+        if let Some(pending) = self.pending.take() {
+            // SAFETY: The controller confirmed reset before queue teardown;
+            // publication is permanently disabled by the shared reset state.
+            let data = pending
+                .data
+                .map(|data| unsafe { data.complete_after_quiesce() });
+            sink.complete(CompletedRequest::new(pending.id, Err(BlkError::Io), data));
+        }
+        Ok(())
+    }
+}
+
+impl<T: Transport + Send + 'static> Drop for VirtioBlockQueue<T> {
+    fn drop(&mut self) {
+        let stopped = self
+            .raw
+            .as_ref()
+            .is_none_or(|raw| raw.control.lock().stop() == ControllerState::Shutdown);
+        if let Some(pending) = self.pending.take() {
+            if stopped {
+                // SAFETY: The reset read-back above proves that no DMA can
+                // reach this backing, and no endpoint can restart the device.
+                drop(
+                    pending
+                        .data
+                        .map(|data| unsafe { data.complete_after_quiesce() }),
+                );
+            } else {
+                // A failed reset retains request storage as well as rings.
+                mem::forget(pending);
+            }
+        }
+        // RawBlock retains the rings unless reset completion is confirmed.
     }
 }

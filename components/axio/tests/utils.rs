@@ -2,7 +2,7 @@
 
 use std::{fmt, io::BorrowedBuf, mem::MaybeUninit};
 
-use ax_io::{Empty, Error, Repeat, SeekFrom, Sink, empty, prelude::*, repeat, sink};
+use ax_io::{Error, SeekFrom, empty, prelude::*, repeat, sink};
 
 struct ErrorDisplay;
 
@@ -56,32 +56,32 @@ fn empty_reads() {
     );
 
     let buf: &mut [MaybeUninit<_>] = &mut [];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit()];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     Read::by_ref(&mut e).read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [MaybeUninit<_>] = &mut [];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     e.read_buf_exact(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit()];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     assert_eq!(
         e.read_buf_exact(buf.unfilled()).unwrap_err(),
         Error::UnexpectedEof
@@ -89,7 +89,7 @@ fn empty_reads() {
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     assert_eq!(
         e.read_buf_exact(buf.unfilled()).unwrap_err(),
         Error::UnexpectedEof
@@ -97,7 +97,7 @@ fn empty_reads() {
     assert_eq!(buf.len(), 0);
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
-    let mut buf: BorrowedBuf<'_> = buf.into();
+    let mut buf: BorrowedBuf<'_, u8> = buf.into();
     assert_eq!(
         Read::by_ref(&mut e)
             .read_buf_exact(buf.unfilled())
@@ -155,11 +155,4 @@ fn repeat_repeats() {
     let mut b = [0; 1024];
     assert_eq!(r.read(&mut b).unwrap(), 1024);
     assert!(b.iter().all(|b| *b == 4));
-}
-
-#[allow(dead_code)]
-fn const_utils() {
-    const _: Empty = empty();
-    const _: Repeat = repeat(b'c');
-    const _: Sink = sink();
 }

@@ -1,0 +1,309 @@
+//! Physical host-console ownership.
+
+use alloc::{format, sync::Arc, task::Wake};
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Waker;
+
+use anyhow::{Context, Result, anyhow, bail};
+use ax_std::os::arceos::modules::ax_runtime::console::{
+    self, ConsoleLogDropReport, ConsoleLogRecord, ConsoleLogSubscription, TaskConsoleInput,
+    TaskConsoleOutput,
+};
+use std::sync::{Mutex, OnceLock};
+
+use crate::sync::MutexExt;
+use {
+    ax_std::os::arceos::modules::ax_runtime::RuntimeError,
+    ax_std::os::arceos::modules::ax_runtime::RuntimeResult,
+    ax_std::os::arceos::modules::ax_runtime::emergency_console,
+    ax_std::os::arceos::modules::ax_runtime::irq::FixedIrqWorkerSignal,
+};
+
+use ax_std::os::arceos::modules::ax_task::sync::WaitQueue;
+use axvisor::console_mux::HostOutputQueue;
+use axvm::VmLifecycleSubscription;
+
+use super::terminal::TerminalNewlineNormalizer;
+
+const HOST_OUTPUT_QUEUE_CAPACITY: usize = 64 * 1024;
+const HOST_OUTPUT_BATCH_CAPACITY: usize = 512;
+
+struct HostConsole {
+    input: Option<TaskConsoleInput>,
+    logs: Option<ConsoleLogSubscription>,
+}
+
+struct HostOutput {
+    queue: Mutex<HostOutputQueue<HOST_OUTPUT_QUEUE_CAPACITY>>,
+    ready: FixedIrqWorkerSignal,
+    failed: AtomicBool,
+}
+
+struct HostOutputBatch {
+    bytes: [u8; HOST_OUTPUT_BATCH_CAPACITY],
+    len: usize,
+    dropped_bytes: usize,
+}
+
+static HOST_CONSOLE: OnceLock<HostConsole> = OnceLock::new();
+static HOST_CONSOLE_CONFIGURE: Mutex<()> = Mutex::new(());
+static HOST_OUTPUT: HostOutput = HostOutput::new();
+static LIFECYCLE_PROGRESS: WaitQueue = WaitQueue::new();
+
+struct LifecycleWake;
+
+impl Wake for LifecycleWake {
+    fn wake(self: Arc<Self>) {
+        LIFECYCLE_PROGRESS.notify_all();
+    }
+}
+
+/// Takes the sole task-context input and log subscription before any vCPU starts.
+///
+/// The returned runtime output capability is moved into one dedicated task.
+/// Guest/vCPU producers submit through [`HOST_OUTPUT`] in task context.
+/// The worker alone waits for UART backpressure.
+pub(crate) fn configure_host_console() -> Result<()> {
+    let _configure_guard = HOST_CONSOLE_CONFIGURE
+        .lock()
+        .map_err(|_| anyhow!("host console configuration lock was poisoned"))?;
+    if HOST_CONSOLE.get().is_some() {
+        bail!("host console has already been configured");
+    }
+
+    let logs = match console::subscribe_logs() {
+        Ok(logs) => Some(logs),
+        Err(RuntimeError::OperationNotSupported) => None,
+        Err(error) => return Err(error).context("failed to subscribe to host console logs"),
+    };
+    let input = match console::take_input() {
+        Ok(input) => Some(input),
+        Err(RuntimeError::OperationNotSupported) => None,
+        Err(error) => return Err(error).context("failed to take host console input"),
+    };
+    let output = console::output().context("failed to open host console output")?;
+    let host_console = HostConsole { input, logs };
+    std::thread::Builder::new()
+        .name("axvisor-console-output".into())
+        .spawn(move || run_host_output_worker(output))
+        .context("failed to start host console output worker")?;
+    let Ok(()) = HOST_CONSOLE.set(host_console) else {
+        unreachable!("the configuration lock serializes the only HOST_CONSOLE publisher");
+    };
+    Ok(())
+}
+
+fn host_console() -> Option<&'static HostConsole> {
+    HOST_CONSOLE.get()
+}
+
+/// Reads at most one byte from the physical host console.
+///
+/// No other Axvisor component may own the runtime RX subscription.
+pub(crate) fn read_host_byte() -> Option<u8> {
+    let input = host_console()?.input.as_ref()?;
+    let mut item = [console::RxItem::default()];
+    while input.try_read(&mut item) != 0 {
+        if let console::RxItem::Byte { byte, .. } = item[0] {
+            return Some(byte);
+        }
+    }
+    None
+}
+
+pub(crate) fn read_host_log() -> Option<ConsoleLogRecord> {
+    host_log_subscription()?.try_read()
+}
+
+/// Returns `Ok(false)` only when this console has no ordered subscription.
+pub(crate) fn queue_guest_output(tag: u128, bytes: &[u8]) -> RuntimeResult<bool> {
+    let Some(logs) = host_log_subscription() else {
+        return Ok(false);
+    };
+    logs.write_output(tag, bytes)?;
+    Ok(true)
+}
+
+pub(crate) fn take_host_log_drops() -> ConsoleLogDropReport {
+    host_log_subscription().map_or_else(
+        ConsoleLogDropReport::default,
+        ConsoleLogSubscription::dropped,
+    )
+}
+
+fn host_log_subscription() -> Option<&'static ConsoleLogSubscription> {
+    host_console()?.logs.as_ref()
+}
+
+/// Subscribes lifecycle invalidations to the queue used by this host console.
+pub(crate) fn subscribe_lifecycle() -> VmLifecycleSubscription {
+    let waker = host_console()
+        .and_then(|console| {
+            console
+                .input
+                .as_ref()
+                .map(TaskConsoleInput::event_waker)
+                .or_else(|| {
+                    console
+                        .logs
+                        .as_ref()
+                        .map(ConsoleLogSubscription::event_waker)
+                })
+        })
+        .unwrap_or_else(|| Waker::from(Arc::new(LifecycleWake)));
+    crate::manager::manager().subscribe_lifecycle(waker)
+}
+
+/// Sleeps until input/output or a durable lifecycle invalidation is published.
+pub(crate) fn wait_for_host_event(lifecycle: &VmLifecycleSubscription) {
+    let Some(console) = host_console() else {
+        LIFECYCLE_PROGRESS.wait_until(|| lifecycle.has_changed());
+        return;
+    };
+    let logs = host_log_subscription();
+    let result = match (&console.input, logs) {
+        (Some(input), logs) => input.wait_event_until(logs, || lifecycle.has_changed()),
+        (None, Some(logs)) => logs.wait_readable_until(|| lifecycle.has_changed()),
+        (None, None) => {
+            LIFECYCLE_PROGRESS.wait_until(|| lifecycle.has_changed());
+            Ok(())
+        }
+    };
+    if let Err(err) = result {
+        log::error!("runtime console stopped while Axvisor was running: {err}");
+        park_console_task();
+    }
+}
+
+fn park_console_task() -> ! {
+    static STOPPED: ax_std::os::arceos::modules::ax_task::sync::WaitQueue =
+        ax_std::os::arceos::modules::ax_task::sync::WaitQueue::new();
+    loop {
+        STOPPED.wait();
+    }
+}
+
+/// Submits bytes without allocating, sleeping, or touching UART registers.
+pub(crate) fn submit_host_bytes(bytes: &[u8]) {
+    if host_console().is_none() {
+        return;
+    }
+    HOST_OUTPUT.submit(bytes);
+}
+
+/// Builds one non-interleaved host-output transaction in the fixed queue.
+///
+/// `transaction` runs while the queue mutex is held. It must not
+/// allocate, sleep, or call back into a physical console API.
+pub(crate) fn submit_host_transaction(transaction: impl FnOnce(&mut dyn FnMut(&[u8]))) {
+    if host_console().is_none() {
+        return;
+    }
+    HOST_OUTPUT.submit_transaction(transaction);
+}
+
+fn run_host_output_worker(output: TaskConsoleOutput) {
+    let mut terminal = TerminalNewlineNormalizer::new();
+    loop {
+        if let Err(error) = HOST_OUTPUT.ready.wait() {
+            HOST_OUTPUT.failed.store(true, Ordering::Release);
+            let _ = emergency_console::write_fmt(format_args!(
+                "\nAxvisor host console output worker stopped: {error}\n"
+            ));
+            return;
+        }
+        if HOST_OUTPUT.failed.load(Ordering::Acquire) {
+            return;
+        }
+        loop {
+            let batch = HOST_OUTPUT.take_batch();
+            if batch.is_empty() {
+                break;
+            }
+            if let Err(error) = write_host_output_batch(&output, &mut terminal, &batch) {
+                HOST_OUTPUT.failed.store(true, Ordering::Release);
+                let _ = emergency_console::write_fmt(format_args!(
+                    "\r\nAxvisor host console output stopped: {error}\r\n"
+                ));
+                return;
+            }
+        }
+    }
+}
+
+fn write_host_output_batch(
+    output: &TaskConsoleOutput,
+    terminal: &mut TerminalNewlineNormalizer,
+    batch: &HostOutputBatch,
+) -> RuntimeResult {
+    if batch.dropped_bytes != 0 {
+        let report = format!(
+            "\n[Axvisor host console dropped {} queued bytes]\n",
+            batch.dropped_bytes
+        );
+        terminal.write(report.as_bytes(), |bytes| {
+            output.write_all(bytes).map(|_| ())
+        })?;
+    }
+    terminal.write(&batch.bytes[..batch.len], |bytes| {
+        output.write_all(bytes).map(|_| ())
+    })
+}
+
+impl HostOutput {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(HostOutputQueue::new()),
+            ready: FixedIrqWorkerSignal::new(),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn submit(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.submit_transaction(|emit| emit(bytes));
+    }
+
+    fn submit_transaction(&self, transaction: impl FnOnce(&mut dyn FnMut(&[u8]))) {
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
+
+        // No hard-IRQ path uses this queue. The task mutex preserves output
+        // transaction ordering while permitting the producer to be scheduled.
+        let mut queue = self.queue.lock_unpoisoned();
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut transaction_queue = queue.begin_transaction();
+        transaction(&mut |bytes| {
+            transaction_queue.enqueue(bytes);
+        });
+        let submitted = transaction_queue.has_activity();
+        drop(transaction_queue);
+        drop(queue);
+        if submitted {
+            self.ready.notify();
+        }
+    }
+
+    fn take_batch(&self) -> HostOutputBatch {
+        let mut batch = HostOutputBatch {
+            bytes: [0; HOST_OUTPUT_BATCH_CAPACITY],
+            len: 0,
+            dropped_bytes: 0,
+        };
+        let mut queue = self.queue.lock_unpoisoned();
+        batch.dropped_bytes = queue.take_dropped_bytes();
+        batch.len = queue.dequeue(&mut batch.bytes);
+        batch
+    }
+}
+
+impl HostOutputBatch {
+    fn is_empty(&self) -> bool {
+        self.len == 0 && self.dropped_bytes == 0
+    }
+}

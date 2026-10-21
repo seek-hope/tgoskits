@@ -101,8 +101,9 @@ pub(crate) fn ensure_default_build_config_for_target(
                 .unwrap_or_else(|_| "os/StarryOS/configs/board".to_string())
         )
     })?;
+    // This only materializes a missing build config. The command dispatcher owns
+    // snapshot persistence, so implicit config creation cannot alter it here.
     write_board_to_build_config(build_config_path, &board)?;
-    update_snapshot_for_board(workspace_root, &board, build_config_path)?;
     Ok(Some(board))
 }
 
@@ -162,7 +163,7 @@ mod tests {
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-features = ["ax-driver/serial", "ax-driver/virtio-blk"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
 "#,
         );
@@ -219,7 +220,7 @@ log = "Warn"
             "qemu-aarch64",
             r#"
 target = "aarch64-unknown-none-softfloat"
-features = ["qemu"]
+features = ["ax-driver/virtio-net"]
 log = "Warn"
 "#,
         );
@@ -244,7 +245,6 @@ target = "riscv64gc-unknown-none-elf"
 features = [
   "starry-kernel/sg2002",
   "axplat-dyn/thead-mae",
-  "ax-driver/cvsd",
   "ax-driver/serial",
 ]
 log = "Info"
@@ -261,7 +261,7 @@ log = "Info"
     }
 
     #[test]
-    fn ensure_default_build_config_for_target_generates_missing_file_and_updates_snapshot() {
+    fn ensure_default_build_config_for_target_generates_missing_file_without_changing_snapshot() {
         let root = tempdir().unwrap();
         write_workspace(root.path());
         let source = write_board(
@@ -269,7 +269,7 @@ log = "Info"
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-features = ["ax-driver/serial", "ax-driver/virtio-blk"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
 "#,
         );
@@ -298,44 +298,9 @@ log = "Warn"
             fs::read_to_string(source).unwrap()
         );
 
-        let snapshot = StarryCommandSnapshot::load(root.path()).unwrap();
-        assert_eq!(snapshot.arch.as_deref(), Some("riscv64"));
         assert_eq!(
-            snapshot.target.as_deref(),
-            Some("riscv64gc-unknown-none-elf")
+            StarryCommandSnapshot::load(root.path()).unwrap(),
+            existing_snapshot
         );
-        assert_eq!(
-            snapshot.config,
-            Some(PathBuf::from("tmp/custom-starry.toml"))
-        );
-    }
-
-    #[test]
-    fn ensure_default_build_config_for_target_keeps_existing_file() {
-        let root = tempdir().unwrap();
-        write_workspace(root.path());
-        write_board(
-            root.path(),
-            "qemu-aarch64",
-            r#"
-target = "aarch64-unknown-none-softfloat"
-features = ["qemu"]
-log = "Warn"
-"#,
-        );
-
-        let output = root.path().join("tmp/custom-starry.toml");
-        fs::create_dir_all(output.parent().unwrap()).unwrap();
-        fs::write(&output, "log = \"Debug\"\n").unwrap();
-
-        let board = ensure_default_build_config_for_target(
-            root.path(),
-            "aarch64-unknown-none-softfloat",
-            &output,
-        )
-        .unwrap();
-
-        assert!(board.is_none());
-        assert_eq!(fs::read_to_string(&output).unwrap(), "log = \"Debug\"\n");
     }
 }

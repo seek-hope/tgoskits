@@ -96,6 +96,7 @@ pub(crate) fn prepare_grouped_case_assets_sync(
         let result = prepare_grouped_c_subcases_sync(
             arch,
             case,
+            case_rootfs,
             &c_subcases,
             all_c_subcases.len(),
             layout,
@@ -105,20 +106,22 @@ pub(crate) fn prepare_grouped_case_assets_sync(
         result?;
     }
 
-    let timing_stage = timing::TimingStage::new(
-        "qemu-asset-grouped",
-        [
-            ("case", case.display_name.clone()),
-            ("phase", "write-grouped-runner".to_string()),
-        ],
-    );
-    let runner_commands = selected_grouped_runner_commands(case, &c_subcases)?;
-    case_assets::write_grouped_case_runner_script(
-        &layout.overlay_dir,
-        &runner_commands,
-        &config.grouped_runner,
-    )?;
-    timing_stage.finish();
+    if config.grouped_execution.runner().is_some() {
+        let timing_stage = timing::TimingStage::new(
+            "qemu-asset-grouped",
+            [
+                ("case", case.display_name.clone()),
+                ("phase", "write-grouped-runner".to_string()),
+            ],
+        );
+        let runner_commands = selected_grouped_runner_commands(case, &c_subcases)?;
+        case_assets::write_grouped_case_runner(
+            &layout.overlay_dir,
+            &runner_commands,
+            &config.grouped_execution,
+        )?;
+        timing_stage.finish();
+    }
     let timing_stage = timing::TimingStage::new(
         "qemu-asset-grouped",
         [
@@ -126,7 +129,11 @@ pub(crate) fn prepare_grouped_case_assets_sync(
             ("phase", "sync-runtime-deps".to_string()),
         ],
     );
-    crate::rootfs::runtime::sync_runtime_dependencies(&layout.staging_root, &layout.overlay_dir)?;
+    crate::rootfs::runtime::sync_runtime_dependencies(
+        arch,
+        &layout.staging_root,
+        &layout.overlay_dir,
+    )?;
     timing_stage.finish();
     let timing_stage = timing::TimingStage::new(
         "qemu-asset-grouped",
@@ -171,6 +178,10 @@ pub(super) fn selected_grouped_c_subcases<'a>(
             .collect());
     }
 
+    if case.grouped_command_selection == GroupedCommandSelection::PreserveAll {
+        return Ok(subcases);
+    }
+
     let Some(command_names) = direct_usr_bin_command_names(&case.test_commands) else {
         return Ok(subcases);
     };
@@ -213,6 +224,10 @@ pub(super) fn selected_grouped_runner_commands(
     else {
         return Ok(case.test_commands.clone());
     };
+
+    if case.grouped_command_selection == GroupedCommandSelection::PreserveAll {
+        return Ok(case.test_commands.clone());
+    }
 
     let Some(command_names) = direct_usr_bin_command_names(&case.test_commands) else {
         return Ok(case.test_commands.clone());
@@ -325,21 +340,12 @@ pub(super) fn cmake_install_target_names(content: &str) -> BTreeSet<String> {
 pub(super) fn prepare_grouped_c_subcases_sync(
     arch: &str,
     case: &TestQemuCase,
+    case_rootfs: &Path,
     subcases: &[&TestQemuSubcase],
     all_c_subcase_count: usize,
     layout: &case_assets::CaseAssetLayout,
     config: &CaseAssetConfig,
 ) -> anyhow::Result<()> {
-    let timing_stage = timing::TimingStage::new(
-        "grouped-c",
-        [
-            ("case", case.display_name.clone()),
-            ("phase", "find-qemu-user".to_string()),
-        ],
-    );
-    let qemu_runner = find_host_binary_candidates(qemu_user_binary_names(arch)?)?;
-    timing_stage.finish();
-
     let root_prebuild_script = case.case_dir.join(CASE_PREBUILD_SCRIPT_NAME);
     if root_prebuild_script.is_file() {
         let timing_stage = timing::TimingStage::new(
@@ -349,18 +355,21 @@ pub(super) fn prepare_grouped_c_subcases_sync(
                 ("phase", "prebuild".to_string()),
             ],
         );
-        let extra_script_envs = prepare_guest_package_env(config, &layout.staging_root)?;
-        let prebuild_env =
-            prepare_guest_prebuild_env(arch, case, layout, extra_script_envs, config)?;
-        let mut command = build_prebuild_command_with_work_dir(
-            &root_prebuild_script,
-            &case.case_dir,
+        let extra_script_envs = grouped_c_root_prebuild_env(
+            prepare_guest_package_env(config, &layout.staging_root)?,
+            subcases,
+        );
+        let result = run_guest_prebuild(GuestPrebuildRequest {
+            arch,
+            case,
+            case_rootfs,
+            script: &root_prebuild_script,
+            work_dir: &case.case_dir,
             layout,
-            &prebuild_env,
-        )?;
-        let result = command
-            .exec()
-            .context("failed to run grouped C root prebuild.sh");
+            extra_envs: &extra_script_envs,
+            config,
+        })
+        .context("failed to run grouped C root prebuild.sh");
         timing_stage.finish();
         result?;
     }
@@ -393,22 +402,18 @@ pub(super) fn prepare_grouped_c_subcases_sync(
                         ("phase", "prebuild".to_string()),
                     ],
                 );
-                let prebuild_env = prepare_guest_prebuild_env(
+                let source_dir = grouped_c_subcase_source_dir(subcase);
+                let result = run_guest_prebuild(GuestPrebuildRequest {
                     arch,
-                    &subcase_case,
-                    &subcase_layout,
-                    extra_script_envs.clone(),
+                    case: &subcase_case,
+                    case_rootfs,
+                    script: &prebuild_script,
+                    work_dir: &source_dir,
+                    layout: &subcase_layout,
+                    extra_envs: &extra_script_envs,
                     config,
-                )?;
-                let mut command = build_prebuild_command(
-                    &subcase_case,
-                    &prebuild_script,
-                    &subcase_layout,
-                    &prebuild_env,
-                )?;
-                let result = command.exec().with_context(|| {
-                    format!("failed to run {} prebuild.sh", subcase.name.as_str())
-                });
+                })
+                .with_context(|| format!("failed to run {} prebuild.sh", subcase.name.as_str()));
                 timing_stage.finish();
                 result?;
                 timing::print_timing_line(
@@ -431,7 +436,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             ("phase", "prepare-cross-env".to_string()),
         ],
     );
-    let build_env = prepare_host_cross_build_env(arch, layout, &qemu_runner)?;
+    let build_env = prepare_host_cross_build_env(arch, layout)?;
     timing_stage.finish();
 
     if grouped_c_root_project_path(case).is_file() {
@@ -471,7 +476,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             &build_env,
             config,
         );
-        let result = configure.exec().with_context(|| {
+        let result = configure.exec_quiet().with_context(|| {
             format!(
                 "failed to configure grouped C subcase `{}`",
                 subcase.name.as_str()
@@ -489,7 +494,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             ],
         );
         let mut build = build_cmake_build_command(&subcase_layout, &build_env);
-        let result = build.exec().with_context(|| {
+        let result = build.exec_quiet().with_context(|| {
             format!(
                 "failed to build grouped C subcase `{}`",
                 subcase.name.as_str()
@@ -507,7 +512,7 @@ pub(super) fn prepare_grouped_c_subcases_sync(
             ],
         );
         let mut install = build_cmake_install_command(&subcase_layout, &build_env);
-        let result = install.exec().with_context(|| {
+        let result = install.exec_quiet().with_context(|| {
             format!(
                 "failed to install grouped C subcase `{}`",
                 subcase.name.as_str()
@@ -525,6 +530,19 @@ pub(super) fn prepare_grouped_c_subcases_sync(
     print_slowest_grouped_c_subcases(case, subcase_timings);
 
     Ok(())
+}
+
+pub(super) fn grouped_c_root_prebuild_env(
+    mut env: Vec<(String, String)>,
+    subcases: &[&TestQemuSubcase],
+) -> Vec<(String, String)> {
+    let selected_subcases = subcases
+        .iter()
+        .map(|subcase| subcase.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    env.push(("STARRY_GROUPED_C_SUBCASES".to_string(), selected_subcases));
+    env
 }
 
 pub(super) fn prepare_grouped_c_root_project_sync(
@@ -560,7 +578,7 @@ pub(super) fn prepare_grouped_c_root_project_sync(
         config,
     );
     let result = configure
-        .exec()
+        .exec_quiet()
         .context("failed to configure grouped C root project");
     timing_stage.finish();
     result?;
@@ -575,7 +593,7 @@ pub(super) fn prepare_grouped_c_root_project_sync(
     );
     let mut build = build_cmake_build_command(layout, build_env);
     let result = build
-        .exec()
+        .exec_quiet()
         .context("failed to build grouped C root project");
     timing_stage.finish();
     result?;
@@ -589,7 +607,7 @@ pub(super) fn prepare_grouped_c_root_project_sync(
     );
     let mut install = build_cmake_install_command(layout, build_env);
     let result = install
-        .exec()
+        .exec_quiet()
         .context("failed to install grouped C root project");
     timing_stage.finish();
     result?;
@@ -637,9 +655,10 @@ pub(super) fn subcase_as_case(case: &TestQemuCase, subcase: &TestQemuSubcase) ->
         case_dir: subcase.case_dir.clone(),
         qemu_config_path: case.qemu_config_path.clone(),
         test_commands: Vec::new(),
-        host_symbolize_success_regex: Vec::new(),
+        grouped_command_selection: Default::default(),
         host_http_server: case.host_http_server.clone(),
         subcases: Vec::new(),
         grouped_subcase_filter: None,
+        ltp_case_id: None,
     }
 }

@@ -1,13 +1,31 @@
-//! AxVM-facing adapters for OS-neutral x86 virtual interrupt-controller devices.
+//! Reusable x86 device package for OS-neutral x86 virtual devices.
+//!
+//! This module intentionally lives outside the architecture-neutral runtime
+//! core: it is compiled only for x86_64 targets and exposes narrow typed
+//! services consumed by AxVM's x86 architecture layer.
 
 use alloc::{boxed::Box, string::String};
-use core::{any::Any, marker::PhantomData};
+use core::marker::PhantomData;
 
-use axdevice_base::{AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceError, Resource};
-use x86_vlapic::{
-    EmulatedIoApic, EmulatedPit, EmulatedSerialPort, IoApicEoi, IoApicInterrupt, X86AccessWidth,
-    X86GuestPhysAddr, X86GuestPhysAddrRange, X86Port, X86PortRange, X86VlapicHostOps,
+use axdevice_base::*;
+use x86_vlapic::*;
+
+use crate::{
+    DeviceLifecycle, DeviceManagerError, DeviceManagerResult, ServiceCardinality, ServiceKey,
 };
+
+#[path = "x86/acpi_pm_timer.rs"]
+mod acpi_pm_timer;
+pub use acpi_pm_timer::{X86AcpiPmTimerDevice, X86MonotonicNanos};
+#[path = "x86/cmos.rs"]
+mod cmos;
+pub use cmos::X86CmosDevice;
+#[path = "x86/pci_config.rs"]
+mod pci_config;
+pub use pci_config::X86PciConfigFrontend;
+#[path = "x86/pic.rs"]
+mod pic;
+pub use pic::X86PicDevice;
 
 /// Type-specific IOAPIC capability used by the x86 interrupt runtime.
 pub trait X86IoApicDeviceOps: Send + Sync {
@@ -17,20 +35,151 @@ pub trait X86IoApicDeviceOps: Send + Sync {
     /// Assert an IOAPIC GSI and return an interrupt to inject if one is unmasked.
     fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt>;
 
+    /// Updates the electrical level of an IOAPIC GSI.
+    fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt>;
+
     /// Broadcast a local APIC EOI to the IOAPIC.
+    fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi>;
+
+    /// Completes an EOI for the source GSI captured at delivery time.
+    ///
+    /// The redirection entry may have been reprogrammed before the guest EOI
+    /// exit is handled, so completion must not rediscover the source from the
+    /// current guest vector.
+    fn end_of_interrupt_for_gsi(&self, gsi: usize) -> Option<IoApicEoi>;
+}
+
+/// Type-specific legacy PIC capability used by the x86 timer path.
+pub trait X86PicDeviceOps: Send + Sync {
+    /// Latch one legacy IRQ edge and claim it when it is deliverable.
+    fn claim_irq(&self, irq: u8) -> Option<PicInterruptClaim>;
+
+    /// Claim a request already latched by the legacy PIC.
+    fn claim_pending_interrupt(&self) -> Option<PicInterruptClaim>;
+
+    /// Restore a claim when the runtime cannot publish its vector.
+    fn restore_interrupt(&self, claim: PicInterruptClaim);
+}
+
+/// x86 interrupt-controller operations needed by the VM interrupt runtime.
+///
+/// This is an adapter boundary rather than the IOAPIC device type itself:
+/// synthetic and forwarded sources only need to resolve a GSI, assert it, and
+/// process guest EOIs.
+pub trait X86InterruptDomainOps: Send + Sync {
+    /// Returns the guest vector currently programmed for a GSI.
+    fn vector_for_gsi(&self, gsi: usize) -> Option<u8>;
+
+    /// Asserts a GSI and returns an interrupt to inject when it is unmasked.
+    fn assert_gsi(&self, gsi: usize) -> Option<IoApicInterrupt>;
+
+    /// Processes a guest local-APIC EOI.
     fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi>;
 }
 
-/// Type-specific PIT capability used by the x86 interrupt runtime.
-pub trait X86PitDeviceOps: Send + Sync {
-    /// Consume a pending PIT IRQ0 tick if the deadline is due.
-    fn consume_irq0_if_due(&self, now_ns: u64) -> bool;
+/// Typed service key for the VM's x86 virtual I/O APIC.
+pub struct X86IoApicServiceKey;
+
+impl ServiceKey for X86IoApicServiceKey {
+    type Service = dyn X86IoApicDeviceOps;
+
+    const NAME: &'static str = "x86-ioapic";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
 }
 
-/// Type-specific COM1 capability used by the x86 interrupt runtime.
-pub trait X86SerialDeviceOps: Send + Sync {
-    /// Poll host input and return whether COM1 should assert an IRQ.
-    fn poll_irq(&self) -> bool;
+/// Typed service key for the VM's x86 interrupt-domain adapter.
+pub struct X86InterruptDomainKey;
+
+impl ServiceKey for X86InterruptDomainKey {
+    type Service = dyn X86InterruptDomainOps;
+
+    const NAME: &'static str = "x86-interrupt-domain";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
+/// Typed service key for the VM's guest-owned legacy PIC pair.
+pub struct X86PicServiceKey;
+
+impl ServiceKey for X86PicServiceKey {
+    type Service = dyn X86PicDeviceOps;
+
+    const NAME: &'static str = "x86-pic";
+    const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
+}
+
+/// Protected or physically absent x86 platform MMIO window.
+///
+/// Reads return the conventional all-ones value for their access width and
+/// writes are ignored. The window is always handled in software and never
+/// forwards an access to host physical MMIO.
+pub struct X86UnassignedMmioDevice {
+    base: u64,
+    end: u64,
+    resources: Box<[Resource]>,
+}
+
+impl X86UnassignedMmioDevice {
+    /// Creates a checked, non-empty unassigned MMIO window.
+    pub fn new(base: u64, size: u64) -> DeviceManagerResult<Self> {
+        let end = base
+            .checked_add(size)
+            .filter(|_| size != 0)
+            .ok_or_else(|| DeviceManagerError::InvalidInput {
+                operation: "create x86 unassigned MMIO window",
+                detail: String::from("range must be non-empty and must not overflow"),
+            })?;
+        Ok(Self {
+            base,
+            end,
+            resources: alloc::vec![Resource::MmioRange { base, size }].into_boxed_slice(),
+        })
+    }
+
+    fn contains_access(&self, access: &DeviceAccess) -> bool {
+        access.address() >= self.base
+            && access
+                .address()
+                .checked_add(usize::from(access.width()) as u64)
+                .is_some_and(|end| end <= self.end)
+    }
+}
+
+impl Device for X86UnassignedMmioDevice {
+    fn name(&self) -> &str {
+        "x86-unassigned-mmio"
+    }
+
+    fn resources(&self) -> &[Resource] {
+        &self.resources
+    }
+
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        if access.bus() != BusKind::Mmio || !self.contains_access(access) {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        Ok(match access.width() {
+            AccessWidth::Byte => u8::MAX as u64,
+            AccessWidth::Word => u16::MAX as u64,
+            AccessWidth::Dword => u32::MAX as u64,
+            AccessWidth::Qword => u64::MAX,
+        })
+    }
+
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        _value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        if access.bus() != BusKind::Mmio || !self.contains_access(access) {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Unified-device adapter for [`EmulatedIoApic`].
@@ -67,8 +216,16 @@ impl X86IoApicDeviceOps for X86IoApicDevice {
         self.inner.assert_gsi(gsi)
     }
 
+    fn set_gsi_level(&self, gsi: usize, asserted: bool) -> Option<IoApicInterrupt> {
+        self.inner.set_gsi_level(gsi, asserted)
+    }
+
     fn end_of_interrupt(&self, vector: u8) -> Option<IoApicEoi> {
         self.inner.end_of_interrupt(vector)
+    }
+
+    fn end_of_interrupt_for_gsi(&self, gsi: usize) -> Option<IoApicEoi> {
+        self.inner.end_of_interrupt_for_gsi(gsi)
     }
 }
 
@@ -81,29 +238,25 @@ impl Device for X86IoApicDevice {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::Mmio {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
-        }
-        let addr = X86GuestPhysAddr::from_usize(access.addr as usize);
-        let width = x86_access_width(access.width);
-        if access.is_read {
-            self.inner
-                .handle_read(addr, width)
-                .map(|value| BusResponse::Read {
-                    value: value as u64,
-                })
-                .map_err(|_| DeviceError::Internal)
-        } else {
-            self.inner
-                .handle_write(addr, width, access.data as usize)
-                .map(|_| BusResponse::Write)
-                .map_err(|_| DeviceError::Internal)
-        }
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        let addr = ioapic_address(access)?;
+        self.inner
+            .handle_read(addr, x86_access_width(access.width()))
+            .map(|value| value as u64)
+            .map_err(|_| DeviceError::Internal)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        let addr = ioapic_address(access)?;
+        self.inner
+            .handle_write(addr, x86_access_width(access.width()), value as usize)
+            .map(|_| ())
+            .map_err(|_| DeviceError::Internal)
     }
 }
 
@@ -118,14 +271,35 @@ pub struct X86PitDevice<H: X86VlapicHostOps> {
 impl<H: X86VlapicHostOps> X86PitDevice<H> {
     /// Creates a PIT adapter.
     pub fn new() -> Self {
-        let inner = EmulatedPit::<H>::new();
-        let resources = port_resources(inner.address_range());
+        Self::new_for_vcpu(0, 0)
+    }
+
+    /// Creates a PIT adapter whose IRQ0 uses the supplied run-scoped port.
+    ///
+    /// The port is pre-bound to one run's lower capabilities, so the PIT timer
+    /// callback retains that binding for its whole lifetime instead of looking
+    /// up a VM identity when the timer expires.
+    pub fn new_for_vcpu_with_runtime(runtime: H::Runtime, vm_id: usize, vcpu_id: usize) -> Self {
+        let inner = EmulatedPit::<H>::new_for_vcpu_with_runtime(runtime, vm_id, vcpu_id);
+        let resources = EmulatedPit::<H>::port_ranges()
+            .map(port_resource)
+            .to_vec()
+            .into_boxed_slice();
         Self {
             inner,
             name: String::from("x86-pit"),
             resources,
             _host: PhantomData,
         }
+    }
+
+    /// Creates a host-side PIT adapter that is not attached to a guest run.
+    ///
+    /// Its timer path returns a run-state error until a real run binds it, so
+    /// AxVM installs its PIT through [`Self::new_for_vcpu_with_runtime`].
+    pub fn new_for_vcpu(vm_id: usize, vcpu_id: usize) -> Self {
+        let runtime = H::unbound_runtime(vm_id, vcpu_id);
+        Self::new_for_vcpu_with_runtime(runtime, vm_id, vcpu_id)
     }
 
     /// Returns the wrapped OS-neutral PIT core.
@@ -140,12 +314,6 @@ impl<H: X86VlapicHostOps> Default for X86PitDevice<H> {
     }
 }
 
-impl<H: X86VlapicHostOps> X86PitDeviceOps for X86PitDevice<H> {
-    fn consume_irq0_if_due(&self, now_ns: u64) -> bool {
-        self.inner.consume_irq0_if_due(now_ns)
-    }
-}
-
 impl<H: X86VlapicHostOps + 'static> Device for X86PitDevice<H> {
     fn name(&self) -> &str {
         &self.name
@@ -155,110 +323,76 @@ impl<H: X86VlapicHostOps + 'static> Device for X86PitDevice<H> {
         &self.resources
     }
 
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::Port {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
-        }
-        let port = X86Port::new(
-            u16::try_from(access.addr)
-                .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?,
-        );
-        let width = x86_access_width(access.width);
-        if access.is_read {
-            self.inner
-                .handle_read(port, width)
-                .map(|value| BusResponse::Read {
-                    value: value as u64,
-                })
-                .map_err(|_| DeviceError::Internal)
-        } else {
-            self.inner
-                .handle_write(port, width, access.data as usize)
-                .map(|_| BusResponse::Write)
-                .map_err(|_| DeviceError::Internal)
-        }
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        let port = pit_port(access)?;
+        self.inner
+            .handle_read(port, x86_access_width(access.width()))
+            .map(|value| value as u64)
+            .map_err(|_| DeviceError::Internal)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        let port = pit_port(access)?;
+        self.inner
+            .handle_write(port, x86_access_width(access.width()), value as usize)
+            .map(|_| ())
+            .map_err(|_| DeviceError::Internal)
     }
 }
 
-/// Unified-device adapter for [`EmulatedSerialPort`].
-pub struct X86SerialPortDevice<H: X86VlapicHostOps> {
-    inner: EmulatedSerialPort<H>,
-    name: String,
-    resources: Box<[Resource]>,
-    _host: PhantomData<fn() -> H>,
-}
-
-impl<H: X86VlapicHostOps> X86SerialPortDevice<H> {
-    /// Creates a COM1 adapter.
-    pub fn new() -> Self {
-        let inner = EmulatedSerialPort::<H>::new();
-        let resources = port_resources(inner.address_range());
-        Self {
-            inner,
-            name: String::from("x86-serial-com1"),
-            resources,
-            _host: PhantomData,
-        }
+impl<H: X86VlapicHostOps + 'static> DeviceLifecycle for X86PitDevice<H> {
+    fn stop(&self) -> DeviceManagerResult {
+        self.inner
+            .stop()
+            .map_err(|_| DeviceManagerError::from(DeviceError::Internal))
+    }
+    /// Retires the IRQ0 host timer and the guest-visible 8254 state.
+    fn reset(&self) -> DeviceManagerResult {
+        self.inner
+            .stop()
+            .map_err(|_| DeviceManagerError::from(DeviceError::Internal))
     }
 
-    /// Returns the wrapped OS-neutral COM1 core.
-    pub const fn inner(&self) -> &EmulatedSerialPort<H> {
-        &self.inner
+    /// Quiesces the IRQ0 host timer before a task-side VM pause is ACKed.
+    fn suspend(&self) -> DeviceManagerResult {
+        self.inner
+            .suspend()
+            .map_err(|_| DeviceManagerError::from(DeviceError::Internal))
     }
-}
 
-impl<H: X86VlapicHostOps> Default for X86SerialPortDevice<H> {
-    fn default() -> Self {
-        Self::new()
+    /// Reinstalls the IRQ0 host timer before guest entry reopens.
+    fn resume(&self) -> DeviceManagerResult {
+        self.inner
+            .resume()
+            .map_err(|_| DeviceManagerError::from(DeviceError::Internal))
     }
 }
 
-impl<H: X86VlapicHostOps> X86SerialDeviceOps for X86SerialPortDevice<H> {
-    fn poll_irq(&self) -> bool {
-        self.inner.poll_irq()
+fn ioapic_address(access: &DeviceAccess) -> DeviceResult<X86GuestPhysAddr> {
+    if access.bus() != BusKind::Mmio {
+        return Err(DeviceError::OutOfRange {
+            addr: access.address(),
+        });
     }
+    Ok(X86GuestPhysAddr::from_usize(access.address() as usize))
 }
 
-impl<H: X86VlapicHostOps + 'static> Device for X86SerialPortDevice<H> {
-    fn name(&self) -> &str {
-        &self.name
+fn pit_port(access: &DeviceAccess) -> DeviceResult<X86Port> {
+    if access.bus() != BusKind::Port {
+        return Err(DeviceError::OutOfRange {
+            addr: access.address(),
+        });
     }
-
-    fn resources(&self) -> &[Resource] {
-        &self.resources
-    }
-
-    fn handle(&self, access: &BusAccess) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::Port {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
-        }
-        let port = X86Port::new(
-            u16::try_from(access.addr)
-                .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?,
-        );
-        let width = x86_access_width(access.width);
-        if access.is_read {
-            self.inner
-                .handle_read(port, width)
-                .map(|value| BusResponse::Read {
-                    value: value as u64,
-                })
-                .map_err(|_| DeviceError::Internal)
-        } else {
-            self.inner
-                .handle_write(port, width, access.data as usize)
-                .map(|_| BusResponse::Write)
-                .map_err(|_| DeviceError::Internal)
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    u16::try_from(access.address())
+        .map(X86Port::new)
+        .map_err(|_| DeviceError::OutOfRange {
+            addr: access.address(),
+        })
 }
 
 fn x86_access_width(width: AccessWidth) -> X86AccessWidth {
@@ -276,12 +410,57 @@ fn mmio_resources(range: X86GuestPhysAddrRange) -> Box<[Resource]> {
     alloc::vec![Resource::MmioRange { base, size }].into_boxed_slice()
 }
 
-fn port_resources(range: X86PortRange) -> Box<[Resource]> {
+fn port_resource(range: X86PortRange) -> Resource {
     let base = range.start.number();
     let size = range
         .end
         .number()
         .saturating_sub(range.start.number())
         .saturating_add(1);
-    alloc::vec![Resource::PortRange { base, size }].into_boxed_slice()
+    Resource::PortRange { base, size }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn access(address: u64, width: AccessWidth) -> DeviceAccess {
+        DeviceAccess::new(DeviceVcpuId::new(0), BusKind::Mmio, address, width)
+    }
+
+    #[test]
+    fn unassigned_mmio_reads_as_all_ones_and_ignores_writes() {
+        let device = X86UnassignedMmioDevice::new(0xfed8_0000, 0x1_0000).unwrap();
+        let mut context = NoopDeviceContext::new(DeviceId::new(0));
+
+        for (width, expected) in [
+            (AccessWidth::Byte, u8::MAX as u64),
+            (AccessWidth::Word, u16::MAX as u64),
+            (AccessWidth::Dword, u32::MAX as u64),
+            (AccessWidth::Qword, u64::MAX),
+        ] {
+            assert_eq!(
+                device
+                    .read(&access(0xfed8_03c0, width), &mut context)
+                    .unwrap(),
+                expected
+            );
+        }
+        device
+            .write(&access(0xfed8_03c0, AccessWidth::Dword), 0, &mut context)
+            .unwrap();
+    }
+
+    #[test]
+    fn unassigned_mmio_rejects_invalid_ranges_and_out_of_range_accesses() {
+        assert!(X86UnassignedMmioDevice::new(0, 0).is_err());
+        assert!(X86UnassignedMmioDevice::new(u64::MAX, 2).is_err());
+
+        let device = X86UnassignedMmioDevice::new(0x1000, 4).unwrap();
+        let mut context = NoopDeviceContext::new(DeviceId::new(0));
+        assert!(matches!(
+            device.read(&access(0x1002, AccessWidth::Dword), &mut context),
+            Err(DeviceError::OutOfRange { .. })
+        ));
+    }
 }

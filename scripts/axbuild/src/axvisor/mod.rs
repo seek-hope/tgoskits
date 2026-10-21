@@ -10,11 +10,14 @@ use crate::context::{
     AppContext, AxvisorCliArgs, AxvisorRequestPaths, ResolvedAxvisorRequest, SnapshotPersistence,
 };
 
+pub mod app;
 pub mod board;
 pub mod build;
+mod bundle;
 pub mod config;
 pub mod rootfs;
 pub mod test;
+mod web_ui;
 
 /// Axvisor host-side commands
 #[derive(Subcommand)]
@@ -25,6 +28,8 @@ pub enum Command {
     Qemu(ArgsQemu),
     /// Build and run Axvisor on a remote board
     Board(ArgsBoard),
+    /// List, build and run AxVisor applications
+    App(app::ArgsApp),
     /// Run Axvisor test suites
     Test(ArgsTest),
     /// Build and run Axvisor with U-Boot
@@ -52,7 +57,7 @@ pub struct ArgsBuild {
     #[arg(long)]
     pub debug: bool,
 
-    #[arg(long)]
+    #[arg(long = "vmconfig", alias = "vmconfigs")]
     pub vmconfigs: Vec<PathBuf>,
 }
 
@@ -151,9 +156,10 @@ pub struct ArgsTestQemu {
         short = 'c',
         long = "test-case",
         value_name = "CASE",
-        help = "Run only one Axvisor QEMU test case"
+        value_delimiter = ',',
+        help = "Run selected Axvisor QEMU cases; repeat or separate with commas"
     )]
-    pub test_case: Option<String>,
+    pub test_case: Vec<String>,
     #[arg(short = 'l', long, help = "List discovered Axvisor QEMU test cases")]
     pub list: bool,
 }
@@ -184,16 +190,18 @@ pub struct ArgsTestBoard {
         short = 'c',
         long = "test-case",
         value_name = "CASE",
-        help = "Run only one Axvisor board test case"
+        value_delimiter = ',',
+        help = "Run one or more Axvisor board test cases"
     )]
-    pub test_case: Option<String>,
+    pub test_case: Vec<String>,
 
     #[arg(
         long,
         value_name = "BOARD",
-        help = "Run all Axvisor board test cases for one board"
+        value_delimiter = ',',
+        help = "Run all Axvisor board test cases for one or more boards"
     )]
-    pub board: Option<String>,
+    pub board: Vec<String>,
 
     #[arg(short = 'b', long = "board-type", value_name = "BOARD_TYPE")]
     pub board_type: Option<String>,
@@ -212,6 +220,11 @@ pub struct ArgsTestBoard {
 pub enum ConfigCommand {
     /// List available board names
     Ls,
+    /// Edit one guest configuration with menuconfig
+    Vm {
+        /// Guest configuration file to edit
+        guest_config: PathBuf,
+    },
 }
 
 pub struct Axvisor {
@@ -244,8 +257,9 @@ impl Axvisor {
             Command::Uboot(args) => self.uboot(args).await,
             Command::Board(args) => self.board(args).await,
             Command::Defconfig(args) => self.defconfig(args),
-            Command::Config(args) => self.config(args),
+            Command::Config(args) => self.config(args).await,
             Command::Test(args) => self.test(args).await,
+            Command::App(args) => self.app_command(args).await,
         }
     }
 
@@ -270,12 +284,16 @@ impl Axvisor {
     }
 
     async fn board(&mut self, args: ArgsBoard) -> anyhow::Result<()> {
-        let request =
+        let mut request =
             self.prepare_request((&args.build).into(), None, None, SnapshotPersistence::Store)?;
         self.app.set_debug_mode(request.debug)?;
-        let cargo = build::load_cargo_config(&request)?;
-        let board_config = self
+        let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
+        let mut board_config = self
             .load_board_config(&cargo, args.board_config.as_deref())
+            .await?;
+        // Board-only handoffs may resolve guest images to paths published by
+        // the board root filesystem (for example `/linux/...`).
+        self.prepare_guest_payload(&mut request, &mut board_config.boot, &cargo, true)
             .await?;
         self.app
             .board(
@@ -302,7 +320,7 @@ impl Axvisor {
         Ok(())
     }
 
-    fn config(&mut self, args: ArgsConfig) -> anyhow::Result<()> {
+    async fn config(&mut self, args: ArgsConfig) -> anyhow::Result<()> {
         match args.command {
             ConfigCommand::Ls => {
                 for board in config::available_board_names(
@@ -310,6 +328,9 @@ impl Axvisor {
                 )? {
                     println!("{board}");
                 }
+            }
+            ConfigCommand::Vm { guest_config } => {
+                let _ = jkconfig::run::<axvmconfig::GuestConfig>(guest_config, true, &[]).await?;
             }
         }
         Ok(())
@@ -382,21 +403,118 @@ impl Axvisor {
         }
     }
 
-    async fn run_build_request(&mut self, request: ResolvedAxvisorRequest) -> anyhow::Result<()> {
+    async fn run_build_request(
+        &mut self,
+        mut request: ResolvedAxvisorRequest,
+    ) -> anyhow::Result<()> {
         self.app.set_debug_mode(request.debug)?;
-        let cargo = build::load_cargo_config(&request)?;
+        let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
         self.app
-            .build(cargo, request.build_info_path)
-            .await
-            .map(|_| ())
+            .build(cargo.clone(), request.build_info_path.clone())
+            .await?;
+        self.prepare_guest_payload(
+            &mut request,
+            &mut ostool::BootPayloadConfig::default(),
+            &cargo,
+            false,
+        )
+        .await
     }
 
-    async fn run_uboot_request(&mut self, request: ResolvedAxvisorRequest) -> anyhow::Result<()> {
+    async fn run_uboot_request(
+        &mut self,
+        mut request: ResolvedAxvisorRequest,
+    ) -> anyhow::Result<()> {
         self.app.set_debug_mode(request.debug)?;
-        let cargo = build::load_cargo_config(&request)?;
-        let uboot = self.load_uboot_config(&request, &cargo).await?;
-        self.app.uboot(cargo, request.build_info_path, uboot).await
+        let cargo = build::load_cargo_config(&request, self.app.workspace_context())?;
+        let mut uboot = match self.load_uboot_config(&request, &cargo).await? {
+            Some(config) => config,
+            None => self.app.ensure_uboot_config_for_cargo(&cargo).await?,
+        };
+        self.prepare_guest_payload(&mut request, &mut uboot.boot, &cargo, true)
+            .await?;
+        self.app
+            .uboot(cargo, request.build_info_path, Some(uboot))
+            .await
     }
+
+    pub(super) async fn prepare_guest_payload(
+        &mut self,
+        request: &mut ResolvedAxvisorRequest,
+        boot: &mut ostool::BootPayloadConfig,
+        cargo: &Cargo,
+        allow_external_assets: bool,
+    ) -> anyhow::Result<()> {
+        request.vmconfigs = build::load_vmconfigs(request, self.app.workspace_context())?;
+        attach_guest_payload(
+            &mut self.app,
+            request,
+            boot,
+            cargo,
+            false,
+            allow_external_assets,
+        )
+        .await
+    }
+}
+
+/// Prepares the AxVisor guest payload for one explicit axtest execution unit.
+///
+/// The ktest runner owns its Cargo target selection, so it cannot reuse the
+/// [`Axvisor`] command object. The resource pipeline stays the same: an optional
+/// `host-initramfs.toml` sidecar next to the run configuration may select guest
+/// configurations and publishes the package even when the build configuration
+/// lists none; without that sidecar the build configuration's `vm_configs` are
+/// used, so a case that owns no sidecar still boots the guests its build
+/// declares.
+pub(crate) async fn prepare_ktest_guest_payload(
+    app: &mut AppContext,
+    request: &mut ResolvedAxvisorRequest,
+    boot: &mut ostool::BootPayloadConfig,
+    cargo: &Cargo,
+    sidecar_dir: &Path,
+    allow_external_assets: bool,
+) -> anyhow::Result<()> {
+    let inputs = bundle::case_inputs(sidecar_dir)?;
+    request.vmconfigs = match &inputs.vm_configs {
+        Some(configs) => build::resolve_vmconfigs(request, configs, app.workspace_context())?,
+        None => build::load_vmconfigs(request, app.workspace_context())?,
+    };
+    attach_guest_payload(
+        app,
+        request,
+        boot,
+        cargo,
+        inputs.vm_configs.is_some(),
+        allow_external_assets,
+    )
+    .await
+}
+
+/// Packs the selected guest configurations and their boot images into the host
+/// archive already carried by `boot`.
+async fn attach_guest_payload(
+    app: &mut AppContext,
+    request: &ResolvedAxvisorRequest,
+    boot: &mut ostool::BootPayloadConfig,
+    cargo: &Cargo,
+    empty_package: bool,
+    allow_external_assets: bool,
+) -> anyhow::Result<()> {
+    rootfs::ensure_guest_image_bundles(request, app.workspace_root(), app.target_dir()).await?;
+    let web_ui_dist = web_ui::build_dist(&cargo.features, &request.axvisor_dir, app.target_dir())?;
+    let output = app
+        .target_dir()
+        .join("axbuild/axvisor/host-initramfs")
+        .join(format!("{}.cpio", request.arch));
+    bundle::attach_with_external_assets(
+        &request.vmconfigs,
+        empty_package,
+        web_ui_dist.as_deref(),
+        &output,
+        &mut boot.initramfs,
+        allow_external_assets,
+    )
 }
 
 fn default_qemu_config_template_path(axvisor_dir: &Path, arch: &str) -> PathBuf {
@@ -409,292 +527,18 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn default_qemu_template_path_uses_axvisor_script_location() {
-        let path = default_qemu_config_template_path(Path::new("os/axvisor"), "aarch64");
-
-        assert_eq!(
-            path,
-            PathBuf::from("os/axvisor/configs/qemu/qemu-aarch64.toml")
-        );
+    #[derive(Parser)]
+    struct BoardCli {
+        #[command(flatten)]
+        board: ArgsTestBoard,
     }
 
     #[test]
-    fn command_parses_uboot() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from([
-            "axvisor",
-            "uboot",
-            "--arch",
-            "aarch64",
-            "--uboot-config",
-            "uboot.toml",
-            "--vmconfigs",
-            "tmp/vm1.toml",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Uboot(args) => {
-                assert_eq!(args.build.arch.as_deref(), Some("aarch64"));
-                assert_eq!(args.uboot_config, Some(PathBuf::from("uboot.toml")));
-                assert_eq!(args.build.vmconfigs, vec![PathBuf::from("tmp/vm1.toml")]);
-            }
-            _ => panic!("expected uboot command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_board() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from([
-            "axvisor",
-            "board",
-            "--arch",
-            "aarch64",
-            "--board-config",
-            "remote.board.toml",
-            "-b",
-            "rk3568",
-            "--server",
-            "10.0.0.2",
-            "--port",
-            "9000",
-            "--vmconfigs",
-            "tmp/vm1.toml",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Board(args) => {
-                assert_eq!(args.build.arch.as_deref(), Some("aarch64"));
-                assert_eq!(args.board_config, Some(PathBuf::from("remote.board.toml")));
-                assert_eq!(args.board_type.as_deref(), Some("rk3568"));
-                assert_eq!(args.server.as_deref(), Some("10.0.0.2"));
-                assert_eq!(args.port, Some(9000));
-                assert_eq!(args.build.vmconfigs, vec![PathBuf::from("tmp/vm1.toml")]);
-            }
-            _ => panic!("expected board command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_test_qemu() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from(["axvisor", "test", "qemu", "--arch", "aarch64"]).unwrap();
-
-        match cli.command {
-            Command::Test(args) => match args.command {
-                TestCommand::Qemu(args) => {
-                    assert_eq!(args.arch.as_deref(), Some("aarch64"));
-                    assert_eq!(args.target, None);
-                    assert_eq!(args.test_group, None);
-                    assert_eq!(args.test_case, None);
-                }
-                _ => panic!("expected qemu test command"),
-            },
-            _ => panic!("expected test command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_test_qemu_target() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
+    fn board_case_selector_accepts_repeated_and_comma_separated_values() {
         let cli =
-            Cli::try_parse_from(["axvisor", "test", "qemu", "--target", "x86_64-unknown-none"])
+            BoardCli::try_parse_from(["test", "--test-case", "smoke,direct", "--test-case", "pci"])
                 .unwrap();
 
-        match cli.command {
-            Command::Test(args) => match args.command {
-                TestCommand::Qemu(args) => {
-                    assert_eq!(args.arch, None);
-                    assert_eq!(args.target.as_deref(), Some("x86_64-unknown-none"));
-                    assert_eq!(args.test_group, None);
-                }
-                _ => panic!("expected qemu test command"),
-            },
-            _ => panic!("expected test command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_test_qemu_case_filter() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from([
-            "axvisor", "test", "qemu", "--arch", "aarch64", "-g", "normal", "-c", "smoke",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Test(args) => match args.command {
-                TestCommand::Qemu(args) => {
-                    assert_eq!(args.arch.as_deref(), Some("aarch64"));
-                    assert_eq!(args.test_group.as_deref(), Some("normal"));
-                    assert_eq!(args.test_case.as_deref(), Some("smoke"));
-                }
-                _ => panic!("expected qemu test command"),
-            },
-            _ => panic!("expected test command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_test_uboot() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from([
-            "axvisor",
-            "test",
-            "uboot",
-            "-b",
-            "roc-rk3568-pc",
-            "--guest",
-            "arceos",
-            "--uboot-config",
-            "uboot.toml",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Test(args) => match args.command {
-                TestCommand::Uboot(args) => {
-                    assert_eq!(args.board, "roc-rk3568-pc");
-                    assert_eq!(args.guest, "arceos");
-                    assert_eq!(args.uboot_config, Some(PathBuf::from("uboot.toml")));
-                }
-                _ => panic!("expected uboot test command"),
-            },
-            _ => panic!("expected test command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_test_board() {
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let cli = Cli::try_parse_from([
-            "axvisor",
-            "test",
-            "board",
-            "-g",
-            "normal",
-            "-c",
-            "smoke",
-            "--board",
-            "phytiumpi-linux",
-            "-b",
-            "Phytiumpi",
-            "--server",
-            "10.0.0.2",
-            "--port",
-            "9000",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Test(args) => match args.command {
-                TestCommand::Board(args) => {
-                    assert_eq!(args.test_group.as_deref(), Some("normal"));
-                    assert_eq!(args.test_case.as_deref(), Some("smoke"));
-                    assert_eq!(args.board.as_deref(), Some("phytiumpi-linux"));
-                    assert_eq!(args.board_type.as_deref(), Some("Phytiumpi"));
-                    assert_eq!(args.server.as_deref(), Some("10.0.0.2"));
-                    assert_eq!(args.port, Some(9000));
-                }
-                _ => panic!("expected board test command"),
-            },
-            _ => panic!("expected test command"),
-        }
-    }
-
-    #[test]
-    fn command_parses_build_and_qemu() {
-        let build_config = "os/axvisor/.build.toml";
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            command: Command,
-        }
-
-        let build_cli = Cli::try_parse_from([
-            "axvisor",
-            "build",
-            "--config",
-            build_config,
-            "--arch",
-            "aarch64",
-            "--vmconfigs",
-            "tmp/vm1.toml",
-        ])
-        .unwrap();
-        match build_cli.command {
-            Command::Build(args) => {
-                assert_eq!(args.config, Some(PathBuf::from(build_config)));
-                assert_eq!(args.arch.as_deref(), Some("aarch64"));
-                assert_eq!(args.vmconfigs, vec![PathBuf::from("tmp/vm1.toml")]);
-            }
-            _ => panic!("expected build command"),
-        }
-
-        let qemu_cli = Cli::try_parse_from([
-            "axvisor",
-            "qemu",
-            "--config",
-            build_config,
-            "--arch",
-            "aarch64",
-            "--qemu-config",
-            "configs/qemu.toml",
-            "--vmconfigs",
-            "tmp/vm1.toml",
-            "--vmconfigs",
-            "tmp/vm2.toml",
-        ])
-        .unwrap();
-        match qemu_cli.command {
-            Command::Qemu(args) => {
-                assert_eq!(args.build.config, Some(PathBuf::from(build_config)));
-                assert_eq!(args.build.arch.as_deref(), Some("aarch64"));
-                assert_eq!(args.qemu_config, Some(PathBuf::from("configs/qemu.toml")));
-                assert_eq!(
-                    args.build.vmconfigs,
-                    vec![PathBuf::from("tmp/vm1.toml"), PathBuf::from("tmp/vm2.toml")]
-                );
-            }
-            _ => panic!("expected qemu command"),
-        }
+        assert_eq!(cli.board.test_case, ["smoke", "direct", "pci"]);
     }
 }

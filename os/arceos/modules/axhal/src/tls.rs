@@ -51,6 +51,7 @@
 
 extern crate alloc;
 
+use alloc::alloc::alloc_zeroed;
 use core::{alloc::Layout, ptr::NonNull};
 
 use ax_memory_addr::align_up;
@@ -96,6 +97,12 @@ impl Drop for TlsArea {
 }
 
 impl TlsArea {
+    /// Returns the complete allocation backing this live TLS area, including TCB.
+    pub fn backing_range(&self) -> core::ops::Range<usize> {
+        let start = self.base.as_ptr() as usize;
+        start..start + self.layout.size()
+    }
+
     /// Returns the pointer to the TLS static area.
     ///
     /// One should set the hardware thread pointer register to this value.
@@ -103,10 +110,12 @@ impl TlsArea {
         unsafe { self.base.as_ptr().add(tp_offset()) }
     }
 
-    /// Allocates the memory region for TLS, and initializes it.
-    pub fn alloc() -> Self {
+    /// Allocates and initializes TLS, returning `None` if memory is exhausted.
+    pub fn try_alloc() -> Option<Self> {
         let layout = Layout::from_size_align(tls_area_size(), TLS_ALIGN).unwrap();
-        let area_base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        // SAFETY: `layout` has non-zero power-of-two alignment and remains
+        // owned by the returned `TlsArea` until its matching deallocation.
+        let area_base = NonNull::new(unsafe { alloc_zeroed(layout) })?;
 
         unsafe {
             let tls_load_base = _stdata as *mut u8;
@@ -114,17 +123,17 @@ impl TlsArea {
             // copy data from .tbdata section
             core::ptr::copy_nonoverlapping(
                 tls_load_base,
-                area_base.add(static_tls_offset()),
+                area_base.as_ptr().add(static_tls_offset()),
                 tls_load_size,
             );
             // initialize TCB
-            init_tcb(area_base);
+            init_tcb(area_base.as_ptr());
         }
 
-        Self {
-            base: NonNull::new(area_base).unwrap(),
+        Some(Self {
+            base: area_base,
             layout,
-        }
+        })
     }
 }
 

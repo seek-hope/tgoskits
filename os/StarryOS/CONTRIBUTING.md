@@ -51,10 +51,12 @@ git checkout -b fix/your-bug-fix
 ### 3. Make Changes
 
 - Write code
-- Add tests (if applicable)
+- 测试遵循工作区 [test-quality](../../.agents/skills/test-quality/SKILL.md)：优先复用或增强完整功能验证，仅在缺少独立行为证明时新增；参数取值或历史问题不自动新增用例。
 - Update documentation (if needed)
 
 ### 4. Code Quality Checks
+
+The commands in this section apply to the standalone StarryOS repository. For a pull request to TGOSKits, follow its repository-level validation rules and check only the affected packages and QEMU or board cases.
 
 Before committing, make sure:
 

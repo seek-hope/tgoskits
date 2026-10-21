@@ -1,9 +1,9 @@
 //! DRM ioctl decoding helpers and userspace struct definitions.
 //!
 //! See Linux's `include/uapi/drm/drm.h` for the canonical definitions —
-//! everything here is layout-compatible with that header.  This file
-//! intentionally covers only the subset `card0.rs` implements today; the
-//! full DRM ioctl set has ~100 commands, and we add them incrementally.
+//! everything here is layout-compatible with that header. This module holds
+//! core DRM ABI shared by the device nodes; VirtIO GPU private ABI lives in
+//! `card0/virtgpu_uapi.rs`.
 
 use core::ffi::c_int;
 
@@ -26,7 +26,7 @@ const fn ioc(dir: u32, ty: u8, nr: u8, size: u16) -> u32 {
     (dir << 30) | ((size as u32) << 16) | ((ty as u32) << 8) | (nr as u32)
 }
 #[inline]
-const fn iowr<T>(ty: u8, nr: u8) -> u32 {
+pub(super) const fn iowr<T>(ty: u8, nr: u8) -> u32 {
     ioc(
         IOC_READ | IOC_WRITE,
         ty,
@@ -83,6 +83,14 @@ pub const DRM_IOCTL_VERSION: u32 = iowr::<DrmVersion>(DRM_TYPE, 0x00);
 pub const DRM_IOCTL_GET_UNIQUE: u32 = iowr::<DrmUnique>(DRM_TYPE, 0x01);
 pub const DRM_IOCTL_SET_VERSION: u32 = iowr::<DrmSetVersion>(DRM_TYPE, 0x07);
 pub const DRM_IOCTL_GET_CAP: u32 = iowr::<DrmGetCap>(DRM_TYPE, 0x0c);
+/// GEM_CLOSE — release a GEM handle (pure input, WRITE direction).
+/// Layout: `struct drm_gem_close { u32 handle; u32 pad; }` (8 bytes).
+pub const DRM_IOCTL_GEM_CLOSE: u32 = ioc(
+    IOC_WRITE,
+    DRM_TYPE,
+    0x09,
+    core::mem::size_of::<DrmGemClose>() as u16,
+);
 pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = ioc(
     IOC_WRITE,
     DRM_TYPE,
@@ -129,13 +137,13 @@ pub struct DrmPrimeHandle {
 // (not counting the nul terminator, per Linux convention).
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmVersion {
     pub version_major: c_int,
     pub version_minor: c_int,
     pub version_patchlevel: c_int,
-    /// `_pad` — field missing on 32-bit. On 64-bit the compiler inserts
-    /// padding naturally before the u64 fields.
+    /// Explicit 64-bit ABI alignment bytes before the pointer-sized fields.
+    pub _padding: u32,
     pub name_len: usize,
     pub name: u64,
     pub date_len: usize,
@@ -145,14 +153,14 @@ pub struct DrmVersion {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmUnique {
     pub unique_len: usize,
     pub unique: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSetVersion {
     pub drm_di_major: c_int,
     pub drm_di_minor: c_int,
@@ -166,7 +174,7 @@ pub struct DrmSetVersion {
 // writes back `value`.
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmGetCap {
     pub capability: u64,
     pub value: u64,
@@ -187,7 +195,15 @@ pub const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 0x12;
 /// `modifier[]` array and validates every entry against the set we
 /// advertise in the plane's `IN_FORMATS` blob.
 pub const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
-
+/// Syncobj objects are supported (`DRM_IOCTL_SYNCOBJ_*` family served).
+pub const DRM_CAP_SYNCOBJ: u64 = 0x13;
+/// Timeline syncobjs are supported (points on every wait/query/signal).
+///
+/// The value must match the UAPI headers the guest userspace was compiled
+/// against: mesa's DRM sync provider selects the kernel syncobj path from
+/// this cap, and a stale value makes it silently fall back to the sync-file
+/// path, which the venus face does not honour.
+pub const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 /// `DRM_MODE_FB_MODIFIERS` — caller is providing `modifier[]` entries.
 /// Without this flag the `modifier[]` array in `drm_mode_fb_cmd2` is
 /// ignored and assumed implicit-linear.
@@ -210,7 +226,7 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 // fast path yet).
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmSetClientCap {
     pub capability: u64,
     pub value: u64,
@@ -234,24 +250,28 @@ pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = iowr::<DrmModeDestroyDumb>(DRM_TYPE
 pub const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = iowr::<DrmModeGetPlaneRes>(DRM_TYPE, 0xB5);
 pub const DRM_IOCTL_MODE_GETPLANE: u32 = iowr::<DrmModeGetPlane>(DRM_TYPE, 0xB6);
 pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr::<DrmModeFbCmd2>(DRM_TYPE, 0xB8);
+/// Legacy `ADDFB` (28-byte `drm_mode_fb_cmd`). GBM userspaces issue it for
+/// plain buffers; the card0 handler synthesizes the `ADDFB2` core from it.
+pub const DRM_IOCTL_MODE_ADDFB: u32 = iowr::<DrmModeFbCmd>(DRM_TYPE, 0xAE);
 pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = iowr::<DrmModeObjGetProperties>(DRM_TYPE, 0xB9);
 pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr::<DrmModeAtomic>(DRM_TYPE, 0xBC);
 pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iowr::<DrmModeCreateBlob>(DRM_TYPE, 0xBD);
 pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 = iowr::<DrmModeDestroyBlob>(DRM_TYPE, 0xBE);
 pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = iowr::<DrmModeGetBlob>(DRM_TYPE, 0xAC);
-// WAIT_VBLANK is a union of request/reply, size = 24 bytes on 64-bit.
 pub const DRM_IOCTL_WAIT_VBLANK: u32 = ioc(
     IOC_READ | IOC_WRITE,
     DRM_TYPE,
     0x3A,
     core::mem::size_of::<DrmWaitVblank>() as u16,
 );
+pub const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = iowr::<DrmModeCrtcGetSequence>(DRM_TYPE, 0x3b);
+pub const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = iowr::<DrmModeCrtcQueueSequence>(DRM_TYPE, 0x3c);
 
 /// 32 bytes — Linux's `DRM_DISPLAY_MODE_LEN`.
 pub const DRM_MODE_NAME_LEN: usize = 32;
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeCardRes {
     /// user ptr to array of u32 fb ids
     pub fb_id_ptr: u64,
@@ -272,7 +292,7 @@ pub struct DrmModeCardRes {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeModeInfo {
     pub clock: u32,
     pub hdisplay: u16,
@@ -292,7 +312,7 @@ pub struct DrmModeModeInfo {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeCrtc {
     /// user ptr to set-of connector ids (on SETCRTC)
     pub set_connectors_ptr: u64,
@@ -307,7 +327,7 @@ pub struct DrmModeCrtc {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetEncoder {
     pub encoder_id: u32,
     pub encoder_type: u32,
@@ -317,7 +337,7 @@ pub struct DrmModeGetEncoder {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetConnector {
     pub encoders_ptr: u64,
     pub modes_ptr: u64,
@@ -339,14 +359,38 @@ pub struct DrmModeGetConnector {
 
 /// Linux's `DRM_MODE_CONNECTED`.
 pub const DRM_MODE_CONNECTED: u32 = 1;
-/// `DRM_MODE_CONNECTOR_VIRTUAL` — we advertise a single virtual connector
-/// since we're not on real hardware.
+pub const DRM_MODE_DISCONNECTED: u32 = 2;
+pub const DRM_MODE_CONNECTOR_UNKNOWN: u32 = 0;
+pub const DRM_MODE_CONNECTOR_VGA: u32 = 1;
+pub const DRM_MODE_CONNECTOR_DISPLAYPORT: u32 = 10;
+pub const DRM_MODE_CONNECTOR_HDMIA: u32 = 11;
+pub const DRM_MODE_CONNECTOR_EDP: u32 = 14;
 pub const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
-/// Encoder type VIRTUAL.
+pub const DRM_MODE_ENCODER_NONE: u32 = 0;
+pub const DRM_MODE_ENCODER_DAC: u32 = 1;
+pub const DRM_MODE_ENCODER_TMDS: u32 = 2;
+pub const DRM_MODE_ENCODER_LVDS: u32 = 3;
 pub const DRM_MODE_ENCODER_VIRTUAL: u32 = 5;
 
+/// Legacy framebuffer addition request.
+/// Linux: `struct drm_mode_fb_cmd` (28 bytes).
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeFbCmd {
+    /// Output: framebuffer id.
+    pub fb_id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// `DRM_FORMAT_HEADER` depth (bpp/depth pair packed by userspace).
+    pub pitch: u32,
+    pub bpp: u32,
+    pub depth: u32,
+    /// Input: GEM handle of the single plane.
+    pub handle: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeFbCmd2 {
     pub fb_id: u32,
     pub width: u32,
@@ -356,11 +400,13 @@ pub struct DrmModeFbCmd2 {
     pub handles: [u32; 4],
     pub pitches: [u32; 4],
     pub offsets: [u32; 4],
+    /// Explicit ABI alignment bytes before the modifier array.
+    pub _padding: u32,
     pub modifier: [u64; 4],
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeCreateDumb {
     pub height: u32,
     pub width: u32,
@@ -372,7 +418,7 @@ pub struct DrmModeCreateDumb {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeMapDumb {
     pub handle: u32,
     pub pad: u32,
@@ -380,30 +426,52 @@ pub struct DrmModeMapDumb {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeDestroyDumb {
     pub handle: u32,
 }
 
+/// `struct drm_gem_close` — GEM_CLOSE ioctl payload. Unlike
+/// `DrmModeDestroyDumb`, this carries an explicit 8-byte layout
+/// (`handle` + `pad`) so the packed ioctl number decodes with size 8,
+/// matching `DRM_IOCTL_GEM_CLOSE = 0x40086409` as sent by Mesa/libdrm.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+pub struct DrmGemClose {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// Linux DRM fourcc formats supported by the portable GPU interface.
+pub const DRM_FORMAT_RGB565: u32 =
+    (b'R' as u32) | ((b'G' as u32) << 8) | ((b'1' as u32) << 16) | ((b'6' as u32) << 24);
+pub const DRM_FORMAT_RGB888: u32 =
+    (b'R' as u32) | ((b'G' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
+pub const DRM_FORMAT_BGR888: u32 =
+    (b'B' as u32) | ((b'G' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 /// XRGB8888 — four bytes per pixel, little-endian, X/R/G/B in low-to-high.
 pub const DRM_FORMAT_XRGB8888: u32 =
     (b'X' as u32) | ((b'R' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 /// ARGB8888 — same layout but with meaningful alpha.
 pub const DRM_FORMAT_ARGB8888: u32 =
     (b'A' as u32) | ((b'R' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
+pub const DRM_FORMAT_XBGR8888: u32 =
+    (b'X' as u32) | ((b'B' as u32) << 8) | ((b'2' as u32) << 16) | ((b'4' as u32) << 24);
 
 // ======== M4b: planes, properties, page flip, vblank ========
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetPlaneRes {
     /// user ptr to array of u32 plane ids
     pub plane_id_ptr: u64,
     pub count_planes: u32,
+    /// Explicit tail bytes in the 64-bit DRM ABI.
+    pub _padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetPlane {
     pub plane_id: u32,
     pub crtc_id: u32,
@@ -415,17 +483,17 @@ pub struct DrmModeGetPlane {
     pub format_type_ptr: u64,
 }
 
-/// `DRM_MODE_OBJECT_*` — type tags for `OBJ_GETPROPERTIES` and atomic
-/// commits.  Values match Linux's uapi exactly; weston/modetest pattern-
-/// match on them.
+/// Linux `drm_mode.h` object type tags used by object queries and
+/// OBJECT property metadata.
 pub const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+pub const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 
 pub const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeObjGetProperties {
     /// user ptr to u32 array of property ids
     pub props_ptr: u64,
@@ -434,6 +502,8 @@ pub struct DrmModeObjGetProperties {
     pub count_props: u32,
     pub obj_id: u32,
     pub obj_type: u32,
+    /// Explicit tail bytes in the 64-bit DRM ABI.
+    pub _padding: u32,
 }
 
 /// Property-flag bits (`DRM_MODE_PROP_*`).  Only the values we actually
@@ -443,20 +513,21 @@ pub const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 pub const DRM_MODE_PROP_OBJECT: u32 = 1 << 6;
+pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 1 << 7;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 /// `DRM_PROP_NAME_LEN` from Linux uapi.
 pub const DRM_PROP_NAME_LEN: usize = 32;
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModePropertyEnum {
     pub value: u64,
     pub name: [u8; DRM_PROP_NAME_LEN],
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetProperty {
     /// user ptr to u64 array of range limits (RANGE props) or enum values
     pub values_ptr: u64,
@@ -472,7 +543,7 @@ pub struct DrmModeGetProperty {
 // ---- page flip ----
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeCrtcPageFlip {
     pub crtc_id: u32,
     pub fb_id: u32,
@@ -489,7 +560,7 @@ pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 // on output.  Request and reply are the same size (24 bytes on 64-bit);
 // we just overlay the reply when writing back.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmWaitVblank {
     pub rep_type: u32,
     pub sequence: u32,
@@ -503,13 +574,68 @@ pub struct DrmWaitVblank {
 /// `_DRM_VBLANK_ABSOLUTE = 0`, `_DRM_VBLANK_RELATIVE = 1`. The low bits
 /// of `type` are a CRTC index (unused here — we have one CRTC).
 pub const DRM_VBLANK_RELATIVE: u32 = 0x1;
+/// `_DRM_VBLANK_EVENT` — deliver a `DRM_EVENT_VBLANK` on the fd instead
+/// of blocking inside the ioctl.
+pub const DRM_VBLANK_EVENT: u32 = 0x400_0000;
+/// `_DRM_VBLANK_NEXTONMISS` — if the target already passed, jump to the
+/// next edge instead of firing immediately.
+pub const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
+/// `_DRM_VBLANK_SECONDARY` — select the second CRTC (none on this card).
+pub const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
+/// `_DRM_VBLANK_SIGNAL` — signal-based delivery, rejected as EINVAL by
+/// modern Linux.
+pub const DRM_VBLANK_SIGNAL: u32 = 0x4000_0000;
+/// `_DRM_VBLANK_HIGH_CRTC_MASK` — bits 1..6 carry a CRTC index beyond
+/// the secondary bit.
+pub const DRM_VBLANK_HIGH_CRTC_MASK: u32 = 0x3e;
+/// `_DRM_VBLANK_TYPES_MASK` — the absolute/relative selector bits.
+pub const DRM_VBLANK_TYPES_MASK: u32 = DRM_VBLANK_RELATIVE;
+/// `_DRM_VBLANK_FLAGS_MASK` — every flag bit of `type`.
+pub const DRM_VBLANK_FLAGS_MASK: u32 =
+    DRM_VBLANK_EVENT | DRM_VBLANK_SIGNAL | DRM_VBLANK_SECONDARY | DRM_VBLANK_NEXTONMISS;
+
+// ---- CRTC vblank sequence clock (Linux 4.19+ `drm_crtc_get_sequence`) ----
+
+/// `DRM_IOCTL_CRTC_GET_SEQUENCE` payload: query the current vblank
+/// sequence and the timestamp of its edge.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeCrtcGetSequence {
+    pub crtc_id: u32,
+    /// Return: 1 while the CRTC is actively scanning out.
+    pub active: u32,
+    /// Return: most recent vblank sequence.
+    pub sequence: u64,
+    /// Return: time of the sequence's first pixel out, in
+    /// `CLOCK_MONOTONIC` nanoseconds.
+    pub sequence_ns: i64,
+}
+
+/// `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` payload: deliver a
+/// `DRM_EVENT_CRTC_SEQUENCE` when the counter reaches `sequence`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmModeCrtcQueueSequence {
+    pub crtc_id: u32,
+    pub flags: u32,
+    /// Input: target sequence. Output: target (or the actual counter
+    /// when the target had already passed).
+    pub sequence: u64,
+    pub user_data: u64,
+}
+
+/// `DRM_CRTC_SEQUENCE_RELATIVE` — `sequence` counts from the current
+/// counter value.
+pub const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x0000_0001;
+/// `DRM_CRTC_SEQUENCE_NEXT_ON_MISS` — use the next edge if the target
+/// was missed.
+pub const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x0000_0002;
 
 // ---- event delivery ----
 //
-// Page-flip completion events are delivered by reading the DRM fd.  Each
-// event begins with a `drm_event` header (type + total length); the
-// concrete payload type tells userspace what struct to expect.  We only
-// ever emit `drm_event_vblank`.
+// Display events are delivered by reading the DRM fd. Each event begins
+// with a `drm_event` header (type + total length); the event type selects
+// either a vblank/page-flip payload or a CRTC sequence payload.
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
@@ -529,7 +655,19 @@ pub struct DrmEventVblank {
     pub crtc_id: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmEventCrtcSequence {
+    pub base: DrmEvent,
+    pub user_data: u64,
+    /// `CLOCK_MONOTONIC` nanoseconds of the delivery edge.
+    pub tv_ns: i64,
+    pub sequence: u64,
+}
+
+pub const DRM_EVENT_VBLANK: u32 = 0x01;
 pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+pub const DRM_EVENT_CRTC_SEQUENCE: u32 = 0x03;
 
 // ======== M4c: atomic KMS + property blobs ========
 
@@ -542,7 +680,7 @@ pub const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 /// `props_ptr` / `prop_values_ptr` arrays together have
 /// `sum(count_props_ptr[0..count_objs])` entries, consumed in order.
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeAtomic {
     pub flags: u32,
     pub count_objs: u32,
@@ -569,7 +707,7 @@ pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 // `GETPROPBLOB` reads the stored bytes back.
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeCreateBlob {
     /// user ptr to the source bytes
     pub data: u64,
@@ -579,13 +717,13 @@ pub struct DrmModeCreateBlob {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeDestroyBlob {
     pub blob_id: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AnyBitPattern)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
 pub struct DrmModeGetBlob {
     pub blob_id: u32,
     pub length: u32,
@@ -593,7 +731,174 @@ pub struct DrmModeGetBlob {
     pub data: u64,
 }
 
-#[cfg(all(test, feature = "rknpu"))]
+// ---- Generic-DRM syncobj family (core ioctls 0xBF..0xCF) ----
+//
+// Mesa's venus ICD tracks GPU completion through timeline syncobjs
+// (util_sync_provider_drm selects the kernel path when DRM_CAP_SYNCOBJ_TIMELINE
+// is reported), so card0 serves the family alongside the VIRTGPU_* ioctls.
+// The MODE_* ioctl nrs stop at 0xBE, so nothing collides.
+
+/// Creates a syncobj. Linux: `struct drm_syncobj_create` (8 bytes)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjCreate {
+    /// Output: syncobj handle.
+    pub handle: u32,
+    /// Input: `DRM_SYNCOBJ_CREATE_*` flags.
+    pub flags: u32,
+}
+
+/// Destroys a syncobj. Linux: `struct drm_syncobj_destroy` (8 bytes)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjDestroy {
+    /// Input: syncobj handle.
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// Exports/imports a syncobj as a sync_file fd.
+/// `struct drm_syncobj_handle` as the userspace headers define it for this
+/// stack: 24 bytes, with a trailing timeline point (the new-style
+/// handle-to-fd export carries the point to export at; 0 means the binary
+/// view of the syncobj).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjHandle {
+    pub handle: u32,
+    pub flags: u32,
+    pub fd: i32,
+    pub pad: u32,
+    pub point: u64,
+}
+
+/// Waits on binary syncobjs. Linux: `struct drm_syncobj_wait` (40 bytes:
+/// handles, timeout_nsec, count_handles, flags, first_signaled, pad,
+/// deadline_nsec).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjWait {
+    /// Pointer to a __u32 handle array.
+    pub handles: u64,
+    /// Absolute CLOCK_MONOTONIC deadline in nanoseconds; a value that
+    /// already lapsed degenerates to a single poll (Linux
+    /// `drm_timeout_abs_to_jiffies`).
+    pub timeout_nsec: i64,
+    /// Number of handles in the array.
+    pub count_handles: u32,
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_*`.
+    pub flags: u32,
+    /// Output: index of the first signaled handle (valid on a successful
+    /// non-WAIT_ALL return only).
+    pub first_signaled: u32,
+    pub pad: u32,
+    /// Optional per-wait deadline hint forwarded to the fences when
+    /// WAIT_DEADLINE is set (Linux master, post-v7.1); accepted and unused.
+    pub deadline_nsec: u64,
+}
+
+/// Resets/signals binary syncobjs. Linux: `struct drm_syncobj_array` (16 bytes)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjArray {
+    pub handles: u64,
+    pub count_handles: u32,
+    pub flags: u32,
+}
+
+/// Queries/signals timeline syncobjs.
+/// Linux: `struct drm_syncobj_timeline_array` (24 bytes)
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjTimelineArray {
+    pub handles: u64,
+    /// Pointer to a __u64 point array.
+    pub points: u64,
+    pub count_handles: u32,
+    pub flags: u32,
+}
+
+/// Waits on timeline syncobjs. Linux: `struct drm_syncobj_timeline_wait`
+/// (48 bytes).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjTimelineWait {
+    pub handles: u64,
+    pub points: u64,
+    /// Absolute CLOCK_MONOTONIC deadline (`__s64` in Linux: negative values
+    /// read as already lapsed).
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    /// Output: index of the first signaled handle (valid on a successful
+    /// non-WAIT_ALL return only).
+    pub first_signaled: u32,
+    pub pad: u32,
+    /// Optional per-wait deadline hint forwarded to the fences when
+    /// WAIT_DEADLINE is set (Linux master, post-v7.1); accepted and unused.
+    pub deadline_nsec: u64,
+}
+
+/// Registers an eventfd to be signalled when a syncobj point completes.
+/// Linux: `struct drm_syncobj_eventfd` (24 bytes, v6.7 UAPI).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, AnyBitPattern, NoUninit)]
+pub struct DrmSyncobjEventfd {
+    pub handle: u32,
+    /// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE` waits for a fence to become
+    /// available rather than for the point to signal.
+    pub flags: u32,
+    /// Timeline point (0 for binary syncobjs).
+    pub point: u64,
+    /// Existing eventfd to signal.
+    pub fd: i32,
+    pub pad: u32,
+}
+
+pub const DRM_IOCTL_SYNCOBJ_CREATE: u32 = iowr::<DrmSyncobjCreate>(DRM_TYPE, 0xBF);
+pub const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = iowr::<DrmSyncobjDestroy>(DRM_TYPE, 0xC0);
+pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = iowr::<DrmSyncobjHandle>(DRM_TYPE, 0xC1);
+pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = iowr::<DrmSyncobjHandle>(DRM_TYPE, 0xC2);
+pub const DRM_IOCTL_SYNCOBJ_WAIT: u32 = iowr::<DrmSyncobjWait>(DRM_TYPE, 0xC3);
+pub const DRM_IOCTL_SYNCOBJ_RESET: u32 = iowr::<DrmSyncobjArray>(DRM_TYPE, 0xC4);
+pub const DRM_IOCTL_SYNCOBJ_SIGNAL: u32 = iowr::<DrmSyncobjArray>(DRM_TYPE, 0xC5);
+pub const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 = iowr::<DrmSyncobjTimelineWait>(DRM_TYPE, 0xCA);
+pub const DRM_IOCTL_SYNCOBJ_QUERY: u32 = iowr::<DrmSyncobjTimelineArray>(DRM_TYPE, 0xCB);
+pub const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 =
+    iowr::<DrmSyncobjTimelineArray>(DRM_TYPE, 0xCD);
+pub const DRM_IOCTL_SYNCOBJ_EVENTFD: u32 = iowr::<DrmSyncobjEventfd>(DRM_TYPE, 0xCF);
+
+/// `DRM_SYNCOBJ_CREATE_SIGNALED`: create the syncobj in the signaled state.
+pub const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL`: wait for every handle, not any one.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT`: allow waiting on a future point.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: wait for a fence to become
+/// available at the point rather than for the point to signal.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 1 << 2;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE`: pass `deadline_nsec` as a
+/// scheduling hint to the fences (v6.11+). Accepted and ignored here — it
+/// never changes the wait predicate.
+pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 1 << 3;
+
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE`: export a sync file
+/// fd instead of a syncobj fd.
+pub const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE`: export the sync file at
+/// `point` (v6.16+); without it `point` must be zero.
+pub const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE: u32 = 1 << 1;
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE`: import a sync file fd.
+pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE`: import the fence at `point`
+/// (v6.16+); without it `point` must be zero.
+pub const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE: u32 = 1 << 1;
+
+/// `DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED`: QUERY reports the newest
+/// attached point instead of the last completed one.
+pub const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: u32 = 1 << 0;
+
+#[cfg(all(test, not(axtest), feature = "rknpu"))]
 mod tests {
     use super::*;
 
@@ -643,5 +948,71 @@ mod tests {
         assert!(!is_driver_ioctl(ioctl_nr(DRM_IOCTL_MODE_GETRESOURCES)));
         assert!(is_driver_ioctl(0x40));
         assert!(is_driver_ioctl(0x45));
+    }
+}
+
+/// Layout pins for the UAPI command words this file defines. Deliberately
+/// outside the `rknpu`-gated `mod tests` (whose helpers are rknpu-only):
+/// these assertions only touch always-compiled constants, and keeping them
+/// in the default-feature test build makes `cargo test -p starry-kernel`
+/// run them — the guest-side `_Static_assert`s in `drm-test-syncobj` are
+/// the second, independent layer.
+#[cfg(all(test, not(axtest)))]
+mod uapi_layout_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_addfb_matches_linux_command_word() {
+        // GBM userspaces issue the legacy ADDFB with the 28-byte
+        // `drm_mode_fb_cmd`; the packed command must be the exact word
+        // observed on real clients, or the dispatch never sees it. The
+        // size field (bits 29..16) is decoded locally — `io_size` lives
+        // behind the `rknpu` feature.
+        assert_eq!(DRM_IOCTL_MODE_ADDFB, 0xc01c_64ae);
+        assert_eq!(
+            (DRM_IOCTL_MODE_ADDFB >> 16) & 0x3fff,
+            core::mem::size_of::<DrmModeFbCmd>() as u32
+        );
+        assert_eq!(core::mem::size_of::<DrmModeFbCmd>(), 28);
+    }
+
+    #[test]
+    fn syncobj_handle_to_fd_matches_userspace_command_word() {
+        // Mesa's EGL native-fence path exports syncobjs with the 24-byte
+        // (point-carrying) `drm_syncobj_handle`; the size is part of the
+        // command word, so a 16-byte struct silently misses the dispatch.
+        assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
+        assert_eq!(core::mem::size_of::<DrmSyncobjHandle>(), 24);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjHandle, fd), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjHandle, point), 16);
+    }
+
+    #[test]
+    fn syncobj_wait_structs_match_linux_command_words() {
+        // libdrm compiles `struct drm_syncobj_wait` from the Linux UAPI
+        // header as 40 bytes — timeout_nsec sits before count_handles and
+        // the trailing deadline_nsec hint rides along — and
+        // `drm_syncobj_timeline_wait` as 48 bytes. The packed size is part
+        // of the command word, so any layout drift silently misses the
+        // dispatch (`drmSyncobjWait` gets ENOTTY from the default arm).
+        // The offset pins catch same-size reorders a size check cannot.
+        assert_eq!(DRM_IOCTL_SYNCOBJ_WAIT, 0xc028_64c3);
+        assert_eq!(core::mem::size_of::<DrmSyncobjWait>(), 40);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, timeout_nsec), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, count_handles), 16);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, first_signaled), 24);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjWait, deadline_nsec), 32);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xc030_64ca);
+        assert_eq!(core::mem::size_of::<DrmSyncobjTimelineWait>(), 48);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjTimelineWait, points), 8);
+        assert_eq!(core::mem::offset_of!(DrmSyncobjTimelineWait, timeout_nsec), 16);
+        assert_eq!(
+            core::mem::offset_of!(DrmSyncobjTimelineWait, count_handles),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(DrmSyncobjTimelineWait, deadline_nsec),
+            40
+        );
     }
 }

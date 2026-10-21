@@ -1,13 +1,18 @@
+#[cfg(feature = "pool")]
 use alloc::{
     collections::VecDeque,
     sync::{Arc, Weak},
 };
 use core::ops::{Deref, DerefMut};
 
-use ax_kspin::SpinNoIrq as Mutex;
+#[cfg(feature = "pool")]
+use ax_sync::RawSpinLock;
 
-use crate::{ContiguousArray, DeviceDma, DmaDirection, DmaError};
+use crate::ContiguousArray;
+#[cfg(feature = "pool")]
+use crate::{DeviceDma, DmaDirection, DmaError};
 
+#[cfg(feature = "pool")]
 #[derive(Clone, Debug)]
 pub(crate) struct ContiguousBufferConfig {
     pub size: usize,
@@ -15,14 +20,16 @@ pub(crate) struct ContiguousBufferConfig {
     pub direction: DmaDirection,
 }
 
+#[cfg(feature = "pool")]
 #[derive(Clone)]
 pub struct ContiguousBufferPool {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<RawSpinLock<Inner>>,
 }
 
 pub struct ContiguousBuffer {
     data: Option<ContiguousArray<u8>>,
-    pool: Weak<Mutex<Inner>>,
+    #[cfg(feature = "pool")]
+    pool: Weak<RawSpinLock<Inner>>,
 }
 
 unsafe impl Send for ContiguousBuffer {}
@@ -43,21 +50,24 @@ impl DerefMut for ContiguousBuffer {
 
 impl Drop for ContiguousBuffer {
     fn drop(&mut self) {
+        #[cfg(feature = "pool")]
         if let Some(data) = self.data.take()
             && let Some(pool) = self.pool.upgrade()
         {
-            let mut inner = pool.lock();
+            let mut inner = pool.lock_irqsave();
             inner.dealloc(data);
         }
     }
 }
 
+#[cfg(feature = "pool")]
 struct Inner {
     dev: DeviceDma,
     config: ContiguousBufferConfig,
     pool: VecDeque<ContiguousArray<u8>>,
 }
 
+#[cfg(feature = "pool")]
 impl Inner {
     fn alloc(&mut self) -> Option<ContiguousArray<u8>> {
         self.pool.pop_front()
@@ -68,6 +78,7 @@ impl Inner {
     }
 }
 
+#[cfg(feature = "pool")]
 impl ContiguousBufferPool {
     pub(crate) fn with_capacity(
         dev: DeviceDma,
@@ -87,7 +98,7 @@ impl ContiguousBufferPool {
         }
 
         ContiguousBufferPool {
-            inner: Arc::new(Mutex::new(Inner { dev, pool, config })),
+            inner: Arc::new(RawSpinLock::new(Inner { dev, pool, config })),
         }
     }
 
@@ -95,7 +106,7 @@ impl ContiguousBufferPool {
         let config;
         let dev;
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner.lock_irqsave();
             if let Some(data) = inner.alloc() {
                 return Ok(ContiguousBuffer {
                     data: Some(data),

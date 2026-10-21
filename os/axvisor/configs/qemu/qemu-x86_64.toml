@@ -1,3 +1,4 @@
+cmdline = "root=/dev/nvme0n1 rw"
 args = [
   "-nographic",
   "-cpu",
@@ -5,17 +6,20 @@ args = [
   "-machine",
   "q35",
   "-smp",
-  "1",
+  "2",
   "-accel",
   "kvm",
   "-device",
-  "virtio-blk-pci,drive=disk0",
+  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
-  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+  "id=disk0,if=none,format=raw,file=${workspace}/target/axbuild/rootfs/rootfs-x86_64-alpine.img",
+  "-netdev",
+  "user,id=net0,hostfwd=tcp:127.0.0.1:8080-:8080",
+  "-device",
+  "e1000,netdev=net0",
   "-m",
-  "512M",
+  "2G",
 ]
 fail_regex = []
-success_regex = []
-to_bin = false
-uefi = false
+to_bin = true
+uefi = true

@@ -8,13 +8,13 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ax_kspin::SpinRaw as SpinMutex;
+use ax_sync::{RawSpinLock, RawSpinLockUnpinnedGuard};
 
 use crate::{
     align_up,
     buddy::{BuddyAllocator, BuddySection, ManagedSection, PageFlags, SectionInitSpec},
-    eii,
     error::{AllocError, AllocResult},
+    interface,
     slab::{
         SlabAllocResult,
         page::{SLAB_MAGIC, SlabPageHeader},
@@ -32,11 +32,11 @@ pub fn __reset_global_allocator_singleton_for_tests() {
 
 /// Unified allocator: buddy page allocator + per-CPU slab caches.
 pub struct GlobalAllocator<const PAGE_SIZE: usize = 0x1000> {
-    buddy: SpinMutex<BuddyAllocator<PAGE_SIZE>>,
+    buddy: RawSpinLock<BuddyAllocator<PAGE_SIZE>>,
     initialized: AtomicBool,
 }
 
-// SAFETY: All mutable state is behind SpinMutex or AtomicBool.
+// SAFETY: All mutable state is behind RawSpinLock or AtomicBool.
 unsafe impl<const PAGE_SIZE: usize> Sync for GlobalAllocator<PAGE_SIZE> {}
 unsafe impl<const PAGE_SIZE: usize> Send for GlobalAllocator<PAGE_SIZE> {}
 
@@ -44,7 +44,7 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
     /// Create an uninitialised global allocator.
     pub const fn new() -> Self {
         Self {
-            buddy: SpinMutex::new(BuddyAllocator::new()),
+            buddy: RawSpinLock::new(BuddyAllocator::new()),
             initialized: AtomicBool::new(false),
         }
     }
@@ -57,6 +57,14 @@ impl<const PAGE_SIZE: usize> Default for GlobalAllocator<PAGE_SIZE> {
 }
 
 impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
+    #[inline]
+    fn buddy(&self) -> RawSpinLockUnpinnedGuard<'_, BuddyAllocator<PAGE_SIZE>> {
+        // SAFETY: this allocator intentionally preserves the legacy raw-lock
+        // contract. Its OS integration serializes entry against local
+        // re-entry, while the lock word excludes concurrent CPUs.
+        unsafe { self.buddy.lock_raw() }
+    }
+
     /// Initialise the allocator over the first region.
     ///
     /// # Safety
@@ -90,7 +98,7 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
                 }
             };
 
-            let mut buddy = self.buddy.lock();
+            let mut buddy = self.buddy();
             buddy.reset();
             if let Err(err) = buddy.add_region_raw(SectionInitSpec {
                 region_start: raw_region_start,
@@ -129,27 +137,51 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
     /// - `region` must be writable and remain valid for the lifetime of this allocator.
     /// - The region must not overlap any already managed region.
     pub unsafe fn add_region(&self, region: &mut [u8]) -> AllocResult {
-        unsafe {
-            if !self.initialized.load(Ordering::Acquire) {
-                return Err(AllocError::NotInitialized);
-            }
-            let region_start = region.as_mut_ptr() as usize;
-            let region_size = region.len();
-            let Some(layout) = BuddySection::compute_region_layout_with_heap_align::<PAGE_SIZE>(
+        unsafe { self.add_region_with_heap_align(region, REGION_GRANULE) }.map(|_| ())
+    }
+
+    /// Adds a region using page alignment and returns allocator-visible bytes.
+    /// The section header and page metadata consume space within `region`.
+    /// Returns zero if the region cannot hold even one managed page.
+    ///
+    /// # Safety
+    /// - `region` must be writable and remain valid for the lifetime of this allocator.
+    /// - The region must not overlap any already managed region.
+    pub unsafe fn add_compact_region(&self, region: &mut [u8]) -> AllocResult<usize> {
+        unsafe { self.add_region_with_heap_align(region, PAGE_SIZE) }
+    }
+
+    /// # Safety
+    /// `region` must remain writable and disjoint from managed regions for the
+    /// allocator lifetime.
+    unsafe fn add_region_with_heap_align(
+        &self,
+        region: &mut [u8],
+        heap_align: usize,
+    ) -> AllocResult<usize> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(AllocError::NotInitialized);
+        }
+        let region_start = region.as_mut_ptr() as usize;
+        let region_size = region.len();
+        let Some(layout) = BuddySection::compute_region_layout_with_heap_align::<PAGE_SIZE>(
+            region_start,
+            region_size,
+            heap_align,
+        ) else {
+            log::info!(
+                "GlobalAllocator: skip region {:#x}+{:#x}, no allocator-visible memory after {} \
+                 alignment",
                 region_start,
                 region_size,
-                REGION_GRANULE,
-            ) else {
-                log::info!(
-                    "GlobalAllocator: skip region {:#x}+{:#x}, no allocator-visible memory after \
-                     {} alignment",
-                    region_start,
-                    region_size,
-                    REGION_GRANULE,
-                );
-                return Ok(());
-            };
-            self.buddy.lock().add_region_raw(SectionInitSpec {
+                heap_align,
+            );
+            return Ok(0);
+        };
+        // SAFETY: the caller provides a disjoint, lifetime-stable writable
+        // region, and the computed metadata and heap spans are contained in it.
+        unsafe {
+            self.buddy().add_region_raw(SectionInitSpec {
                 region_start,
                 region_size,
                 section_ptr: layout.section_start as *mut BuddySection,
@@ -159,47 +191,56 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
                 ),
                 heap_start: layout.managed_heap_start,
                 heap_size: layout.managed_heap_size,
-            })
+            })?;
         }
+        Ok(layout.managed_heap_size)
     }
 
     /// Number of managed sections.
     pub fn managed_section_count(&self) -> usize {
-        self.buddy.lock().section_count()
+        self.buddy().section_count()
     }
 
     /// Read-only summary for a managed section.
     pub fn managed_section(&self, index: usize) -> Option<ManagedSection> {
-        self.buddy.lock().section(index)
+        self.buddy().section(index)
     }
 
     /// Total managed heap bytes across all sections.
     ///
     /// This excludes region-prefix metadata such as `BuddySection` and `PageMeta[]`.
     pub fn managed_bytes(&self) -> usize {
-        self.buddy.lock().managed_bytes()
+        self.buddy().managed_bytes()
     }
 
     /// Allocated backend bytes across all sections.
     ///
     /// This is page-level occupancy, not the exact sum of requested layout sizes.
     pub fn allocated_bytes(&self) -> usize {
-        self.buddy.lock().allocated_bytes()
+        self.buddy().allocated_bytes()
+    }
+
+    /// Available backend bytes, observed under one buddy metadata lock.
+    pub fn available_bytes(&self) -> usize {
+        let buddy = self.buddy();
+        buddy
+            .managed_bytes()
+            .saturating_sub(buddy.allocated_bytes())
     }
 
     /// Allocate contiguous pages. Returns the virtual start address.
     pub fn alloc_pages(&self, count: usize, align: usize) -> AllocResult<usize> {
-        self.buddy.lock().alloc_pages(count, align)
+        self.buddy().alloc_pages(count, align)
     }
 
     /// Free pages previously obtained via [`alloc_pages`](Self::alloc_pages).
     pub fn dealloc_pages(&self, addr: usize, count: usize) {
-        self.buddy.lock().dealloc_pages(addr, count);
+        self.buddy().dealloc_pages(addr, count);
     }
 
     /// Allocate pages with physical address below 4 GiB.
     pub fn alloc_pages_lowmem(&self, count: usize, align: usize) -> AllocResult<usize> {
-        self.buddy.lock().alloc_pages_lowmem(count, align)
+        self.buddy().alloc_pages_lowmem(count, align)
     }
 
     /// Allocate memory for `layout`. Returns a pointer on success.
@@ -235,15 +276,15 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
     }
 
     fn slab_alloc(&self, layout: Layout) -> AllocResult<NonNull<u8>> {
-        let pool = eii::slab_pool();
+        let pool = interface::slab_pool();
 
         match pool.alloc(layout)? {
             SlabAllocResult::Allocated(ptr) => Ok(ptr),
             SlabAllocResult::NeedsSlab { size_class, pages } => {
                 let bytes = pages * PAGE_SIZE;
-                let addr = self.buddy.lock().alloc_pages(pages, bytes)?;
+                let addr = self.buddy().alloc_pages(pages, bytes)?;
                 unsafe {
-                    self.buddy.lock().set_page_flags(addr, PageFlags::Slab)?;
+                    self.buddy().set_page_flags(addr, PageFlags::Slab)?;
                 }
                 pool.add_slab(size_class, addr, bytes);
                 match pool.alloc(layout)? {
@@ -263,11 +304,11 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
             let hdr = &*(base as *const SlabPageHeader);
             debug_assert_eq!(hdr.magic, SLAB_MAGIC);
 
-            match eii::slab_pool().dealloc(ptr, layout, hdr.owner_cpu as usize) {
+            match interface::slab_pool().dealloc(ptr, layout, hdr.owner_cpu as usize) {
                 crate::SlabPoolDeallocResult::Done => {}
                 crate::SlabPoolDeallocResult::RemoteQueued => {}
                 crate::SlabPoolDeallocResult::FreeSlab { base, pages } => {
-                    self.buddy.lock().dealloc_pages(base, pages);
+                    self.buddy().dealloc_pages(base, pages);
                 }
             }
         }
@@ -276,15 +317,13 @@ impl<const PAGE_SIZE: usize> GlobalAllocator<PAGE_SIZE> {
     fn large_alloc(&self, layout: Layout) -> AllocResult<NonNull<u8>> {
         let pages = align_up(layout.size(), PAGE_SIZE) / PAGE_SIZE;
         let align = layout.align().max(PAGE_SIZE);
-        let addr = self.buddy.lock().alloc_pages(pages, align)?;
+        let addr = self.buddy().alloc_pages(pages, align)?;
         Ok(unsafe { NonNull::new_unchecked(addr as *mut u8) })
     }
 
     unsafe fn large_dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
         let pages = align_up(layout.size(), PAGE_SIZE) / PAGE_SIZE;
-        self.buddy
-            .lock()
-            .dealloc_pages(ptr.as_ptr() as usize, pages);
+        self.buddy().dealloc_pages(ptr.as_ptr() as usize, pages);
     }
 }
 

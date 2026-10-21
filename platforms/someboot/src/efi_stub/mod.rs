@@ -3,20 +3,26 @@ use core::arch::naked_asm;
 use core::{
     ffi::c_void,
     fmt::Write,
-    mem::MaybeUninit,
+    mem::{MaybeUninit, align_of, size_of},
     ptr::{addr_of_mut, null},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub use uefi::Status;
-#[cfg(target_arch = "loongarch64")]
-pub use uefi::runtime::ResetType;
 use uefi::{
     Guid, Result,
-    boot::{self, MemoryDescriptor, MemoryType},
+    boot::{self, AllocateType, MemoryDescriptor, MemoryType},
     guid,
     prelude::*,
-    proto::loaded_image::LoadedImage,
+    proto::{
+        device_path::build,
+        loaded_image::LoadedImage,
+        media::{
+            file::{File, FileAttribute, FileInfo, FileMode, FileType, RegularFile},
+            load_file::LoadFile2,
+        },
+        rng::Rng,
+    },
     runtime::{self, set_virtual_address_map},
     system::with_config_table,
     table::{self, cfg::ConfigTableEntry},
@@ -29,11 +35,32 @@ use crate::{
     mem::{__io, __va},
 };
 
+cfg_select! {
+    target_arch = "loongarch64" => {
+        pub(crate) mod loongarch64;
+        use loongarch64 as platform;
+        pub use loongarch64::{ResetType, reset};
+    }
+    any(target_arch = "x86_64", target_arch = "aarch64") => {
+        mod firmware;
+        use firmware as platform;
+    }
+}
+
 const EFI_IMAGE_HANDLE_UNSET: usize = usize::MAX;
 const EXIT_BOOT_MEMORY_MAP_BUFFER_SIZE: usize = 128 * 1024;
 const EXIT_BOOT_MEMORY_MAP_DESCRIPTOR_CAPACITY: usize = 1024;
 const EXIT_BOOT_MEMORY_MAP_RETRIES: usize = 3;
 const FDT_TABLE_GUID: Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
+const LINUX_EFI_INITRD_MEDIA_GUID: Guid = guid!("5568e427-68fc-4f3d-ac74-ca555231cc68");
+const LINUX_INITRD_DEVICE_PATH_SIZE: usize = 24;
+const MAX_UEFI_INITRAMFS_BYTES: usize = 1024 * 1024 * 1024;
+use crate::handoff::{MAX_CMDLINE, cmdline::decode_efi_cmdline};
+
+const _: () =
+    assert!(size_of::<LoadFile2>() == size_of::<uefi_raw::protocol::media::LoadFile2Protocol>());
+const _: () =
+    assert!(align_of::<LoadFile2>() == align_of::<uefi_raw::protocol::media::LoadFile2Protocol>());
 
 #[repr(align(8))]
 struct AlignedBytes<const N: usize>([u8; N]);
@@ -46,12 +73,16 @@ static mut EXIT_BOOT_MEMORY_MAP_DESCRIPTORS: [MaybeUninit<MemoryDescriptor>;
 static EFI_IMAGE_HANDLE: AtomicUsize = AtomicUsize::new(EFI_IMAGE_HANDLE_UNSET);
 
 pub(crate) fn setup_service(system_table: *const ::core::ffi::c_void) {
+    let system_table = platform::normalize_system_table(system_table);
     unsafe { table::set_system_table(system_table.cast()) };
+    let inherited_handoff = platform::prepare_service_context(system_table);
     if let Some(image_handle) = saved_image_handle() {
         unsafe { boot::set_image_handle(image_handle) };
     }
-    setup_console();
-    println!("UEFI console ok.");
+    if !inherited_handoff {
+        setup_console();
+        println!("UEFI console ok.");
+    }
     find_fdt();
     find_acpi_rsdp();
 }
@@ -88,8 +119,7 @@ unsafe extern "C" fn efi_pe_entry_main(
         save_image_handle(image_handle);
         boot::set_image_handle(image_handle);
         table::set_system_table(system_table.cast());
-        setup_console();
-        println!("UEFI application started.");
+        platform::prepare_entry_payload(image_handle);
         // Safety: `system_table` comes from the EFI firmware entry path and
         // matches the contract documented on `ArchTrait::efi_enter_kernel`.
         if Arch::efi_enter_kernel(system_table) {
@@ -114,10 +144,31 @@ pub unsafe extern "efiapi" fn efi_pe_entry(
 }
 
 pub(crate) fn exit_boot_services() {
+    if platform::inherited_handoff() {
+        return;
+    }
     println!("Exiting UEFI boot services...");
     UEFI_SERVICE_EXIT.store(true, core::sync::atomic::Ordering::Relaxed);
     let mem_map = unsafe { exit_boot_services_no_alloc() };
     println!("Exited boot services, memory map obtained.");
+
+    if let Some((start, end)) = crate::boot_payload::staged_uefi() {
+        let allocation_end = end
+            .checked_next_multiple_of(crate::consts::PAGE_SIZE)
+            .expect("host archive page range overflows");
+        assert!(
+            mem_map.entries().any(|entry| {
+                entry.ty == MemoryType::LOADER_DATA
+                    && entry.phys_start <= start as u64
+                    && entry
+                        .page_count
+                        .checked_mul(4096)
+                        .and_then(|size| entry.phys_start.checked_add(size))
+                        .is_some_and(|limit| allocation_end as u64 <= limit)
+            }),
+            "host initramfs is not backed by UEFI loader pages"
+        );
+    }
 
     let mut new_map: heapless::Vec<MemoryDescriptor, 32> = heapless::Vec::new();
 
@@ -139,12 +190,248 @@ pub(crate) fn exit_boot_services() {
 
     unsafe {
         if let Some(st) = uefi::table::system_table_raw() {
-            set_virtual_address_map(&mut new_map, __va(st.as_ptr() as _) as _)
+            let virtual_system_table = platform::runtime_system_table(st.as_ptr());
+            set_virtual_address_map(&mut new_map, virtual_system_table)
                 .expect("Failed to set virtual address map");
         }
     }
 
     memmap::setup_memory_map(mem_map.entries());
+    platform::reserve_boot_memory();
+    #[cfg(feature = "boot-resources")]
+    for resource in crate::boot_resources::snapshots()
+        .iter()
+        .filter(|r| r.id != 0)
+    {
+        crate::mem::add_memory_descriptor(crate::mem::MemoryDescriptor::new_aligned(
+            resource.range.start as usize,
+            resource.range.len as usize,
+            crate::mem::MemoryType::BootData,
+            4096,
+        ))
+        .expect("failed to reserve boot resource");
+    }
+    crate::boot_payload::reserve_staged_uefi();
+}
+
+fn load_firmware_entry_payload(image_handle: Handle) {
+    setup_console();
+    println!("UEFI application started.");
+    load_efi_cmdline(image_handle);
+    load_efi_payload();
+}
+
+pub(crate) fn init_boot_memory_map() {
+    platform::init_boot_memory_map();
+}
+
+fn load_efi_payload() {
+    let archive_staged = load_linux_initrd();
+    if crate::cmdline::has_handoff_cmdline() && archive_staged {
+        return;
+    }
+
+    let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else {
+        return;
+    };
+    let mut volume = fs.open_volume().expect("failed to open UEFI boot volume");
+    if !crate::cmdline::has_handoff_cmdline()
+        && let Ok(file) = volume.open(
+            uefi::cstr16!("\\EFI\\BOOT\\cmdline.txt"),
+            FileMode::Read,
+            FileAttribute::empty(),
+        )
+    {
+        let mut file = regular_file(file);
+        let size = file_size(&mut file);
+        assert!(size <= MAX_CMDLINE, "host command line is too long");
+        let mut bytes = [0u8; MAX_CMDLINE];
+        read_exact_file(&mut file, &mut bytes[..size]);
+        let command = core::str::from_utf8(&bytes[..size]).expect("invalid host command line");
+        assert!(!command.contains('\0'), "host command line contains NUL");
+        crate::cmdline::set_cmdline(command.trim_end_matches(['\r', '\n']));
+    }
+    if !archive_staged
+        && let Ok(file) = volume.open(
+            uefi::cstr16!("\\EFI\\BOOT\\initramfs.cpio"),
+            FileMode::Read,
+            FileAttribute::empty(),
+        )
+    {
+        let mut file = regular_file(file);
+        let size = file_size(&mut file);
+        assert!(
+            size > 0 && size <= MAX_UEFI_INITRAMFS_BYTES,
+            "invalid UEFI host archive size"
+        );
+        let pages = size.div_ceil(crate::consts::PAGE_SIZE);
+        let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
+            .expect("failed to inspect the loaded UEFI image");
+        let (image_base, _) = image.info();
+        let max_address = (image_base as usize)
+            .checked_sub(1)
+            .expect("loaded UEFI image has no lower address for host archive");
+        let address = boot::allocate_pages(
+            AllocateType::MaxAddress(max_address as _),
+            MemoryType::LOADER_DATA,
+            pages,
+        )
+        .expect("failed to allocate UEFI host archive below the loaded image");
+        // SAFETY: allocate_pages returned at least `size` writable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(address.as_ptr(), size) };
+        read_exact_file(&mut file, bytes);
+        let start = address.as_ptr() as usize;
+        crate::boot_payload::stage_uefi(
+            start,
+            start
+                .checked_add(size)
+                .expect("host archive range overflows"),
+        );
+        println!("UEFI host initramfs loaded: {size} bytes");
+    }
+}
+
+fn load_linux_initrd() -> bool {
+    let mut storage = [MaybeUninit::uninit(); LINUX_INITRD_DEVICE_PATH_SIZE];
+    let mut device_path = build::DevicePathBuilder::with_buf(&mut storage)
+        .push(&build::media::Vendor {
+            vendor_guid: LINUX_EFI_INITRD_MEDIA_GUID,
+            vendor_defined_data: &[],
+        })
+        .expect("failed to build Linux initrd device path")
+        .finalize()
+        .expect("failed to finalize Linux initrd device path");
+    let handle = match boot::locate_device_path::<LoadFile2>(&mut device_path) {
+        Ok(handle) => handle,
+        Err(error) if error.status() == Status::NOT_FOUND => return false,
+        Err(error) => panic!("failed to locate Linux initrd provider: {error:?}"),
+    };
+    let mut provider = boot::open_protocol_exclusive::<LoadFile2>(handle)
+        .expect("failed to open Linux initrd provider");
+    // SAFETY: `open_protocol_exclusive` keeps this firmware protocol instance
+    // valid and uniquely borrowed for the lifetime of `provider`. `LoadFile2`
+    // is a `#[repr(transparent)]` wrapper around the raw UEFI protocol, and
+    // the size and alignment assertions above pin that representation at
+    // compile time.
+    let raw_provider = unsafe {
+        &mut *((&mut *provider) as *mut LoadFile2
+            as *mut uefi_raw::protocol::media::LoadFile2Protocol)
+    };
+    let mut size = 0usize;
+    // SAFETY: the firmware-installed callback belongs to `raw_provider`; the
+    // finalized device path and `size` pointer are valid for this call, and a
+    // null buffer with `BootPolicy = FALSE` is the UEFI LoadFile2 size-query
+    // contract. The firmware does not retain any of these pointers.
+    let status = unsafe {
+        (raw_provider.load_file)(
+            raw_provider,
+            device_path.as_ffi_ptr().cast(),
+            uefi_raw::Boolean::FALSE,
+            &mut size,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        status,
+        uefi::Status::BUFFER_TOO_SMALL,
+        "Linux initrd provider did not report its size"
+    );
+    assert!(
+        size > 0 && size <= MAX_UEFI_INITRAMFS_BYTES,
+        "invalid Linux initrd size: {size}"
+    );
+    let pages = size.div_ceil(crate::consts::PAGE_SIZE);
+    let address = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, pages)
+        .expect("failed to allocate Linux initrd");
+    let mut loaded = size;
+    // SAFETY: this is the same exclusively opened provider and finalized
+    // device path as the size query. `address` owns `pages` writable
+    // `LOADER_DATA` pages, and the exact size reported by the query is passed
+    // as the buffer capacity, so the firmware callback may write only within
+    // that allocation through `address` and `loaded`.
+    let status = unsafe {
+        (raw_provider.load_file)(
+            raw_provider,
+            device_path.as_ffi_ptr().cast(),
+            uefi_raw::Boolean::FALSE,
+            &mut loaded,
+            address.as_ptr().cast(),
+        )
+    };
+    if status != Status::SUCCESS || loaded != size {
+        // SAFETY: the allocation has not been handed to the kernel.
+        unsafe { boot::free_pages(address, pages) }
+            .expect("failed to free invalid Linux initrd allocation");
+        panic!("Linux initrd provider read failed: {status:?}, bytes={loaded}");
+    }
+    let start = address.as_ptr() as usize;
+    let end = start
+        .checked_add(size)
+        .expect("Linux initrd range overflows");
+    crate::boot_payload::stage_uefi(start, end);
+    println!("Linux EFI initrd loaded: {size} bytes");
+    true
+}
+
+fn load_efi_cmdline(image_handle: Handle) {
+    let image = boot::open_protocol_exclusive::<LoadedImage>(image_handle)
+        .expect("failed to open LoadedImage for EFI command line");
+    let options = match image.load_options_as_cstr16() {
+        Ok(options) => options,
+        Err(uefi::proto::loaded_image::LoadOptionsError::NotSet) => return,
+        Err(error) => panic!("invalid EFI command line: {error:?}"),
+    };
+    let mut bytes = [0_u8; MAX_CMDLINE];
+    match decode_efi_cmdline(options.to_u16_slice(), &mut bytes) {
+        Ok("") => {}
+        Ok(cmdline) => crate::cmdline::set_cmdline(cmdline),
+        Err(error) => panic!("unsupported EFI command line: {error:?}"),
+    }
+}
+
+fn regular_file(file: uefi::proto::media::file::FileHandle) -> RegularFile {
+    match file.into_type().expect("failed to inspect UEFI boot file") {
+        FileType::Regular(file) => file,
+        FileType::Dir(_) => panic!("UEFI boot payload path is a directory"),
+    }
+}
+
+fn file_size(file: &mut RegularFile) -> usize {
+    #[repr(align(8))]
+    struct InfoBuffer([u8; 512]);
+    let mut buffer = InfoBuffer([0; 512]);
+    let size = file
+        .get_info::<FileInfo>(&mut buffer.0)
+        .expect("failed to read UEFI boot file info")
+        .file_size();
+    usize::try_from(size).expect("UEFI boot file size overflows")
+}
+
+fn read_exact_file(file: &mut RegularFile, bytes: &mut [u8]) {
+    let mut done = 0;
+    while done < bytes.len() {
+        let read = file
+            .read(&mut bytes[done..])
+            .expect("failed to read UEFI boot file");
+        assert!(read != 0, "truncated UEFI boot file");
+        done += read;
+    }
+}
+
+pub(crate) fn boot_entropy() -> Option<[u8; 32]> {
+    // An inherited LoongArch target is entered after the first loader has
+    // exited boot services. Firmware protocol calls (including RNG discovery)
+    // are no longer valid on that path; the target may still use a trusted FDT
+    // seed or explicitly report that no firmware entropy is available.
+    if platform::inherited_handoff() || !is_uefi_available() {
+        return None;
+    }
+
+    let handle = boot::get_handle_for_protocol::<Rng>().ok()?;
+    let mut rng = boot::open_protocol_exclusive::<Rng>(handle).ok()?;
+    let mut seed = [0; 32];
+    rng.get_rng(None, &mut seed).ok()?;
+    Some(seed)
 }
 
 struct ExitBootMemoryMap {
@@ -198,6 +485,10 @@ unsafe fn exit_boot_services_no_alloc() -> ExitBootMemoryMap {
             reset_on_exit_boot_services_failure(status);
         }
 
+        // LoongArch firmware publishes callable service entry points in its
+        // current EFI address space. Translate only the service-table storage
+        // above; rewriting these function pointers to a guessed direct-map
+        // alias breaks firmware-owned tables.
         status = unsafe { (boot_services.exit_boot_services)(image_handle.as_ptr(), map_key) };
         if status == Status::SUCCESS {
             let entries =
@@ -356,7 +647,9 @@ fn find_acpi_rsdp() {
 
         if !addr.is_null() {
             println!("Using ACPI {} RSDP at address: {:p}", version, addr);
-            set_rsdp(addr);
+            let rsdp = <crate::arch::Arch as crate::ArchTrait>::canonicalize_paddr(addr as usize)
+                as *const c_void;
+            set_rsdp(rsdp);
         } else {
             println!("No ACPI RSDP found in UEFI config tables.");
         }
@@ -384,14 +677,13 @@ mod tests {
 
         assert_eq!(find_fdt_address(&tables), Some(fdt_addr));
     }
+
+    #[test]
+    fn boot_entropy_is_unavailable_without_uefi_system_table() {
+        assert_eq!(boot_entropy(), None);
+    }
 }
 
 pub fn is_uefi_available() -> bool {
     uefi::table::system_table_raw().is_some()
-}
-
-#[cfg(target_arch = "loongarch64")]
-pub fn reset(reset_type: ResetType, status: Status, data: Option<&[u8]>) -> ! {
-    info!("Resetting system via UEFI...");
-    uefi::runtime::reset(reset_type, status, data)
 }

@@ -5,6 +5,7 @@
 <div align="center">
 
 [![Build & Test](https://github.com/rcore-os/tgoskits/actions/workflows/ci.yml/badge.svg)](https://github.com/rcore-os/tgoskits/actions/workflows/ci.yml)
+[![Nightly Benchmarks](https://img.shields.io/badge/nightly-benchmarks-blueviolet.svg)](https://rcore-os.cn/tgoskits/benchmark/)
 [![Rust](https://img.shields.io/badge/edition-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
@@ -24,20 +25,30 @@ TGOSKits 仓库通过 Git Subtree 汇入多个独立子项目，并在根目录�
 
 ```text
 tgoskits/
+├── apps/                      # ArceOS 与 StarryOS 应用包
+├── benchmarks/                # 基准测试与报告
+├── bootloader/                # UEFI 与平台引导程序
 ├── components/                # 可复用组件 crate
+├── container/                 # CI 与开发容器镜像
+├── drivers/                   # 可复用驱动与驱动子系统
+├── fs/                        # 文件系统 crate
+├── memory/                    # 内存管理 crate
+├── net/                       # 网络 crate
 ├── os/
 │   ├── arceos/                # ArceOS 模块化内核
 │   ├── StarryOS/              # StarryOS Linux 兼容 OS
 │   └── axvisor/               # Axvisor Type-I Hypervisor
-├── platform/                  # 平台与板卡适配 crate
-├── drivers/                   # 可复用驱动与驱动子系统
+├── platforms/                 # 平台与板卡适配 crate
+├── nixos-tests/               # NixOS 集成测试
 ├── test-suit/                 # 系统级测试用例
+├── tools/                     # 仓库与开发工具
+├── virtualization/            # 虚拟化支持 crate
 ├── xtask/                     # 根目录统一命令入口
 ├── scripts/                   # 仓库维护、测试和同步脚本
 └── docs/                      # Docusaurus 文档站点
 ```
 
-更多关于 subtree 同步、组件分层和开发约定的说明，请参考 [仓库结构与协作方式](https://rcore-os.cn/tgoskits/docs/contributing/repo) 和 [组件开发指南](https://rcore-os.cn/tgoskits/docs/development/components)。
+更多关于 subtree 同步、组件分层和开发约定的说明，请参考 [仓库结构与协作方式](https://rcore-os.cn/tgoskits/docs/contributing/repo) 和 [架构设计概览](https://rcore-os.cn/tgoskits/docs/architecture/overview)。
 
 ## 3. 快速体验
 
@@ -56,7 +67,7 @@ docker run -it --rm \
   ghcr.io/rcore-os/tgoskits-container:latest
 ```
 
-如果不使用容器，请至少准备 Rust、基础构建工具和常用 QEMU。推荐使用与容器和 CI 一致的 QEMU 10.2.1；发行版自带 QEMU 可用于快速体验，但如果遇到架构缺失或运行差异，请优先切换到容器环境：
+如果不使用容器，请至少准备 Rust、基础构建工具和常用 QEMU。推荐使用与容器和 CI 一致的 QEMU 11.1.1；发行版自带 QEMU 可用于快速体验，但如果遇到架构缺失或运行差异，请优先切换到容器环境：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -70,7 +81,7 @@ cargo install cargo-binutils
 
 ### 3.2 QEMU 验证
 
-先确认常用 QEMU 命令可用，并尽量与容器和 CI 使用的 QEMU 10.2.1 对齐：
+先确认常用 QEMU 命令可用，并尽量与容器和 CI 使用的 QEMU 11.1.1 对齐：
 
 ```bash
 qemu-system-riscv64 --version
@@ -93,7 +104,7 @@ cargo xtask starry qemu --arch aarch64
 cargo xtask axvisor qemu --arch aarch64
 ```
 
-如果只想先跑通一个最短路径，建议从 ArceOS Hello World 开始。更多系统、架构组合和 QEMU 参数说明见 [快速开始总览](https://rcore-os.cn/tgoskits/docs/quickstart/overview) 和 [运行与 QEMU](https://rcore-os.cn/tgoskits/docs/build/run)。
+如果只想先跑通一个最短路径，建议从 ArceOS Hello World 开始。更多系统、架构组合和 QEMU 参数说明见 [快速开始总览](https://rcore-os.cn/tgoskits/docs/quickstart/overview) 和 [命令索引](https://rcore-os.cn/tgoskits/docs/build/commands)。
 
 ## 4. 贡献
 

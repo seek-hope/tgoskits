@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <stdint.h>
 
 static int __pass = 0;
@@ -53,8 +55,59 @@ static long raw_delete_module(const char *name, unsigned int flags) {
 #endif
 }
 
+enum module_operation {
+    MODULE_INIT,
+    MODULE_FINIT,
+    MODULE_DELETE,
+};
+
+static int unprivileged_operation_returns_eperm(enum module_operation operation, int fd) {
+    pid_t pid = fork();
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        uint8_t invalid_module = 0;
+        if (setresuid(1000, 1000, 1000) != 0)
+            _exit(10);
+
+        errno = 0;
+        long ret;
+        switch (operation) {
+        case MODULE_INIT:
+            ret = raw_init_module(&invalid_module, sizeof(invalid_module), "");
+            break;
+        case MODULE_FINIT:
+            ret = raw_finit_module(fd, "", 0);
+            break;
+        case MODULE_DELETE:
+            ret = raw_delete_module("no_such_module", 0);
+            break;
+        default:
+            _exit(11);
+        }
+        _exit(ret == -1 && errno == EPERM ? 0 : 12);
+    }
+
+    int status = 0;
+    return waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
 int main(void) {
     printf("=== kmod Loader Test Suite ===\n");
+
+    int module_fd = open("/dev/null", O_RDONLY);
+    CHECK(module_fd >= 0, "open valid fd for unprivileged module checks");
+    if (module_fd >= 0) {
+        MODULE_START("unprivileged_module_operations");
+        CHECK(unprivileged_operation_returns_eperm(MODULE_INIT, module_fd),
+              "non-root init_module returns EPERM");
+        CHECK(unprivileged_operation_returns_eperm(MODULE_FINIT, module_fd),
+              "non-root finit_module returns EPERM");
+        CHECK(unprivileged_operation_returns_eperm(MODULE_DELETE, module_fd),
+              "non-root delete_module returns EPERM");
+        close(module_fd);
+    }
 
     MODULE_START("init_module_null");
     CHECK(raw_init_module(NULL, 0, "") < 0, "init_module(NULL,0) returns error");
@@ -101,6 +154,12 @@ int main(void) {
     uint8_t big[256]; memset(big, 0xAA, sizeof(big));
     CHECK(raw_init_module(big, sizeof(big), "") < 0,
           "init_module(256-byte junk) returns error, no crash");
+
+    MODULE_START("init_module_oversized_len");
+    CHECK(geteuid() == 0, "oversized module test starts with root credentials");
+    errno = 0;
+    CHECK(raw_init_module(&dummy, SIZE_MAX, "") == -1 && errno == ENOMEM,
+          "init_module(SIZE_MAX) returns ENOMEM for an oversized image");
 
     SUMMARY();
 }

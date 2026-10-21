@@ -12,110 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(
-    feature = "fs",
-    any(target_arch = "x86_64", target_arch = "loongarch64")
-))]
-use core::sync::atomic::{AtomicBool, Ordering};
+extern crate alloc;
 
-use anyhow::{Context, Result, anyhow, bail};
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-use axvm::InterruptTriggerMode;
-use axvm::{
-    AxVM, GuestPhysAddr,
-    boot::{
-        BootImageProvider, StaticVmImage, boot_firmware_load_gpa, get_image_header,
-        guest_boot_policy, init_guest_boot_resources, prepare_guest_boot,
-    },
-    config::{
-        AxVCpuConfig, AxVMConfig, AxVMConfigParams, GuestBootPolicy, PhysCpuList, RamdiskInfo,
-        VMImageConfig,
-    },
-};
-#[cfg(feature = "fs")]
+use alloc::sync::Arc;
+
+use anyhow::{Context, Result, bail};
 use axvm::{AxVmError, AxVmResult};
-use axvmconfig::{AxVMCrateConfig, VMType};
+use axvm::{boot::*, config::*, *};
+use axvmconfig::{GuestConfig, GuestType, HostDeviceAssignment};
 
-#[cfg(all(
-    feature = "fs",
-    any(target_arch = "x86_64", target_arch = "loongarch64")
-))]
-static HOST_FILESYSTEM_RELEASE_REQUIRED: AtomicBool = AtomicBool::new(false);
-
-#[allow(dead_code)]
-pub mod vmcfg {
-    use alloc::{string::String, vec, vec::Vec};
-
-    /// Default static VM configs. Used when no VM config is provided.
-    pub fn default_static_vm_configs() -> Vec<&'static str> {
-        vec![]
-    }
-
-    /// Read VM configs from filesystem
-    #[cfg(feature = "fs")]
-    pub fn filesystem_vm_configs() -> Vec<String> {
-        let config_dir = "/guest/vm_default";
-        crate::manager::AxvmManager::filesystem_vm_configs(config_dir)
-            .into_iter()
-            .filter_map(
-                |content| match axvmconfig::AxVMCrateConfig::from_toml(&content) {
-                    Ok(_) => Some(content),
-                    Err(e) => {
-                        warn!("Filesystem VM config is invalid: {:?}", e);
-                        None
-                    }
-                },
-            )
-            .collect()
-    }
-
-    /// Fallback function for when "fs" feature is not enabled
-    #[cfg(not(feature = "fs"))]
-    pub fn filesystem_vm_configs() -> Vec<String> {
-        Vec::new()
-    }
-
-    include!(concat!(env!("OUT_DIR"), "/vm_configs.rs"));
-}
-
-pub fn init_guest_vms() {
+pub fn load_builtin_catalog() -> Result<axvisor::builtin::BuiltinCatalog> {
     init_guest_boot_resources();
-
-    // First try to get configs from filesystem if fs feature is enabled
-    let mut gvm_raw_configs = vmcfg::filesystem_vm_configs();
-
-    // If no filesystem configs found, fallback to static configs
-    if gvm_raw_configs.is_empty() {
-        let static_configs = vmcfg::static_vm_configs();
-        if static_configs.is_empty() {
-            info!("Static VM configs are empty.");
-            info!("Now axvisor will entry the shell...");
-        } else {
-            info!("Using static VM configs.");
-        }
-        // Convert static configs to String type
-        gvm_raw_configs.extend(static_configs.into_iter().map(|s| s.into()));
-    }
-
-    for raw_cfg_str in gvm_raw_configs {
-        debug!("Initializing guest VM with config: {:#?}", raw_cfg_str);
-        if let Err(e) = init_guest_vm(&raw_cfg_str) {
-            error!("Failed to initialize guest VM: {e:#}");
-        }
-    }
+    let context = ax_fs_ng::current_fs_context();
+    axvisor::builtin::load_catalog(&context.lock())
 }
 
-pub fn init_guest_vm(raw_cfg: &str) -> Result<usize> {
+pub(crate) struct PreparedGuestVm {
+    pub plan: VmCreatePlan,
+    pub release_host_filesystem: bool,
+}
+
+pub(crate) fn prepare_guest_vm(
+    raw_cfg: &str,
+    backend: Arc<dyn axvm::GuestCpuFreqBackend>,
+) -> Result<PreparedGuestVm> {
     let image_provider = AxvisorBootImageProvider;
-    let vm_create_config = AxVMCrateConfig::from_toml(raw_cfg)
-        .map_err(|error| anyhow!("parse VM TOML configuration: {error}"))?;
+    let mut vm_create_config =
+        GuestConfig::from_toml(raw_cfg).context("parse VM TOML configuration")?;
+    materialize_guest_cpufreq_tables(&mut vm_create_config, backend.as_ref())?;
     let configured_vm_id = vm_create_config.base.id;
 
-    #[cfg(all(
-        feature = "fs",
-        any(target_arch = "x86_64", target_arch = "loongarch64")
-    ))]
-    let release_host_filesystem = vm_config_needs_host_filesystem_release(&vm_create_config);
+    if let Some(path) = crate::guest_images::missing_guest_image(&vm_create_config) {
+        bail!("guest image `{path}` does not exist");
+    }
 
     if let Some(linux) = get_image_header(&vm_create_config, &image_provider) {
         debug!(
@@ -124,61 +53,116 @@ pub fn init_guest_vm(raw_cfg: &str) -> Result<usize> {
         );
     }
 
-    let mut vm_config = build_axvm_config(&vm_create_config);
+    let mut vm_config = build_axvm_config(&vm_create_config)?;
+    validate_guest_cpufreq_placement(&vm_config, backend.as_ref())?;
+    let release_host_filesystem = vm_config_needs_host_filesystem_release(&vm_create_config);
     let prepared_boot = prepare_guest_boot(&mut vm_config, vm_create_config, &image_provider)
         .with_context(|| format!("prepare boot resources for VM[{configured_vm_id}]"))?;
     let prepared_config = prepared_boot.config();
-
     sync_axvm_config_from_crate_config(&mut vm_config, prepared_config);
-
     vm_config.set_boot_policy(guest_boot_policy(prepared_config, &image_provider));
 
-    // info!("after parse_vm_interrupt, crate VM[{}] with config: {:#?}", vm_config.id(), vm_config);
-    info!("Creating VM[{}] {:?}", vm_config.id(), vm_config.name());
-
-    // Create VM.
-    let vm = AxVM::new(vm_config).with_context(|| format!("create VM[{configured_vm_id}]"))?;
-    let vm_id = vm.id();
-
-    let memory_layout = vm
-        .prepare_memory_layout()
-        .with_context(|| format!("prepare memory layout for VM[{vm_id}]"))?;
-    let main_mem = memory_layout.main_memory().clone();
-
-    // Load corresponding images for VM.
-    info!("VM[{}] created success, loading images...", vm.id());
-
-    prepared_boot
-        .load_images(main_mem, vm.clone(), &image_provider)
-        .with_context(|| format!("load boot images for VM[{vm_id}]"))?;
-
-    vm.prepare()
-        .with_context(|| format!("prepare devices and vCPUs for VM[{vm_id}]"))?;
-
-    if !axvm::register_vm(vm) {
-        bail!("register VM[{vm_id}]: a VM with this ID already exists");
-    }
-    #[cfg(target_arch = "loongarch64")]
-    crate::manager::register_loongarch_passthrough_irq_routes(vm_id);
-
-    #[cfg(all(
-        feature = "fs",
-        any(target_arch = "x86_64", target_arch = "loongarch64")
-    ))]
-    if release_host_filesystem {
-        #[cfg(target_arch = "x86_64")]
-        register_x86_host_fs_passthrough_irq_route();
-        HOST_FILESYSTEM_RELEASE_REQUIRED.store(true, Ordering::Release);
-    }
-
-    Ok(vm_id)
+    Ok(PreparedGuestVm {
+        plan: VmCreatePlan {
+            config: vm_config,
+            boot: prepared_boot,
+            images: alloc::sync::Arc::new(image_provider),
+            vcpu_schedule_policy: axvm::SchedulePolicy::default(),
+            cpu_freq_backend: Some(backend),
+        },
+        release_host_filesystem,
+    })
 }
 
-pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
-    AxVMConfig::new(AxVMConfigParams {
+fn materialize_guest_cpufreq_tables(
+    config: &mut GuestConfig,
+    backend: &dyn axvm::GuestCpuFreqBackend,
+) -> Result<()> {
+    for request in config
+        .devices
+        .virtual_devices
+        .iter_mut()
+        .filter(|request| request.model == axvm::VIRTUAL_CPUFREQ_MODEL)
+    {
+        let options = axvm::VirtualCpuFreqOptions::from_request(request)
+            .map_err(|error| anyhow::anyhow!("parse virtual-cpufreq options: {error}"))?;
+        let domain = options.domain;
+        let table = backend
+            .performance_table(domain)
+            .map_err(|error| anyhow::anyhow!("materialize virtual-cpufreq OPP table: {error}"))?;
+        axvm::VirtualCpuFreqOptions::replace_performance_table(request, table)
+            .map_err(|error| anyhow::anyhow!("materialize virtual-cpufreq OPP table: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_guest_cpufreq_placement(
+    vm_config: &AxVMConfig,
+    backend: &dyn axvm::GuestCpuFreqBackend,
+) -> Result<()> {
+    let requests = vm_config
+        .virtual_device_requests()
+        .iter()
+        .filter(|request| request.model == axvm::VIRTUAL_CPUFREQ_MODEL)
+        .collect::<Vec<_>>();
+    if requests.is_empty() {
+        return Ok(());
+    }
+    if requests.len() != 1 {
+        bail!(
+            "virtual-cpufreq permits exactly one device per VM, found {}",
+            requests.len()
+        );
+    }
+    let request = requests[0];
+    let options = axvm::VirtualCpuFreqOptions::from_request(request)
+        .map_err(|error| anyhow::anyhow!("parse virtual-cpufreq options: {error}"))?;
+    let domain = options.domain;
+    let vcpu_count = usize::try_from(options.vcpu_count).expect("validated vcpu_count");
+    let placements = vm_config.phys_cpu_ls().get_vcpu_affinities_pcpu_ids();
+    if vcpu_count != placements.len() || vcpu_count != vm_config.phys_cpu_ls().cpu_num() {
+        bail!("virtual-cpufreq vcpu_count={vcpu_count} must cover every configured vCPU");
+    }
+    let mut host_cpus = Vec::with_capacity(placements.len());
+    for (vcpu, affinity, _) in placements {
+        let mask = affinity.ok_or_else(|| {
+            anyhow::anyhow!(
+                "virtual-cpufreq requires an explicit single-CPU affinity for vCPU {vcpu}"
+            )
+        })?;
+        if mask == 0 || !mask.is_power_of_two() {
+            bail!("virtual-cpufreq vCPU {vcpu} affinity {mask:#x} crosses CPU frequency domains");
+        }
+        host_cpus.push(mask.trailing_zeros() as usize);
+    }
+    backend
+        .validate_placement(domain, &host_cpus)
+        .map_err(|error| anyhow::anyhow!("validate virtual-cpufreq host placement: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn build_axvm_config(cfg: &GuestConfig) -> Result<AxVMConfig> {
+    let machine = axvm::machine::current_machine_profile(cfg.base.cpu_num);
+    let serial_profile = machine.serial;
+    let mut passthrough_devices = cfg.devices.unresolved_host_devices();
+    if cfg.base.guest_type == GuestType::Passthrough
+        && passthrough_devices.is_empty()
+        && let Some(path) = machine.default_passthrough_device_path
+    {
+        passthrough_devices.insert(
+            0,
+            HostDeviceAssignment {
+                name: path.into(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut virtual_device_catalog = axvm::ConfiguredDeviceCatalog::new();
+    axvm::machine::register_devices(&mut virtual_device_catalog)
+        .context("register AxVM virtual-device models")?;
+    Ok(AxVMConfig::new(AxVMConfigParams {
         id: cfg.base.id,
         name: cfg.base.name.clone(),
-        vm_type: VMType::from(cfg.base.vm_type),
         phys_cpu_ls: PhysCpuList::new(
             cfg.base.cpu_num,
             cfg.base.phys_cpu_ids.clone(),
@@ -190,7 +174,7 @@ pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
         },
         image_config: VMImageConfig {
             kernel_load_gpa: GuestPhysAddr::from(cfg.kernel.kernel_load_addr),
-            loaded_from_filesystem: cfg.kernel.image_location.as_deref() == Some("fs"),
+            loaded_from_filesystem: true,
             bios_load_gpa: boot_firmware_load_gpa(cfg),
             dtb_load_gpa: cfg.kernel.dtb_load_addr.map(GuestPhysAddr::from),
             ramdisk: cfg.kernel.ramdisk_load_addr.map(|addr| RamdiskInfo {
@@ -198,197 +182,85 @@ pub(crate) fn build_axvm_config(cfg: &AxVMCrateConfig) -> AxVMConfig {
                 size: None,
             }),
         },
-        emu_devices: cfg.devices.emu_devices.clone(),
-        pass_through_devices: cfg.devices.passthrough_devices.clone(),
-        excluded_devices: cfg.devices.excluded_devices.clone(),
-        pass_through_addresses: cfg.devices.passthrough_addresses.clone(),
+        pass_through_devices: passthrough_devices,
+        excluded_devices: cfg.devices.disabled_device_paths(),
+        pass_through_addresses: Vec::new(),
         reserved_address_ranges: Vec::new(),
-        pass_through_ports: cfg.devices.passthrough_ports.clone(),
-        address_space_policy: cfg.devices.address_space_policy,
+        pass_through_ports: Vec::new(),
+        address_space_policy: cfg.base.guest_type.address_space_policy(),
         memory_regions: cfg.kernel.memory_regions.clone(),
         boot_policy: GuestBootPolicy::KeepConfigured,
-        interrupt_mode: cfg.devices.interrupt_mode,
-    })
+        serial_profile: Some(serial_profile),
+        serial_backend_factory: Some(crate::guest_console::serial_backend_factory(cfg.base.id)),
+        virtual_device_requests: cfg.devices.virtual_device_requests().to_vec(),
+        virtual_device_catalog: alloc::sync::Arc::new(virtual_device_catalog),
+    }))
 }
 
-fn sync_axvm_config_from_crate_config(vm_config: &mut AxVMConfig, cfg: &AxVMCrateConfig) {
+fn sync_axvm_config_from_crate_config(vm_config: &mut AxVMConfig, cfg: &GuestConfig) {
     vm_config.set_memory_regions(cfg.kernel.memory_regions.clone());
 }
 
-#[cfg(all(
-    feature = "fs",
-    any(target_arch = "x86_64", target_arch = "loongarch64")
-))]
-fn vm_config_needs_host_filesystem_release(config: &AxVMCrateConfig) -> bool {
-    config.kernel.image_location.as_deref() == Some("fs")
-        && (!config.devices.passthrough_devices.is_empty()
-            || !config.devices.passthrough_addresses.is_empty()
-            || !config.devices.passthrough_ports.is_empty())
-}
-
-#[cfg(all(
-    feature = "fs",
-    any(target_arch = "x86_64", target_arch = "loongarch64")
-))]
-pub fn host_filesystem_release_required() -> bool {
-    HOST_FILESYSTEM_RELEASE_REQUIRED.load(Ordering::Acquire)
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn register_x86_host_fs_passthrough_irq_route() {
-    let (_, _, _, guest_gsi) = axvm::boot::x86_qemu_passthrough_block_intx();
-    let info = x86_host_fs_passthrough_pci_info();
-
-    let route = match ax_driver::pci::resolve_intx_binding(info) {
-        Ok(Some(binding)) => {
-            let trigger = x86_intx_forwarding_trigger(&binding);
-            resolve_binding_irq(binding).map(|host_irq| (host_irq, trigger))
-        }
-        Ok(None) => {
-            warn!("x86 host filesystem passthrough PCI INTx route was not found for {info:?}");
-            return;
-        }
-        Err(err) => {
-            warn!("failed to resolve x86 host filesystem passthrough PCI INTx route: {err:?}");
-            return;
-        }
-    };
-
-    match route {
-        Ok((host_irq, trigger)) => {
-            axvm::register_x86_ioapic_irq_forwarding_route_with_trigger(
-                guest_gsi, host_irq, trigger,
-            );
-            axvm::register_x86_ioapic_irq_forwarding_activator(
-                guest_gsi,
-                unmask_x86_host_fs_passthrough_intx,
-            );
-            info!(
-                "Registered x86 host filesystem PCI INTx forwarding route: guest GSI \
-                 {guest_gsi} <- host IRQ {host_irq:?}, trigger {trigger:?}"
-            );
-        }
-        Err(err) => {
-            warn!(
-                "failed to resolve x86 host filesystem passthrough IRQ source into host IRQ: \
-                 {err:?}"
-            );
-        }
+fn vm_config_needs_host_filesystem_release(config: &GuestConfig) -> bool {
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "loongarch64"
+    ))]
+    {
+        return (ax_fs_ng::root::root_kind() == Some(ax_fs_ng::root::RootKind::Block)
+            && config.base.guest_type == GuestType::Passthrough)
+            || !config.devices.passthrough.is_empty();
     }
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-pub(crate) fn prepare_x86_host_fs_passthrough_devices() {
-    let info = x86_host_fs_passthrough_pci_info();
-    match ax_driver::pci::prepare_intx_passthrough(info) {
-        Ok(()) => {
-            info!("Prepared x86 host filesystem PCI INTx passthrough device {info:?}");
-        }
-        Err(err) => {
-            warn!("failed to prepare x86 host filesystem PCI INTx passthrough device: {err:?}");
-        }
-    }
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn unmask_x86_host_fs_passthrough_intx() {
-    let info = x86_host_fs_passthrough_pci_info();
-    match ax_driver::pci::unmask_intx_passthrough(info) {
-        Ok(()) => {
-            info!("Unmasked x86 host filesystem PCI INTx passthrough device {info:?}");
-        }
-        Err(err) => {
-            warn!("failed to unmask x86 host filesystem PCI INTx passthrough device: {err:?}");
-        }
-    }
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn x86_host_fs_passthrough_pci_info() -> ax_driver::probe::pci::PciInfo {
-    use ax_driver::probe::pci::{PciAddress, PciInfo, PciIntxRoute};
-
-    let (device, function, pin, _) = axvm::boot::x86_qemu_passthrough_block_intx();
-    PciInfo {
-        address: PciAddress::new(0, 0, device, function),
-        interrupt_pin: pin,
-        interrupt_line: 0,
-        intx_route: Some(PciIntxRoute {
-            root_device: device,
-            root_function: function,
-            root_pin: pin,
-        }),
-    }
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn resolve_binding_irq(
-    binding: ax_driver::BindingIrq,
-) -> Result<ax_hal::irq::IrqId, ax_hal::irq::IrqError> {
-    use ax_hal::irq;
-
-    match binding {
-        ax_driver::BindingIrq::Id(irq) => Ok(irq),
-        ax_driver::BindingIrq::Source(source) => match source {
-            ax_driver::BindingIrqSource::AcpiGsi(gsi) => {
-                irq::resolve_irq_source(irq::IrqSource::AcpiGsi(gsi))
-            }
-            ax_driver::BindingIrqSource::AcpiGsiRoute(route) => {
-                irq::resolve_irq_source(irq::IrqSource::AcpiGsiRoute(route))
-            }
-            ax_driver::BindingIrqSource::FdtInterrupt(_) => Err(irq::IrqError::Unsupported),
-        },
-    }
-}
-
-#[cfg(all(feature = "fs", target_arch = "x86_64"))]
-fn x86_intx_forwarding_trigger(binding: &ax_driver::BindingIrq) -> InterruptTriggerMode {
-    match binding {
-        ax_driver::BindingIrq::Source(ax_driver::BindingIrqSource::AcpiGsiRoute(route)) => {
-            match route.trigger {
-                ax_hal::irq::AcpiIrqTrigger::Edge => InterruptTriggerMode::EdgeTriggered,
-                ax_hal::irq::AcpiIrqTrigger::Level => InterruptTriggerMode::LevelTriggered,
-            }
-        }
-        _ => InterruptTriggerMode::LevelTriggered,
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "loongarch64"
+    )))]
+    {
+        let _ = config;
+        false
     }
 }
 
 struct AxvisorBootImageProvider;
 
 impl BootImageProvider for AxvisorBootImageProvider {
-    fn static_vm_images(&self) -> &'static [StaticVmImage] {
-        vmcfg::get_memory_images()
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    fn static_firmware_images(&self) -> &'static [StaticVmImage] {
-        vmcfg::get_firmware_images()
-    }
-
-    #[cfg(feature = "fs")]
     fn read_file(&self, file_name: &str) -> AxVmResult<alloc::vec::Vec<u8>> {
+        if let Some(bytes) = axvisor::builtin::read_boot_asset(file_name)
+            .map_err(|error| boot_file_error("read retained builtin asset", file_name, error))?
+        {
+            return Ok(bytes);
+        }
         crate::manager::AxvmManager::read_file(file_name)
             .map_err(|error| boot_file_error("read guest image file", file_name, error))
     }
 
-    #[cfg(feature = "fs")]
     fn read_file_exact(
         &self,
         file_name: &str,
         read_size: usize,
     ) -> AxVmResult<alloc::vec::Vec<u8>> {
+        if let Some(bytes) = axvisor::builtin::read_boot_asset_exact(file_name, read_size)
+            .map_err(|error| boot_file_error("read retained builtin asset", file_name, error))?
+        {
+            return Ok(bytes);
+        }
         crate::manager::AxvmManager::read_file_exact(file_name, read_size)
             .map_err(|error| boot_file_error("read guest image file", file_name, error))
     }
 
-    #[cfg(feature = "fs")]
     fn file_size(&self, file_name: &str) -> AxVmResult<usize> {
+        if let Some(size) = axvisor::builtin::boot_asset_size(file_name)
+            .map_err(|error| boot_file_error("inspect retained builtin asset", file_name, error))?
+        {
+            return Ok(size);
+        }
         crate::manager::AxvmManager::file_size(file_name)
             .map_err(|error| boot_file_error("inspect guest image file", file_name, error))
     }
 }
 
-#[cfg(feature = "fs")]
 fn boot_file_error(operation: &'static str, file_name: &str, error: anyhow::Error) -> AxVmError {
     AxVmError::Boot {
         operation,
@@ -412,13 +284,13 @@ mod tests {
 
     #[test]
     fn sync_axvm_config_keeps_fdt_reserved_memory_regions() {
-        let mut crate_config = AxVMCrateConfig::default();
+        let mut crate_config = GuestConfig::default();
         crate_config.kernel.memory_regions.push(memory_region(
             0x8000_0000,
             0x200000,
             VmMemMappingType::MapIdentical,
         ));
-        let mut vm_config = build_axvm_config(&crate_config);
+        let mut vm_config = build_axvm_config(&crate_config).unwrap();
 
         crate_config.kernel.memory_regions.push(memory_region(
             0x110000,

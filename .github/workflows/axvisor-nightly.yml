@@ -1,0 +1,69 @@
+name: AxVisor Nightly
+
+on:
+  schedule:
+    # 03:20 Beijing time, offset from the Starry Apps schedule.
+    - cron: "20 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: axvisor-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan AxVisor Nightly
+    if: github.repository == 'rcore-os/tgoskits'
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.revision.outputs.sha }}
+      axvisor_matrix: ${{ steps.matrix.outputs.axvisor_matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Pin triggering revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Plan AxVisor nightly checks
+        id: matrix
+        uses: ./.github/actions/ci-plan
+        with:
+          mode: axvisor-nightly
+          repository: ${{ github.repository }}
+          repository-owner: ${{ github.repository_owner }}
+          event-name: ${{ github.event_name }}
+
+  checks:
+    name: AxVisor
+    needs: [plan]
+    uses: ./.github/workflows/reusable-check-matrix.yml
+    with:
+      checkout_ref: ${{ needs.plan.outputs.revision }}
+      matrix_json: ${{ needs.plan.outputs.axvisor_matrix }}
+      fail_fast: false
+      save_cache: ${{ github.event_name == 'schedule' }}
+
+  result:
+    name: Nightly Result
+    if: always() && github.repository == 'rcore-os/tgoskits'
+    needs: [plan, checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.revision || github.sha }}
+      - name: Report result
+        uses: ./.github/actions/ci-result
+        with:
+          title: AxVisor Nightly
+          revision: ${{ needs.plan.outputs.revision }}
+          revision-label: tested revision
+          stages: |
+            Plan=${{ needs.plan.result }}
+            Checks=${{ needs.checks.result }}
+          required-stages: |
+            Plan
+            Checks

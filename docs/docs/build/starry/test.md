@@ -5,11 +5,13 @@ sidebar_label: "测试"
 
 # StarryOS 测试
 
-StarryOS 测试直接从 `test-suit/starryos/` 根目录发现用例，通过 **build wrapper**（含 `build-{target}.toml` 的目录）划分构建组。同一 wrapper 下的 case 共享一次内核构建，避免重复编译。
+StarryOS 测试直接从 `test-suit/starryos/` 根目录发现用例，通过 **build wrapper**（含 `build-{target}.toml` 的目录）确定构建配置。相同 Cargo 编译身份的 case 共享一次内核构建，避免重复编译；独立的 VM、rootfs 和板卡资源仍按 case 加载。
 
-测试编排（用例发现、分组构建、资产准备、结果判定）由 `scripts/axbuild/src/test/` 提供统一框架，核心原则是 **OS 只构建一次，逐 case 运行**——具有相同构建配置的用例归入同一 build wrapper，组内共享一次内核编译。本文描述 StarryOS 特有的测试目录结构和用例组织方式。
+测试编排（用例发现、分组构建、资产准备、结果判定）由 `scripts/axbuild/src/test/` 提供统一框架，核心原则是 **OS 只构建一次，逐 case 运行**——用例先按 wrapper 发现，再按完整 Cargo 编译配置合并。共享框架的完整说明见 [测试基础设施](../test_infra)；本文描述 StarryOS 特有的测试目录结构和用例组织方式。
 
-## 命令
+## 1. 命令
+
+StarryOS 测试分为 QEMU 和板卡两类，QEMU 路径需要在架构、目标或列表模式中选择一种。
 
 ```text
 cargo xtask starry test qemu --arch <arch> [--test-case <case>] [--list]
@@ -18,7 +20,14 @@ cargo xtask starry test board --board <type> --server <host> --port <port> [--te
 
 `--arch` 与 `--target`/`--list` 三选一（`test qemu`）。
 
-## 目录结构
+`-c/--test-case` 可以选择 `qemu/system/ltp-syscalls/<id>`，例如
+`cargo xtask starry test qemu --arch x86_64 -c qemu/system/ltp-syscalls/execve03`。
+`<id>` 必须出现在 `test-suit/starryos/qemu/system/ltp-syscalls/cases.txt` 或对应架构的
+`cases-<arch>.txt`；选择后只安装并运行这个 LTP wrapper，保留其完成数量和文件系统检查。
+使用 `-c qemu/system/ltp-syscalls` 仍执行整个 LTP 集合及 native 隔离回归；
+`--list` 仍列出 QEMU 用例与分组，具体 LTP ID 从这些清单读取。
+
+## 2. 目录结构
 
 StarryOS 的测试目录组织为**平铺 + build wrapper**：
 
@@ -38,33 +47,82 @@ test-suit/starryos/
 
 与 [ArceOS 测试](../arceos/test)（区分 `rust/` 和 `c/` 子目录）不同，StarryOS 从 `test-suit/starryos/` 根目录直接发现 QEMU/board 用例，不按语言分子目录。
 
-### Build Wrapper 的意义
+### 2.1 Build Wrapper 的意义
 
 `qemu-smp1` 和 `qemu-smp4` 分别测试单核和多核场景，它们的构建配置不同（SMP 核数不同），因此必须分别编译；每个 wrapper 下的 `system` 聚合用例使用完全相同的内核，只需编译一次并启动一次。发现算法通过识别 `build-{target}.toml` 文件来自动划分构建边界，build wrapper 是含 `build-{target}.toml` 的目录，定义一组共享相同构建配置的用例。
 
-## QEMU 聚合 case
+x86_64 的 QEMU wrapper 统一启用四组用例可能使用的驱动 feature（AHCI、Intel E1000、NVMe、VirtIO 和 PCI XHCI），并使用同一 `max_cpu_num`，因此 `qemu`、`qemu-e1000`、`timer-preemption-x86` 和 `ahci-single` 共用一次内核构建。驱动注册仍由 PCI/FDT probe 根据 QEMU 实际提供的设备完成；没有对应设备时不会创建驱动实例，所以合并 feature 不会改变各用例的设备语义。
 
-StarryOS 的 QEMU 用例通常是**聚合 case**（Grouped pipeline）——一次内核启动中通过 `test_commands` 顺序执行多条 shell 命令，每条命令独立判定结果。这与 ArceOS 的"feature 即用例"模式不同。
+## 3. QEMU 测试执行流程
 
-聚合 case 的资产准备（runner 脚本生成、ELF 依赖补全、rootfs 注入）逻辑由 `scripts/axbuild/src/test/case/` 提供。StarryOS 在 `prepare_staging_root` 钩子中还额外完成：
+StarryOS 的 QEMU 测试执行链位于 `starry/test/qemu_run.rs::test_qemu()`。核心是 **build group 分组 → 每组一次内核编译 → 逐 case 注入 rootfs 资产并运行 QEMU**。下图描述从 CLI 到结果判定的完整数据流。
 
-- **DNS 注入**（`starry/resolver.rs`）：读取宿主 DNS 配置写入 staging `/etc/resolv.conf`，过滤 loopback 和 QEMU slirp 地址
-- **APK 区域配置**（`starry/apk.rs`）：根据 `STARRY_APK_REGION` 重写 `/etc/apk/repositories` 镜像源（`china`/`cn` 用 `mirrors.cernet.edu.cn/alpine`，`us`/`usa` 用 `dl-cdn.alpinelinux.org`）
+```mermaid
+flowchart TD
+    A["test_qemu(CLI args)"] --> B["parse_test_target<br/>解析 arch/target"]
+    B --> C["discover_qemu_cases<br/>递归发现 qemu-{arch}.toml"]
+    C --> D["prepare_request + qemu_test_request<br/>清空 smp，准备默认 board"]
+    D --> E["prepare_case_build_groups<br/>按 build config 路径分组"]
+    E --> F["逐 build group"]
+    F --> G["build_artifact<br/>编译内核 ELF + AXBT map"]
+    G --> H["prepare_qemu_cases<br/>加载 QEMU config + 解析 rootfs 路径"]
+    H --> I["ensure_qemu_case_rootfs_paths<br/>确保所有 rootfs 已下载"]
+    I --> J["逐 case：run_qemu_case"]
+    J --> K["apply_grouped_qemu_config<br/>注入 runner 脚本和 marker"]
+    K --> L["prepare_case_assets<br/>准备 rootfs 副本/overlay（含缓存）"]
+    L --> M["patch_rootfs(Discard) + apply_smp"]
+    M --> N["run_qemu_with_prepared_case_assets<br/>启动 QEMU"]
+    N --> O{"success_regex?"}
+    O -->|是| P["ok: case_name"]
+    O -->|否| Q["bail: 中止整个测试"]
+```
 
-`STARRY_APK_REGION` 的运行时取值会纳入 rootfs 缓存键，因此切换区域会使缓存失效。
+### 3.1 关键步骤源码行为
 
-## Board 测试
+下表把执行图中的关键节点映射到对应源码入口。
 
-板级用例通过 `board-{board_name}.toml` 配置文件定义，发现算法递归扫描目录匹配 `board-*.toml`，每个 board case 通过 `nearest_build_wrapper()` 向上查找最近的 build wrapper 确定构建配置。`--test-case` 和 `--board` 支持按用例名和板卡名过滤。board 配置按板卡名命名（`board-{name}.toml`），通过 `nearest_build_wrapper()` 向上查找最近的构建配置。
+| 步骤 | 源码位置 | 行为 |
+|------|----------|------|
+| 用例发现 | `qemu_discovery.rs::discover_qemu_cases()` | 递归扫描 `test-suit/starryos/`，通过 `nearest_build_wrapper()` 关联每个用例到最近的 `build-*.toml` |
+| 默认 board | `board::default_board_for_target()` | 从 `os/StarryOS/configs/board/` 查找 target 匹配的 `qemu-*` board，缺失时报错 |
+| 构建分组 | `qemu_test::prepare_case_build_groups()` | 先按 `build_config_path` 发现，再按 Cargo 编译身份合并；每组共享 `(request, cargo)` |
+| 内核编译 | `build_artifact()` | 调用共享 Cargo 装配 + `postprocess_starry_artifact()`，生成 AXBT map 并按需处理 uImage |
+| QEMU config | `read_qemu_config_from_path_for_cargo()` | 从用例的 `qemu-<arch>.toml` 加载，替换 managed rootfs 路径 |
+| rootfs 准备 | `ensure_qemu_case_rootfs_paths()` | 区分 default rootfs（`ensure_rootfs_in_tmp_dir`）和 managed rootfs（`ensure_optional_managed_rootfs`） |
+| grouped 校验 | `validate_grouped_qemu_commands()` / `normalize_qemu_test_commands()` | 禁止同时声明 `shell_check_steps` 与 `test_commands`，并拒绝空命令 |
 
-## GroupedCaseRunnerConfig
+### 3.2 单个 case 运行
 
-StarryOS 的 grouped runner 标记前缀由 `GroupedCaseRunnerConfig` 定义（如 `STARRY`），生成的日志形如：
+每个 case 在 QEMU 运行前完成以下处理：
+
+1. **Grouped runner 注入**：登录 profile 脚本自动执行 runner，同时创建一个无命令的被动步骤匹配 `STARRY_GROUPED_TESTS_PASSED`，并把 grouped 失败标记追加到顶层 `fail_regex`。
+2. **SMP 覆盖**：`apply_smp_qemu_arg()` 从 QEMU config 反读 `-smp` 值（`smp_from_qemu_arg`），写入用例声明的核数。
+3. **Timeout 缩放**：`apply_timeout_scale()` 按 `AXBUILD_TEST_TIMEOUT_SCALE` 放大。
+4. **资产准备**：`prepare_case_assets()` 进入共享的 `test/case/` 层（见 [测试基础设施](../test_infra#7-资产准备与-rootfs-缓存)），StarryOS 的 staging 钩子注入 DNS，guest 包环境钩子按 `STARRY_APK_REGION` 重写 APK 源。
+5. **rootfs 补丁**：`patch_rootfs()` 把 prepared rootfs 路径写入 QEMU `-drive`，模式为 `EnsureDiskBootNet`，写策略为 `RootfsWritePolicy::Discard`。
+6. **Host HTTP**：`start_qemu_case_host_http_server()` 按需启动。
+7. **目标侧 Backtrace**：Starry 构建默认保留帧指针和 DWARF 信息，构建器把 AXBT map 和 Starry 的 AXKS 符号表放入 initramfs；测试直接匹配目标串口中的函数名和 `file:line`，不再通过 `BACKTRACE`/`DWARF` 环境变量切换能力。`ostool` 不支持把 host initramfs 交给非 UEFI 的 x86_64 直接启动路径，因此需要 map 的 x86_64 用例必须声明 `uefi = true`；其它 direct loader 由其架构启动协议接收 initramfs。未切换到 UEFI 的 direct x86_64 用例会保留地址级回溯并跳过 host initramfs 注入。
+
+### 3.3 失败语义
+
+StarryOS QEMU 测试采用**首例失败即中止**策略：任一 case 失败时 `bail!("starry qemu test aborted: case ... failed")`，不继续运行后续 case。这与 ArceOS/Axvisor 的"收集全部失败后汇总"策略不同。
+
+## 4. Board 测试
+
+板级用例通过 `board-{board_name}.toml` 配置文件定义，发现算法递归扫描目录匹配 `board-*.toml`，每个 board case 通过 `nearest_build_wrapper()` 向上查找最近的 build wrapper 确定构建配置。`--test-case` 和 `--board` 支持按用例名和板卡名过滤；`--test-case` 可以接收逗号分隔的多个用例。
+
+板卡执行分为两个阶段：先按规范化后的 `build-{target}.toml` 路径分组，每个构建配置只编译一次并保存 ELF；随后逐个加载各自的 board TOML、环境要求和 session 资产，用保存的 ELF 启动板卡。这样 CI 规划器可以把同一构建配置的增量用例合并为一行，例如 `--test-case exec-cache,native-hardware-smoke --board orangepi-5-plus`，同时保留不同 feature、SMP 或日志设置的构建配置边界。
+
+OrangePi 5 Plus 的 `robot-flow` 与 `uvc-v4l2` wrapper 使用完全相同的 Cargo 编译身份，并启用两类 case 所需的 feature 超集（包括 `starry-kernel/uvc`），因此 `--board orangepi-5-plus-robot` 只编译一次内核；两个 case 仍从各自的 `board-*.toml` 加载启动命令、判定规则和 session 文件。两个 wrapper 都保留自己的 `build-{target}.toml`，让最近 wrapper 发现规则保持明确；构建分组阶段按规范化后的完整 Cargo identity 合并它们，而不是按路径误拆成两个构建组。
+
+## 5. GroupedCaseRunnerConfig
+
+StarryOS 的 grouped runner 标记前缀由 `GroupedCaseRunnerConfig` 定义（`starry/test/assets.rs`），生成的日志形如：
 
 ```text
-STARRY_GROUPED_TEST_BEGIN: /usr/bin/test-a
-STARRY_GROUPED_TEST_PASSED: /usr/bin/test-a
+STARRY_GROUPED_TEST_BEGIN: step=1/3 epoch=... command=/usr/bin/test-a
+STARRY_GROUPED_TEST_PASSED: step=1/3 epoch=... status=0 command=/usr/bin/test-a
 STARRY_GROUPED_TESTS_PASSED
 ```
 
-axbuild 通过这些结构化标记精确统计每条命令的通过/失败状态。
+axbuild 通过这些结构化标记精确统计每条命令的通过/失败状态。生成的被动步骤使用 `STARRY_GROUPED_TESTS_PASSED` 作为 `success_regex`（全部通过），QEMU 顶层 `fail_regex` 匹配单步 `STARRY_GROUPED_TEST_FAILED:`；runner 只有在没有单步失败时才会打印全部通过标记。runner 脚本生成和 marker 协议的完整说明见 [测试基础设施](../test_infra#8-grouped-runner-协议)。

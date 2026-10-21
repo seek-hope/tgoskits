@@ -5,7 +5,7 @@ use ostool::build::config::Cargo;
 
 use crate::support::process::ProcessExt;
 
-pub(super) const AX_LIBC_PACKAGE: &str = "ax-libc";
+pub(crate) const AX_LIBC_PACKAGE: &str = "ax-libc";
 pub(super) const PIC_RUSTFLAG: &str = "-Crelocation-model=pic";
 
 pub(super) fn build_axlibc_staticlib(
@@ -15,6 +15,7 @@ pub(super) fn build_axlibc_staticlib(
     debug: bool,
     dynamic_pie: bool,
 ) -> anyhow::Result<()> {
+    crate::context::reject_raw_target_dir_args(cargo)?;
     let mut command = Command::new("cargo");
     let mut env = cargo.env.clone();
     if dynamic_pie {

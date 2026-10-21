@@ -1,7 +1,7 @@
 use alloc::{collections::btree_set::BTreeSet, vec::Vec};
 
-use ax_kspin::SpinNoPreempt as Mutex;
-use spin::Once;
+use ax_lazyinit::OnceLock;
+use ax_sync::RawSpinLock;
 
 use crate::{
     Descriptor, PlatformDevice,
@@ -10,7 +10,7 @@ use crate::{
     register::{DriverRegister, ProbeKind},
 };
 
-static SYSTEM: Once<System> = Once::new();
+static SYSTEM: OnceLock<System> = OnceLock::new();
 
 pub type FnOnProbe = fn(plat_dev: PlatformDevice) -> Result<(), OnProbeError>;
 
@@ -26,13 +26,13 @@ pub(crate) fn try_probe_register(
 }
 
 struct System {
-    probed_names: Mutex<BTreeSet<&'static str>>,
+    probed_names: RawSpinLock<BTreeSet<&'static str>>,
 }
 
 impl System {
     fn new() -> Self {
         Self {
-            probed_names: Mutex::new(BTreeSet::new()),
+            probed_names: RawSpinLock::new(BTreeSet::new()),
         }
     }
 

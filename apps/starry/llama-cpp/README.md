@@ -6,7 +6,7 @@ Covers binary execution, error handling, model loading, and token generation.
 ## Prerequisites
 
 - llama-cli binary and SmolLM2-135M Q4_0 model pre-injected into the Alpine rootfs
-- Rootfs images at `tmp/axbuild/rootfs/rootfs-{arch}-alpine.img`
+- Rootfs images at `target/axbuild/rootfs/rootfs-{arch}-alpine.img`
 
 ## Running
 
@@ -57,6 +57,6 @@ Application-level stability: 100% (17/18 PASS, 1 kernel issue).
 
 ## Build Config
 
-Features: `ax-hal/<arch>`, `qemu`, `ax-driver/virtio-blk`, `ax-driver/virtio-net`, `ax-driver/virtio-gpu`, `ax-driver/virtio-input`, `ax-driver/virtio-socket`.
+Features: `ax-hal/<arch>`, `qemu`, `ax-driver/nvme`, `ax-driver/virtio-net`, `ax-driver/virtio-gpu`, `ax-driver/virtio-input`, `ax-driver/virtio-socket`.
 
 x86_64 QEMU requires `-cpu max` for SSE4.2 support.

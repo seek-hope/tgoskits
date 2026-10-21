@@ -9,18 +9,18 @@ mod rockchip_soc_pin;
 
 #[bare_test::tests]
 mod tests {
-    use ax_kspin::SpinNoIrq as Mutex;
+    use ax_lazyinit::OnceLock;
+    use ax_sync::RawSpinLock;
     use bare_test::mem::iomap;
     use log::info;
     use rockchip_soc::{Cru, SocType};
-    use spin::Once;
 
     use crate::rockchip_soc_pin::test_pin;
 
-    static INIT: Once<Mutex<Cru>> = Once::new();
+    static INIT: OnceLock<RawSpinLock<Cru>> = OnceLock::new();
 
     pub fn initclk(clk: Cru) {
-        INIT.call_once(|| Mutex::new(clk));
+        INIT.call_once(|| RawSpinLock::new(clk));
     }
 
     #[test]

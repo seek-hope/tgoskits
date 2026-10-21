@@ -14,22 +14,25 @@
 
 //! Architecture-neutral FDT parsing and guest configuration enrichment.
 
-use alloc::{
+use std::{
+    collections::BTreeSet,
     format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 
 use axvmconfig::{
-    AxVMCrateConfig, PassThroughDeviceConfig, ReservedAddressConfig, VmMemConfig, VmMemMappingType,
+    GuestConfig, GuestType, HostDeviceAssignment, ReservedAddressConfig, VmMemConfig,
+    VmMemMappingType,
 };
 use fdt_edit::{Fdt, Node, NodeType, PciRange, PciSpace};
 
-use crate::{AxVmResult, MappingFlags, ax_err_type, config::AxVMConfig};
+use super::policy::DecodedInterrupt;
+use crate::{config::*, *};
 
 const PAGE_SIZE_4K: usize = 0x1000;
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn try_get_host_fdt() -> Option<&'static [u8]> {
     let bootarg = super::super::host_fdt_bootarg();
     if bootarg == 0 {
@@ -46,14 +49,113 @@ pub fn try_get_host_fdt() -> Option<&'static [u8]> {
 pub fn setup_guest_fdt_from_vmm(
     fdt_bytes: &[u8],
     vm_cfg: &mut AxVMConfig,
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> AxVmResult<Vec<u8>> {
     let fdt = Fdt::from_bytes(fdt_bytes)
         .map_err(|e| ax_err_type!(InvalidData, format!("Failed to parse host FDT: {e:#?}")))?;
 
+    // A passthrough guest starts from the root baseline: every guest-assignable
+    // device, minus the PCI host bridges the baseline always strips. An empty
+    // list takes that baseline implicitly. Writing an explicit "/" names the
+    // same baseline, and any path written next to it is appended on top, so a
+    // host bridge named there survives the strip. An endpoint named under a
+    // host bridge that the baseline strips must have that bridge named too: the
+    // guest finds PCI endpoints by probing the bridge's config space, so a
+    // silent exemption for the bridge would also hand over its other endpoints.
+    // A list with no "/" stays an exact selection with no baseline at all.
+    //
+    // The baseline needs the passthrough guest type next to the runtime root
+    // selector: the host installs that selector for a passthrough guest (the
+    // machine default for an empty list, the guest's own "/" otherwise). The
+    // axvmconfig TOML validation rejects "/" for a virtualized guest, but a
+    // directly constructed GuestConfig bypasses that check, so the parser still
+    // gates on guest_type and never hands a virtualized guest the baseline.
+    let explicit_device_names = crate_config
+        .devices
+        .passthrough
+        .iter()
+        .map(|device| device.path.clone())
+        .collect::<Vec<_>>();
+    let appended_device_names = explicit_device_names
+        .iter()
+        .filter(|name| name.as_str() != "/")
+        .cloned()
+        .collect::<Vec<_>>();
+    let base_is_root = crate_config.base.guest_type == GuestType::Passthrough
+        && vm_cfg
+            .pass_through_devices()
+            .iter()
+            .any(|device| device.name == "/");
+
+    if base_is_root {
+        // Decide which host bridges the guest did not name before touching
+        // `vm_cfg`. A selector that only names an endpoint under an unnamed
+        // bridge is rejected, and that rejection must not leave the
+        // configuration with a partially stripped bridge set.
+        let mut bridges_to_strip = Vec::new();
+        for node_id in fdt.iter_node_ids() {
+            if !fdt.node(node_id).is_some_and(Node::is_pci) {
+                continue;
+            }
+            let path = fdt.path_of(node_id);
+            // A host bridge named next to "/" overrides the baseline strip.
+            if appended_device_names
+                .iter()
+                .any(|selector| super::device::selector_includes_path(selector, &path))
+            {
+                continue;
+            }
+            // Keeping a bridge for a selector that only names one of its
+            // endpoints would silently hand over the bridge's other endpoints,
+            // so require the bridge to be named explicitly.
+            if let Some(selector) = appended_device_names
+                .iter()
+                .find(|selector| super::device::selector_includes_path(&path, selector))
+            {
+                return Err(ax_err_type!(
+                    InvalidData,
+                    format!(
+                        "passthrough selector {selector} is below PCI host bridge {path}, which \
+                         the root baseline strips: list {path} explicitly so the endpoint and its \
+                         bridge stay assigned, or drop the selector"
+                    )
+                ));
+            }
+            bridges_to_strip.push(path);
+        }
+        for path in bridges_to_strip {
+            vm_cfg.exclude_device_path(path);
+        }
+    }
+
+    let mut selected_device_names = if base_is_root {
+        vm_cfg
+            .pass_through_devices()
+            .iter()
+            .map(|device| device.name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    selected_device_names.extend(appended_device_names);
     reserve_excluded_device_ranges(vm_cfg, crate_config, fdt_bytes)?;
-    let passthrough_device_names = super::device::find_all_passthrough_devices(vm_cfg, &fdt);
-    super::create::create_guest_fdt(&fdt, &passthrough_device_names, crate_config)
+    let excluded_device_paths = vm_cfg
+        .excluded_devices()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let passthrough_device_names = super::device::find_all_passthrough_devices_from_paths(
+        &selected_device_names,
+        &excluded_device_paths,
+        &fdt,
+    )?;
+    super::create::create_guest_fdt(
+        &fdt,
+        &passthrough_device_names,
+        crate_config,
+        &excluded_device_paths,
+    )
 }
 
 fn is_reserved_memory_path(node_path: &str) -> bool {
@@ -91,50 +193,7 @@ fn align_reserved_region_4k(gpa: usize, size: usize) -> Option<(usize, usize)> {
     (aligned_size > 0).then_some((aligned_gpa, aligned_size))
 }
 
-fn subtract_memory_region_overlap(
-    start: usize,
-    size: usize,
-    existing_regions: &[VmMemConfig],
-) -> Vec<(usize, usize)> {
-    let mut remaining = vec![(start, start.saturating_add(size))];
-    let mut overlaps = existing_regions.to_vec();
-    overlaps.sort_by_key(|region| region.gpa);
-
-    for region in overlaps {
-        let overlap_start = region.gpa;
-        let overlap_end = region.gpa.saturating_add(region.size);
-        let mut next_remaining = Vec::new();
-
-        for (seg_start, seg_end) in remaining {
-            if overlap_end <= seg_start || overlap_start >= seg_end {
-                next_remaining.push((seg_start, seg_end));
-                continue;
-            }
-
-            if seg_start < overlap_start {
-                next_remaining.push((seg_start, overlap_start.min(seg_end)));
-            }
-            if overlap_end < seg_end {
-                next_remaining.push((overlap_end.max(seg_start), seg_end));
-            }
-        }
-
-        remaining = next_remaining;
-        if remaining.is_empty() {
-            break;
-        }
-    }
-
-    remaining
-        .into_iter()
-        .filter_map(|(seg_start, seg_end)| {
-            let seg_size = seg_end.saturating_sub(seg_start);
-            (seg_size > 0).then_some((seg_start, seg_size))
-        })
-        .collect()
-}
-
-fn reserved_memory_regions(crate_cfg: &AxVMCrateConfig) -> impl Iterator<Item = &VmMemConfig> {
+fn reserved_memory_regions(crate_cfg: &GuestConfig) -> impl Iterator<Item = &VmMemConfig> {
     crate_cfg
         .kernel
         .memory_regions
@@ -142,14 +201,23 @@ fn reserved_memory_regions(crate_cfg: &AxVMCrateConfig) -> impl Iterator<Item = 
         .filter(|region| region.map_type == VmMemMappingType::MapReserved)
 }
 
-fn excluded_device_paths(crate_cfg: &AxVMCrateConfig) -> Vec<String> {
-    crate_cfg
-        .devices
-        .excluded_devices
+fn excluded_device_paths(vm_cfg: &AxVMConfig, crate_cfg: &GuestConfig) -> Vec<String> {
+    let mut paths = vm_cfg
+        .excluded_devices()
         .iter()
         .flatten()
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    paths.extend(
+        crate_cfg
+            .devices
+            .disabled
+            .iter()
+            .map(|device| device.path.clone()),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn is_excluded_node_path(node_path: &str, excluded_paths: &[String]) -> bool {
@@ -214,21 +282,25 @@ fn node_pci_ranges(fdt: &Fdt, node_id: usize) -> Vec<PciRange> {
 
 pub fn reserve_excluded_device_ranges(
     vm_cfg: &mut AxVMConfig,
-    crate_cfg: &AxVMCrateConfig,
+    crate_cfg: &GuestConfig,
     dtb: &[u8],
 ) -> AxVmResult {
-    let excluded_paths = excluded_device_paths(crate_cfg);
-    if excluded_paths.is_empty() {
-        return Ok(());
-    }
-
     let fdt = Fdt::from_bytes(dtb).map_err(|e| {
         ax_err_type!(
             InvalidData,
             format!("Failed to parse DTB image while reading excluded devices: {e:#?}")
         )
     })?;
+    protect_machine_owned_firmware_devices(vm_cfg, crate_cfg, &fdt)?;
+    for device in &crate_cfg.devices.disabled {
+        vm_cfg.exclude_device_path(device.path.clone());
+    }
+    let excluded_paths = excluded_device_paths(vm_cfg, crate_cfg);
+    if excluded_paths.is_empty() {
+        return Ok(());
+    }
     let mut reserved_ranges = Vec::new();
+    let decode_interrupt = super::selected_guest_fdt_policy().decode_interrupt;
 
     for node_id in fdt.iter_node_ids() {
         let node_path = fdt.path_of(node_id);
@@ -236,6 +308,7 @@ pub fn reserve_excluded_device_ranges(
             continue;
         }
 
+        exclude_node_interrupt_sources(vm_cfg, &fdt, node_id, decode_interrupt);
         for reg in node_regs(&fdt, node_id) {
             push_reserved_address_range(
                 &mut reserved_ranges,
@@ -244,7 +317,6 @@ pub fn reserve_excluded_device_ranges(
                 reg.size.unwrap_or(0) as usize,
             );
         }
-
         for range in node_pci_ranges(&fdt, node_id) {
             push_reserved_address_range(
                 &mut reserved_ranges,
@@ -260,6 +332,78 @@ pub fn reserve_excluded_device_ranges(
         vm_cfg.add_reserved_address_range(range);
     }
 
+    Ok(())
+}
+
+fn exclude_node_interrupt_sources(
+    vm_cfg: &mut AxVMConfig,
+    fdt: &Fdt,
+    node_id: usize,
+    decode_interrupt: fn(&[u32]) -> Option<DecodedInterrupt>,
+) {
+    let Some(view) = fdt.view_typed(node_id) else {
+        return;
+    };
+    for interrupt in view.interrupts() {
+        if let Some(interrupt) = decode_interrupt(&interrupt.specifier) {
+            vm_cfg.exclude_pass_through_irq_source(interrupt.source);
+        }
+    }
+}
+
+fn protect_machine_owned_firmware_devices(
+    vm_cfg: &mut AxVMConfig,
+    crate_cfg: &GuestConfig,
+    fdt: &Fdt,
+) -> AxVmResult {
+    // The root baseline is not a concrete claim: an empty list already takes it,
+    // and the machine-owned paths are excluded from it further down either way.
+    let claimed = crate_cfg
+        .devices
+        .passthrough
+        .iter()
+        .filter(|device| device.path != "/")
+        .collect::<Vec<_>>();
+    let selected_paths = claimed
+        .iter()
+        .map(|device| device.path.as_str())
+        .collect::<Vec<_>>();
+    let console_paths = super::serial::host_owned_serial_paths(fdt)?;
+    if let Some(selected) = claimed.iter().find(|selected| {
+        console_paths
+            .iter()
+            .any(|console_path| super::device::selector_includes_path(&selected.path, console_path))
+    }) {
+        return Err(AxVmError::HostOwnedDevice {
+            path: selected.path.clone(),
+        });
+    }
+    let mut host_owned_paths = super::serial::physical_serial_paths(fdt)?;
+    host_owned_paths.retain(|path| {
+        console_paths.contains(path)
+            || !selected_paths
+                .iter()
+                .any(|selector| super::device::selector_includes_path(selector, path))
+    });
+    host_owned_paths.extend(fdt.iter_node_ids().filter_map(|node_id| {
+        let node = fdt.node(node_id)?;
+        (super::interrupt::is_machine_interrupt_provider(node)
+            || super::timer::is_machine_timer_node(node))
+        .then(|| fdt.path_of(node_id))
+    }));
+    host_owned_paths.sort();
+    host_owned_paths.dedup();
+    if let Some(selected) = claimed
+        .iter()
+        .find(|selected| host_owned_paths.iter().any(|path| path == &selected.path))
+    {
+        return Err(AxVmError::HostOwnedDevice {
+            path: selected.path.clone(),
+        });
+    }
+    for path in host_owned_paths {
+        vm_cfg.exclude_device_path(path);
+    }
     Ok(())
 }
 
@@ -316,63 +460,57 @@ fn should_skip_passthrough_node(
     false
 }
 
-pub fn parse_reserved_memory_regions(crate_cfg: &mut AxVMCrateConfig, dtb: &[u8]) -> AxVmResult {
-    let fdt = Fdt::from_bytes(dtb).map_err(|e| {
-        ax_err_type!(
-            InvalidData,
-            format!("Failed to parse DTB image while reading reserved memory: {e:#?}")
-        )
-    })?;
-    let default_flags = (MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE).bits();
-
-    let mut added_count = 0usize;
-    for node_id in fdt.iter_node_ids() {
-        let node_path = fdt.path_of(node_id);
-        if !is_reserved_memory_path(&node_path) {
-            continue;
-        }
-
-        for reg in node_regs(&fdt, node_id) {
-            let original_gpa = reg.address as usize;
-            let original_size = reg.size.unwrap_or(0) as usize;
-            let Some((gpa, size)) = align_reserved_region_4k(original_gpa, original_size) else {
-                continue;
-            };
-
-            let remaining_segments =
-                subtract_memory_region_overlap(gpa, size, &crate_cfg.kernel.memory_regions);
-
-            for (seg_gpa, seg_size) in remaining_segments {
-                crate_cfg.kernel.memory_regions.push(VmMemConfig {
-                    gpa: seg_gpa,
-                    size: seg_size,
-                    flags: default_flags,
-                    map_type: VmMemMappingType::MapReserved,
-                });
-                added_count += 1;
-            }
-        }
-    }
-
-    if added_count > 0 {
-        debug!(
-            "Added {} reserved-memory region(s) from DTB into VM kernel memory_regions",
-            added_count
-        );
-    }
-    Ok(())
+pub fn parse_reserved_memory_regions(crate_cfg: &GuestConfig, dtb: &[u8]) -> AxVmResult {
+    let tree = super::tree::FdtTree::from_bytes(dtb)?;
+    super::reserved::validate_configured(tree.inner(), crate_cfg)
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_phys_cpu_sets(
     vm_cfg: &mut AxVMConfig,
     fdt: &Fdt,
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> AxVmResult {
     let phys_cpu_ids = crate_config
         .base
         .phys_cpu_ids
         .as_ref()
         .ok_or_else(|| ax_err_type!(InvalidInput, "phys_cpu_ids is missing"))?;
+
+    let policy = super::selected_guest_fdt_policy();
+    let host_cpu_count = (policy.host_cpu_count)();
+
+    // When `phys_cpu_sets` is configured explicitly, each entry is the final
+    // physical-CPU affinity mask of the corresponding vCPU, so `phys_cpu_ids`
+    // only carries the guest-visible virtual CPU id (the low bits of the
+    // virtualized MPIDR) and must not be required to exist in the host FDT.
+    // This is what makes vCPU over-subscription possible: more guest vCPUs
+    // than host physical CPUs, all scheduled on the CPUs selected by the mask.
+    if let Some(phys_cpu_sets) = crate_config.base.phys_cpu_sets.as_ref() {
+        if phys_cpu_sets.len() != phys_cpu_ids.len() {
+            return Err(ax_err_type!(
+                InvalidInput,
+                format!(
+                    "phys_cpu_sets length ({}) must equal phys_cpu_ids length ({})",
+                    phys_cpu_sets.len(),
+                    phys_cpu_ids.len()
+                )
+            ));
+        }
+        let Some(valid_masks) = host_affinity_mask(host_cpu_count) else {
+            return Err(ax_err_type!(
+                InvalidInput,
+                format!("host CPU count {host_cpu_count} exceeds the affinity mask width")
+            ));
+        };
+        for &mask in phys_cpu_sets {
+            validate_phys_cpu_set(mask, valid_masks, host_cpu_count)?;
+        }
+        let phys_cpu_ls = vm_cfg.phys_cpu_ls_mut();
+        phys_cpu_ls.set_guest_cpu_sets(phys_cpu_sets.clone());
+        phys_cpu_ls.set_guest_phys_cpu_ids(phys_cpu_ids.clone());
+        return Ok(());
+    }
 
     let cpu_nodes_info: Vec<_> = fdt
         .iter_node_ids()
@@ -382,35 +520,22 @@ pub fn set_phys_cpu_sets(
                 .strip_prefix("/cpus/cpu@")
                 .and_then(|id| id.split('/').next())
                 .and_then(|id| usize::from_str_radix(id, 16).ok())?;
-            let guest_cpu_id = node_regs(fdt, node_id).first()?.address as usize;
+            let hardware_cpu_id = node_regs(fdt, node_id).first()?.address as usize;
             info!(
-                "CPU node: {}, node_id: 0x{:x}, guest_cpu_id: 0x{:x}",
-                path, node_id_from_path, guest_cpu_id
+                "CPU node: {}, node_id: 0x{:x}, hardware_cpu_id: 0x{:x}",
+                path, node_id_from_path, hardware_cpu_id
             );
-            Some((node_id_from_path, guest_cpu_id))
+            Some((node_id_from_path, hardware_cpu_id))
         })
         .collect();
     info!("Found {} host CPU nodes", cpu_nodes_info.len());
 
-    let mut new_phys_cpu_sets = Vec::new();
-    let mut guest_phys_cpu_ids = Vec::new();
-    for phys_cpu_id in phys_cpu_ids {
-        if let Some((cpu_index, (_, guest_cpu_id))) = cpu_nodes_info
-            .iter()
-            .enumerate()
-            .find(|(_, (node_id, _))| node_id == phys_cpu_id)
-        {
-            let cpu_mask = 1usize << cpu_index;
-            new_phys_cpu_sets.push(cpu_mask);
-            guest_phys_cpu_ids.push(*guest_cpu_id);
-        } else {
-            error!(
-                "vCPU {} with phys_cpu_id 0x{:x} not found in device tree!",
-                vm_cfg.id(),
-                phys_cpu_id
-            );
-        }
-    }
+    let (new_phys_cpu_sets, guest_phys_cpu_ids) = resolve_phys_cpu_sets(
+        phys_cpu_ids,
+        &cpu_nodes_info,
+        host_cpu_count,
+        policy.resolve_cpu_index,
+    )?;
 
     let phys_cpu_ls = vm_cfg.phys_cpu_ls_mut();
     phys_cpu_ls.set_guest_cpu_sets(new_phys_cpu_sets);
@@ -418,9 +543,96 @@ pub fn set_phys_cpu_sets(
     Ok(())
 }
 
+/// Returns the affinity mask that selects every usable host CPU.
+///
+/// `None` means the CPU count cannot be represented by an affinity mask at all.
+/// A count equal to the mask width stays valid: it covers CPUs
+/// `0..usize::BITS`, which is exactly what `usize::MAX` selects, so it must not
+/// be rejected by the shift below.
+fn host_affinity_mask(host_cpu_count: usize) -> Option<usize> {
+    if host_cpu_count > usize::BITS as usize {
+        return None;
+    }
+    Some(match host_cpu_count {
+        0 => 0,
+        width if width == usize::BITS as usize => usize::MAX,
+        width => (1usize << width) - 1,
+    })
+}
+
+fn validate_phys_cpu_set(mask: usize, valid_masks: usize, host_cpu_count: usize) -> AxVmResult {
+    if mask == 0 || mask & !valid_masks != 0 {
+        return Err(ax_err_type!(
+            InvalidInput,
+            format!("phys_cpu_sets mask 0x{mask:x} is not within the {host_cpu_count} host CPUs")
+        ));
+    }
+    if mask.count_ones() != 1 {
+        return Err(ax_err_type!(
+            InvalidInput,
+            format!("phys_cpu_sets mask 0x{mask:x} must select exactly one host CPU")
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_phys_cpu_sets(
+    phys_cpu_ids: &[usize],
+    cpu_nodes: &[(usize, usize)],
+    host_cpu_count: usize,
+    mut resolve_cpu_index: impl FnMut(usize) -> Option<usize>,
+) -> AxVmResult<(Vec<usize>, Vec<usize>)> {
+    let mut cpu_sets = Vec::with_capacity(phys_cpu_ids.len());
+    let mut guest_cpu_ids = Vec::with_capacity(phys_cpu_ids.len());
+
+    for &phys_cpu_id in phys_cpu_ids {
+        let &(_, hardware_cpu_id) = cpu_nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == phys_cpu_id)
+            .ok_or_else(|| {
+                ax_err_type!(
+                    InvalidInput,
+                    format!("physical CPU ID 0x{phys_cpu_id:x} is missing from the host FDT")
+                )
+            })?;
+        let logical_index = resolve_cpu_index(hardware_cpu_id).ok_or_else(|| {
+            ax_err_type!(
+                InvalidInput,
+                format!(
+                    "hardware CPU ID 0x{hardware_cpu_id:x} is missing from the runtime topology"
+                )
+            )
+        })?;
+        if logical_index >= host_cpu_count {
+            return Err(ax_err_type!(
+                InvalidInput,
+                format!(
+                    "logical CPU index {logical_index} is outside the {host_cpu_count} usable \
+                     host CPUs"
+                )
+            ));
+        }
+        let cpu_mask = if logical_index < usize::BITS as usize {
+            1usize << logical_index
+        } else {
+            return Err(ax_err_type!(
+                InvalidInput,
+                format!(
+                    "logical CPU index {logical_index} does not fit the host CPU affinity mask"
+                )
+            ));
+        };
+
+        cpu_sets.push(cpu_mask);
+        guest_cpu_ids.push(hardware_cpu_id);
+    }
+
+    Ok((cpu_sets, guest_cpu_ids))
+}
+
 fn add_device_address_config(
     vm_cfg: &mut AxVMConfig,
-    node_name: &str,
+    node_path: &str,
     base_address: usize,
     size: usize,
     index: usize,
@@ -430,47 +642,27 @@ fn add_device_address_config(
         return;
     }
 
-    let addr_end = base_address.saturating_add(size);
-    if let Some(emu_dev) = vm_cfg.emu_devices().iter().find(|emu_dev| {
-        let emu_start = emu_dev.base_gpa;
-        let emu_end = emu_dev.base_gpa.saturating_add(emu_dev.length);
-        base_address < emu_end && emu_start < addr_end
-    }) {
-        debug!(
-            "Skipping passthrough mapping for node {} [{:#x}~{:#x}] because it overlaps emulated \
-             device {} [{:#x}~{:#x}]",
-            node_name,
-            base_address,
-            addr_end,
-            emu_dev.name,
-            emu_dev.base_gpa,
-            emu_dev.base_gpa.saturating_add(emu_dev.length),
-        );
-        return;
-    }
-
     let device_name = if index == 0 {
         match prefix {
-            Some(p) => format!("{node_name}-{p}"),
-            None => node_name.to_string(),
+            Some(p) => format!("{node_path}-{p}"),
+            None => node_path.to_string(),
         }
     } else {
         match prefix {
-            Some(p) => format!("{node_name}-{p}-region{index}"),
-            None => format!("{node_name}-region{index}"),
+            Some(p) => format!("{node_path}-{p}-region{index}"),
+            None => format!("{node_path}-region{index}"),
         }
     };
 
-    vm_cfg.add_pass_through_device(PassThroughDeviceConfig {
+    vm_cfg.add_pass_through_device(HostDeviceAssignment {
         name: device_name,
         base_gpa: base_address,
         base_hpa: base_address,
         length: size,
-        irq_id: 0,
     });
 }
 
-fn add_pci_ranges_config(vm_cfg: &mut AxVMConfig, node_name: &str, range: &PciRange, index: usize) {
+fn add_pci_ranges_config(vm_cfg: &mut AxVMConfig, node_path: &str, range: &PciRange, index: usize) {
     let base_address = range.cpu_address as usize;
     let size = range.size as usize;
 
@@ -485,37 +677,26 @@ fn add_pci_ranges_config(vm_cfg: &mut AxVMConfig, node_name: &str, range: &PciRa
     };
 
     let device_name = if index == 0 {
-        format!("{node_name}-{prefix}")
+        format!("{node_path}-{prefix}")
     } else {
-        format!("{node_name}-{prefix}-region{index}")
+        format!("{node_path}-{prefix}-region{index}")
     };
 
-    vm_cfg.add_pass_through_device(PassThroughDeviceConfig {
+    vm_cfg.add_pass_through_device(HostDeviceAssignment {
         name: device_name,
         base_gpa: base_address,
         base_hpa: base_address,
         length: size,
-        irq_id: 0,
     });
 }
 
 pub fn parse_passthrough_devices_address(
     vm_cfg: &mut AxVMConfig,
-    crate_cfg: &AxVMCrateConfig,
+    crate_cfg: &GuestConfig,
     dtb: &[u8],
 ) -> AxVmResult {
     let devices = vm_cfg.pass_through_devices().to_vec();
-    if !devices.is_empty() && devices[0].length != 0 {
-        for (index, device) in devices.iter().enumerate() {
-            add_device_address_config(
-                vm_cfg,
-                &device.name,
-                device.base_gpa,
-                device.length,
-                index,
-                None,
-            );
-        }
+    if devices.iter().all(|device| device.length != 0) {
         return Ok(());
     }
 
@@ -526,6 +707,9 @@ pub fn parse_passthrough_devices_address(
         )
     })?;
 
+    let selected_paths = super::device::find_all_passthrough_devices(vm_cfg, &fdt)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     vm_cfg.clear_pass_through_devices();
     let reserved_regions: Vec<VmMemConfig> = reserved_memory_regions(crate_cfg).cloned().collect();
 
@@ -535,7 +719,9 @@ pub fn parse_passthrough_devices_address(
         };
         let node_path = fdt.path_of(node_id);
 
-        if node_path == "/"
+        if !selected_paths.contains(&node_path)
+            || !super::device::node_enabled(&fdt, node_id)
+            || node_path == "/"
             || node.name().starts_with("memory")
             || is_reserved_memory_path(&node_path)
         {
@@ -548,16 +734,16 @@ pub fn parse_passthrough_devices_address(
             continue;
         }
 
-        let node_name = node.name().to_string();
+        let node_name = node.name();
         if node_name.starts_with("pcie@") || node_name.contains("pci") {
             for (index, range) in node_pci_ranges(&fdt, node_id).iter().enumerate() {
-                add_pci_ranges_config(vm_cfg, &node_name, range, index);
+                add_pci_ranges_config(vm_cfg, &node_path, range, index);
             }
 
             for (index, reg) in node_regs(&fdt, node_id).iter().enumerate() {
                 add_device_address_config(
                     vm_cfg,
-                    &node_name,
+                    &node_path,
                     reg.address as usize,
                     reg.size.unwrap_or(0) as usize,
                     index,
@@ -568,7 +754,7 @@ pub fn parse_passthrough_devices_address(
             for (index, reg) in node_regs(&fdt, node_id).iter().enumerate() {
                 add_device_address_config(
                     vm_cfg,
-                    &node_name,
+                    &node_path,
                     reg.address as usize,
                     reg.size.unwrap_or(0) as usize,
                     index,
@@ -580,7 +766,11 @@ pub fn parse_passthrough_devices_address(
     Ok(())
 }
 
-pub fn parse_vm_interrupt(vm_cfg: &mut AxVMConfig, dtb: &[u8]) -> AxVmResult {
+pub fn parse_vm_interrupt(
+    vm_cfg: &mut AxVMConfig,
+    crate_cfg: &GuestConfig,
+    dtb: &[u8],
+) -> AxVmResult {
     let decode_interrupt = super::selected_guest_fdt_policy().decode_interrupt;
     let fdt = Fdt::from_bytes(dtb).map_err(|e| {
         ax_err_type!(
@@ -588,16 +778,25 @@ pub fn parse_vm_interrupt(vm_cfg: &mut AxVMConfig, dtb: &[u8]) -> AxVmResult {
             format!("Failed to parse DTB image while reading interrupts: {e:#?}")
         )
     })?;
+    let selected_paths = super::device::find_all_passthrough_devices(vm_cfg, &fdt)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let excluded_paths = excluded_device_paths(vm_cfg, crate_cfg);
+    let host_owned_serial_paths = super::serial::host_owned_serial_paths(&fdt)?;
+    let mut passthrough_interrupts = Vec::new();
 
     for node_id in fdt.iter_node_ids() {
         let Some(node) = fdt.node(node_id) else {
             continue;
         };
         let name = node.name();
-        if name.starts_with("memory")
-            || name.starts_with("interrupt-controller")
-            || name.starts_with("intc")
-            || name.starts_with("its")
+        let path = fdt.path_of(node_id);
+        if !selected_paths.contains(&path)
+            || !super::device::node_enabled(&fdt, node_id)
+            || is_excluded_node_path(&path, &excluded_paths)
+            || name.starts_with("memory")
+            || super::interrupt::is_machine_interrupt_provider(node)
+            || host_owned_serial_paths.contains(&path)
         {
             continue;
         }
@@ -606,40 +805,166 @@ pub fn parse_vm_interrupt(vm_cfg: &mut AxVMConfig, dtb: &[u8]) -> AxVmResult {
             continue;
         };
         for interrupt in view.interrupts() {
-            if let Some(irq) = decode_interrupt(&interrupt.specifier) {
-                trace!("node: {name}, passthrough interrupt id: 0x{irq:x}");
-                vm_cfg.add_pass_through_irq(irq);
+            if let Some(interrupt) = decode_interrupt(&interrupt.specifier) {
+                if vm_cfg
+                    .excluded_passthrough_irq_sources()
+                    .contains(&interrupt.source)
+                {
+                    return Err(AxVmError::invalid_config(format!(
+                        "passthrough device {path} shares host-owned interrupt source {:#x}",
+                        interrupt.source
+                    )));
+                }
+                passthrough_interrupts.push((path.clone(), interrupt));
             }
         }
     }
 
+    for (path, interrupt) in passthrough_interrupts {
+        trace!(
+            "node: {path}, passthrough interrupt source: {:#x}, trigger: {:?}",
+            interrupt.source, interrupt.trigger
+        );
+        vm_cfg.add_pass_through_irq(interrupt.source, interrupt.trigger);
+    }
+
     Ok(())
 }
-
 pub fn update_provided_fdt(
     provided_dtb: &[u8],
     host_dtb: Option<&[u8]>,
-    crate_config: &AxVMCrateConfig,
+    crate_config: &GuestConfig,
 ) -> AxVmResult<Vec<u8>> {
     let patch_provided = super::selected_guest_fdt_policy().patch_provided;
-    patch_provided(provided_dtb, host_dtb, crate_config)
+    let bytes = patch_provided(provided_dtb, host_dtb, crate_config)?;
+    let mut tree = super::tree::FdtTree::from_bytes(&bytes)?;
+    super::disabled::apply(&mut tree, crate_config)?;
+    Ok(tree.finish())
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::{string::ToString, vec, vec::Vec};
+    use std::{string::ToString, vec, vec::Vec};
 
-    use axvm_types::{AddressSpacePolicy, VmMemConfig, VmMemMappingType};
-    use axvmconfig::{AxVMCrateConfig, VMDevicesConfig};
+    use axvm_types::{AddressSpacePolicy, HostDeviceAssignment};
+    use axvmconfig::{GuestConfig, GuestDevices, GuestType, PhysicalDeviceRef};
     use fdt_edit::{Fdt, Node};
     use fdt_raw::RegInfo;
 
-    use super::{align_reserved_region_4k, reserve_excluded_device_ranges};
+    use super::{
+        align_reserved_region_4k, host_affinity_mask, parse_passthrough_devices_address,
+        parse_vm_interrupt, reserve_excluded_device_ranges, resolve_phys_cpu_sets,
+        setup_guest_fdt_from_vmm,
+    };
     use crate::config::{AxVMConfig, AxVMConfigParams, PhysCpuList};
 
+    #[test]
+    fn reserved_memory_outside_guest_ram_keeps_firmware_without_adding_mappings() {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        let reserved = fdt.add_node(root, Node::new("reserved-memory"));
+        fdt.node_mut(reserved)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(reserved)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+        let region = fdt.add_node(reserved, Node::new("buffer@4000"));
+        fdt.view_typed_mut(region)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x4000, Some(0x1000))]);
+        let cfg = GuestConfig::default();
+        let bytes = super::update_provided_fdt(fdt.encode().as_ref(), None, &cfg).unwrap();
+        super::parse_reserved_memory_regions(&cfg, &bytes).unwrap();
+        let guest = Fdt::from_bytes(&bytes).unwrap();
+        super::super::reserved::validate_allocated(&guest, &[]).unwrap();
+        let retained = guest.get_by_path("/reserved-memory/buffer@4000").unwrap();
+        assert_eq!(retained.regs()[0].address, 0x4000);
+        assert_eq!(retained.regs()[0].size, Some(0x1000));
+
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/reserved-memory".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        parse_passthrough_devices_address(&mut vm_cfg, &cfg, &bytes).unwrap();
+        assert!(vm_cfg.pass_through_devices().is_empty());
+        fdt.node_mut(region)
+            .unwrap()
+            .set_property(prop_u32_list("reg", &[u32::MAX, u32::MAX, 0, 1]));
+        assert!(super::parse_reserved_memory_regions(&cfg, fdt.encode().as_ref()).is_err());
+    }
+
+    #[test]
+    fn provided_fdt_removes_disabled_device_subtrees() {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        let disabled = fdt.add_node(root, Node::new("interrupt-controller@1000"));
+        fdt.add_node(disabled, Node::new("child"));
+        fdt.node_mut(disabled)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(disabled)
+            .unwrap()
+            .set_property(super::super::tree::prop_string(
+                "compatible",
+                "brcm,bcm2711-l2-intc",
+            ));
+        let consumer = fdt.add_node(root, Node::new("interrupt-controller@1000-other"));
+        fdt.node_mut(disabled)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+        fdt.node_mut(disabled)
+            .unwrap()
+            .set_property(prop_u32("#clock-cells", 0));
+        let aliases = fdt.add_node(root, Node::new("aliases"));
+        fdt.node_mut(aliases)
+            .unwrap()
+            .set_property(super::super::tree::prop_string(
+                "serial0",
+                "/interrupt-controller@1000",
+            ));
+        let mut cfg = GuestConfig::default();
+        cfg.devices.disabled.push(PhysicalDeviceRef {
+            path: "/interrupt-controller@1000".into(),
+        });
+        let bytes = super::update_provided_fdt(fdt.encode().as_ref(), None, &cfg).unwrap();
+        let guest = Fdt::from_bytes(&bytes).unwrap();
+        assert!(guest.get_by_path_id("/interrupt-controller@1000").is_none());
+        assert!(
+            guest
+                .get_by_path_id("/interrupt-controller@1000-other")
+                .is_some()
+        );
+        assert!(
+            guest
+                .node(guest.get_by_path_id("/aliases").unwrap())
+                .unwrap()
+                .get_property("serial0")
+                .is_none()
+        );
+        fdt.node_mut(consumer)
+            .unwrap()
+            .set_property(prop_u32("clocks", 1));
+        let error = super::update_provided_fdt(fdt.encode().as_ref(), None, &cfg).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disabled provider /interrupt-controller@1000")
+        );
+    }
+
     fn prop_u32(name: &str, value: u32) -> fdt_edit::Property {
-        let mut prop = fdt_edit::Property::new(name, alloc::vec![]);
+        let mut prop = fdt_edit::Property::new(name, std::vec![]);
         prop.set_u32_ls(&[value]);
+        prop
+    }
+
+    fn prop_u32_list(name: &str, values: &[u32]) -> fdt_edit::Property {
+        let mut prop = fdt_edit::Property::new(name, std::vec![]);
+        prop.set_u32_ls(values);
         prop
     }
 
@@ -661,6 +986,323 @@ mod tests {
             fdt.view_typed_mut(node)
                 .unwrap()
                 .set_regs(&[RegInfo::new(base, Some(size))]);
+        }
+
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_pci_hosts_and_endpoint() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+        // A host FDT advertises its CPUs, and the guest keeps one
+        // `/cpus/cpu@<id>` node per configured vCPU id, so the fixture carries
+        // the CPU node the `phys_cpu_ids: [0]` configs below refer to.
+        let cpus = fdt.add_node(root, Node::new("cpus"));
+        fdt.node_mut(cpus)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 1));
+        fdt.node_mut(cpus)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 0));
+        let cpu0 = fdt.add_node(cpus, Node::new("cpu@0"));
+        fdt.node_mut(cpu0)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("device_type", "cpu"));
+        fdt.view_typed_mut(cpu0)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0, None)]);
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("compatible", "riscv,plic0"));
+        let soc = fdt.add_node(root, Node::new("soc"));
+        let pci = fdt.add_node(soc, Node::new("pci@30000000"));
+        fdt.node_mut(pci)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("device_type", "pci"));
+        fdt.view_typed_mut(pci)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x3000_0000, Some(0x1000_0000))]);
+        let nvme = fdt.add_node(pci, Node::new("nvme@0"));
+        fdt.node_mut(nvme)
+            .unwrap()
+            .set_property(prop_u32("interrupt-parent", 1));
+        fdt.node_mut(nvme)
+            .unwrap()
+            .set_property(prop_u32_list("interrupts", &[11]));
+        // A second host bridge on a window that does not touch the first one:
+        // the baseline strip has to remove every bridge the guest does not name,
+        // and touching windows would merge into a single reserved range. Its
+        // endpoint lets a test reject a selector under a bridge that is
+        // enumerated after another strippable bridge.
+        let second = fdt.add_node(soc, Node::new("pci@60000000"));
+        fdt.node_mut(second)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("device_type", "pci"));
+        fdt.view_typed_mut(second)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x6000_0000, Some(0x1000_0000))]);
+        let ethernet = fdt.add_node(second, Node::new("ethernet@0"));
+        fdt.node_mut(ethernet)
+            .unwrap()
+            .set_property(prop_u32("interrupt-parent", 1));
+        fdt.node_mut(ethernet)
+            .unwrap()
+            .set_property(prop_u32_list("interrupts", &[12]));
+        let virtio = fdt.add_node(soc, Node::new("virtio_mmio@10001000"));
+        fdt.node_mut(virtio)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("compatible", "virtio,mmio"));
+        fdt.node_mut(virtio)
+            .unwrap()
+            .set_property(prop_u32("interrupt-parent", 1));
+        fdt.node_mut(virtio)
+            .unwrap()
+            .set_property(prop_u32_list("interrupts", &[11]));
+        fdt.view_typed_mut(virtio)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x1000_1000, Some(0x1000))]);
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_serial_and_device_interrupts() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+
+        for (name, compatible, irq) in [
+            ("serial@10000000", "ns16550a", 10),
+            ("virtio_mmio@10001000", "virtio,mmio", 11),
+        ] {
+            let node = fdt.add_node(root, Node::new(name));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(super::super::tree::prop_string("compatible", compatible));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32("interrupt-parent", 1));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", &[irq]));
+        }
+
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_console_and_assignable_serial() -> Vec<u8> {
+        fdt_with_console_and_assignable_serial_irq(11)
+    }
+
+    fn fdt_with_console_and_assignable_serial_irq(assignable_irq: u32) -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+
+        for (name, base, irq) in [
+            ("serial@10000000", 0x1000_0000, 10),
+            ("serial@10001000", 0x1000_1000, assignable_irq),
+        ] {
+            let node = fdt.add_node(root, Node::new(name));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(super::super::tree::prop_string("compatible", "ns16550a"));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32("interrupt-parent", 1));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", &[irq]));
+            fdt.view_typed_mut(node)
+                .unwrap()
+                .set_regs(&[RegInfo::new(base, Some(0x100))]);
+        }
+
+        let chosen = fdt.add_node(root, Node::new("chosen"));
+        fdt.node_mut(chosen)
+            .unwrap()
+            .set_property(super::super::tree::prop_string(
+                "stdout-path",
+                "/serial@10000000:115200",
+            ));
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_nested_console_and_assignable_serial() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+
+        let console_bus = fdt.add_node(root, Node::new("console-bus"));
+        let peripheral_bus = fdt.add_node(root, Node::new("peripherals"));
+        let lookalike_bus = fdt.add_node(root, Node::new("peripherals-extra"));
+        for bus in [console_bus, peripheral_bus, lookalike_bus] {
+            fdt.node_mut(bus)
+                .unwrap()
+                .set_property(prop_u32("#address-cells", 2));
+            fdt.node_mut(bus)
+                .unwrap()
+                .set_property(prop_u32("#size-cells", 2));
+        }
+
+        for (parent, name, base, irq) in [
+            (console_bus, "serial@10000000", 0x1000_0000, 10),
+            (peripheral_bus, "serial@10001000", 0x1000_1000, 11),
+            (lookalike_bus, "serial@10002000", 0x1000_2000, 12),
+        ] {
+            let node = fdt.add_node(parent, Node::new(name));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(super::super::tree::prop_string("compatible", "ns16550a"));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32("interrupt-parent", 1));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", &[irq]));
+            fdt.view_typed_mut(node)
+                .unwrap()
+                .set_regs(&[RegInfo::new(base, Some(0x100))]);
+        }
+
+        let chosen = fdt.add_node(root, Node::new("chosen"));
+        fdt.node_mut(chosen)
+            .unwrap()
+            .set_property(super::super::tree::prop_string(
+                "stdout-path",
+                "/console-bus/serial@10000000:115200",
+            ));
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_platform_timer_and_device_interrupts() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("#interrupt-cells", 1));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(prop_u32("phandle", 1));
+
+        for (name, compatible, base, irq) in [
+            ("timer@10002000", "vendor,soc-timer", 0x1000_2000, 12),
+            ("virtio_mmio@10001000", "virtio,mmio", 0x1000_1000, 11),
+            ("gpio@10003000", "vendor,gpio", 0x1000_3000, 13),
+        ] {
+            let node = fdt.add_node(root, Node::new(name));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(super::super::tree::prop_string("compatible", compatible));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32("interrupt-parent", 1));
+            fdt.node_mut(node)
+                .unwrap()
+                .set_property(prop_u32_list("interrupts", &[irq]));
+            fdt.view_typed_mut(node)
+                .unwrap()
+                .set_regs(&[RegInfo::new(base, Some(0x1000))]);
+        }
+
+        fdt.encode().as_ref().to_vec()
+    }
+
+    fn fdt_with_selectable_and_machine_owned_devices() -> Vec<u8> {
+        let mut fdt = Fdt::new();
+        let root = fdt.root_id();
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#address-cells", 2));
+        fdt.node_mut(root)
+            .unwrap()
+            .set_property(prop_u32("#size-cells", 2));
+
+        let intc = fdt.add_node(root, Node::new("interrupt-controller@c000000"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(super::super::tree::prop_string("compatible", "riscv,plic0"));
+        fdt.node_mut(intc)
+            .unwrap()
+            .set_property(fdt_edit::Property::new("interrupt-controller", std::vec![]));
+        fdt.view_typed_mut(intc)
+            .unwrap()
+            .set_regs(&[RegInfo::new(0x0c00_0000, Some(0x40_0000))]);
+
+        for (name, base) in [
+            ("ethernet@10001000", 0x1000_1000),
+            ("gpio@10002000", 0x1000_2000),
+        ] {
+            let node = fdt.add_node(root, Node::new(name));
+            fdt.view_typed_mut(node)
+                .unwrap()
+                .set_regs(&[RegInfo::new(base, Some(0x1000))]);
         }
 
         fdt.encode().as_ref().to_vec()
@@ -688,45 +1330,72 @@ mod tests {
     }
 
     #[test]
-    fn subtract_memory_region_overlap_keeps_non_overlapping_range() {
-        let existing = vec![VmMemConfig {
-            gpa: 0x4000,
-            size: 0x1000,
-            flags: 0,
-            map_type: VmMemMappingType::MapReserved,
-        }];
+    fn phys_cpu_set_uses_runtime_logical_index_instead_of_fdt_order() {
+        let cpu_nodes = [(0, 0), (1, 1), (2, 2), (3, 3)];
+        let runtime_indices_by_hardware_id = [1, 2, 3, 0];
 
-        assert_eq!(
-            super::subtract_memory_region_overlap(0x1000, 0x1000, &existing),
-            vec![(0x1000, 0x1000)]
+        let (cpu_sets, guest_cpu_ids) =
+            resolve_phys_cpu_sets(&[0], &cpu_nodes, 4, |hardware_cpu_id| {
+                runtime_indices_by_hardware_id.get(hardware_cpu_id).copied()
+            })
+            .unwrap();
+
+        assert_eq!(cpu_sets, vec![0b0010]);
+        assert_eq!(guest_cpu_ids, vec![0]);
+    }
+
+    #[test]
+    fn phys_cpu_set_rejects_cpu_missing_from_runtime_topology() {
+        let error = resolve_phys_cpu_sets(&[3], &[(3, 3)], 4, |_| None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("hardware CPU ID 0x3 is missing from the runtime topology")
         );
     }
 
     #[test]
-    fn subtract_memory_region_overlap_splits_range_around_overlap() {
-        let existing = vec![VmMemConfig {
-            gpa: 0x3000,
-            size: 0x2000,
-            flags: 0,
-            map_type: VmMemMappingType::MapReserved,
-        }];
+    fn phys_cpu_set_rejects_logical_index_outside_affinity_mask() {
+        let error =
+            resolve_phys_cpu_sets(&[3], &[(3, 3)], usize::MAX, |_| Some(usize::BITS as usize))
+                .unwrap_err();
 
-        assert_eq!(
-            super::subtract_memory_region_overlap(0x1000, 0x6000, &existing),
-            vec![(0x1000, 0x2000), (0x5000, 0x2000)]
+        assert!(
+            error
+                .to_string()
+                .contains("does not fit the host CPU affinity mask")
         );
     }
 
     #[test]
-    fn subtract_memory_region_overlap_drops_fully_covered_range() {
-        let existing = vec![VmMemConfig {
-            gpa: 0x1000,
-            size: 0x4000,
-            flags: 0,
-            map_type: VmMemMappingType::MapReserved,
-        }];
+    fn phys_cpu_set_rejects_logical_index_outside_usable_host_cpus() {
+        let error = resolve_phys_cpu_sets(&[3], &[(3, 3)], 4, |_| Some(4)).unwrap_err();
 
-        assert!(super::subtract_memory_region_overlap(0x2000, 0x1000, &existing).is_empty());
+        assert!(error.to_string().contains("outside the 4 usable host CPUs"));
+    }
+
+    #[test]
+    fn host_affinity_mask_covers_every_host_cpu_up_to_the_mask_width() {
+        assert_eq!(host_affinity_mask(0), Some(0));
+        assert_eq!(host_affinity_mask(1), Some(0b1));
+        assert_eq!(host_affinity_mask(4), Some(0b1111));
+        // A host CPU count equal to the mask width is legal: usize::MAX selects
+        // exactly those CPUs, so it must not be rejected as out of range.
+        assert_eq!(host_affinity_mask(usize::BITS as usize), Some(usize::MAX));
+        assert_eq!(host_affinity_mask(usize::BITS as usize + 1), None);
+    }
+
+    #[test]
+    fn explicit_fdt_affinity_rejects_multi_cpu_masks() {
+        let mask = 0b0011usize;
+        let valid_masks = host_affinity_mask(4).unwrap();
+        let error = super::validate_phys_cpu_set(mask, valid_masks, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must select exactly one host CPU")
+        );
     }
 
     #[test]
@@ -738,10 +1407,11 @@ mod tests {
             phys_cpu_ls: PhysCpuList::new(1, None, None),
             ..Default::default()
         });
-        let crate_cfg = AxVMCrateConfig {
-            devices: VMDevicesConfig {
-                address_space_policy: AddressSpacePolicy::Passthrough,
-                excluded_devices: vec![vec!["/serial@10001234".to_string()]],
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                disabled: vec![PhysicalDeviceRef {
+                    path: "/serial@10001234".to_string(),
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -753,5 +1423,770 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].base_gpa, 0x1000_1000);
         assert_eq!(ranges[0].length, 0x1000);
+    }
+
+    #[test]
+    fn physical_uart_is_reserved_without_user_exclusion() {
+        let dtb = fdt_with_excluded_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            ..Default::default()
+        });
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &GuestConfig::default(), &dtb).unwrap();
+
+        assert!(
+            vm_cfg
+                .excluded_devices()
+                .iter()
+                .flatten()
+                .any(|path| path == "/serial@10001234")
+        );
+        assert!(
+            vm_cfg
+                .reserved_address_ranges()
+                .iter()
+                .any(|range| range.base_gpa == 0x1000_1000 && range.length == 0x1000)
+        );
+    }
+
+    #[test]
+    fn implicit_root_passthrough_excludes_unassigned_pci_resources() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(vec![0]),
+                guest_type: GuestType::Passthrough,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let guest_dtb = setup_guest_fdt_from_vmm(&dtb, &mut vm_cfg, &crate_cfg).unwrap();
+        let guest = Fdt::from_bytes(&guest_dtb).unwrap();
+
+        assert!(guest.get_by_path_id("/soc/pci@30000000").is_none());
+        assert!(guest.get_by_path_id("/soc/pci@30000000/nvme@0").is_none());
+        assert!(guest.get_by_path_id("/soc/virtio_mmio@10001000").is_some());
+        assert!(
+            vm_cfg
+                .reserved_address_ranges()
+                .iter()
+                .any(|range| { range.base_gpa == 0x3000_0000 && range.length == 0x1000_0000 })
+        );
+        assert!(vm_cfg.excluded_passthrough_irq_sources().contains(&11));
+
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &guest_dtb).unwrap();
+        let error = parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &guest_dtb).unwrap_err();
+        assert_eq!(
+            error,
+            crate::AxVmError::InvalidConfig {
+                detail: "passthrough device /soc/virtio_mmio@10001000 shares host-owned interrupt \
+                         source 0xb"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn root_passthrough_keeps_named_pci_host_bridge_and_strips_the_others() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+        // Naming the bridge alone already includes its endpoint; naming the
+        // bridge together with one of its endpoints must be accepted the same
+        // way, keeping the bridge and endpoint while the unnamed bridge stays
+        // stripped.
+        let bridge_only: &[&str] = &["/", "/soc/pci@30000000"];
+        let bridge_with_endpoint: &[&str] = &["/", "/soc/pci@30000000", "/soc/pci@30000000/nvme@0"];
+        for selectors in [bridge_only, bridge_with_endpoint] {
+            let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+                id: 0,
+                name: "test".to_string(),
+                phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+                pass_through_devices: selectors
+                    .iter()
+                    .map(|name| HostDeviceAssignment {
+                        name: (*name).to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            let crate_cfg = GuestConfig {
+                base: axvmconfig::VMBaseConfig {
+                    phys_cpu_ids: Some(vec![0]),
+                    guest_type: GuestType::Passthrough,
+                    ..Default::default()
+                },
+                devices: GuestDevices {
+                    passthrough: selectors
+                        .iter()
+                        .map(|path| PhysicalDeviceRef {
+                            path: (*path).to_string(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let guest_dtb = setup_guest_fdt_from_vmm(&dtb, &mut vm_cfg, &crate_cfg).unwrap();
+            let guest = Fdt::from_bytes(&guest_dtb).unwrap();
+
+            assert!(
+                guest.get_by_path_id("/soc/pci@30000000").is_some(),
+                "selectors {selectors:?} dropped the named bridge"
+            );
+            assert!(
+                guest.get_by_path_id("/soc/pci@30000000/nvme@0").is_some(),
+                "selectors {selectors:?} dropped the endpoint of the named bridge"
+            );
+            assert!(guest.get_by_path_id("/soc/virtio_mmio@10001000").is_some());
+            assert!(
+                guest.get_by_path_id("/soc/pci@60000000").is_none(),
+                "selectors {selectors:?} kept an unnamed bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn root_passthrough_rejects_endpoint_below_an_unnamed_pci_host_bridge() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+        // The selector is under the second bridge so the first bridge is queued
+        // for stripping before the rejection fires.
+        let selectors = ["/", "/soc/pci@60000000/ethernet@0"];
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+            pass_through_devices: selectors
+                .iter()
+                .map(|name| HostDeviceAssignment {
+                    name: (*name).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(vec![0]),
+                guest_type: GuestType::Passthrough,
+                ..Default::default()
+            },
+            devices: GuestDevices {
+                passthrough: selectors
+                    .iter()
+                    .map(|path| PhysicalDeviceRef {
+                        path: (*path).to_string(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // An endpoint selector under a host bridge the baseline strips is
+        // ambiguous: the guest could only reach it by keeping the whole bridge,
+        // which would also expose the bridge's other endpoints. The config has
+        // to name the bridge explicitly, so reject the selector instead of
+        // silently widening the passthrough set.
+        let endpoint = "/soc/pci@60000000/ethernet@0";
+        let bridge = "/soc/pci@60000000";
+        let exclusions_before = vm_cfg.excluded_devices().to_vec();
+        let error = setup_guest_fdt_from_vmm(&dtb, &mut vm_cfg, &crate_cfg).unwrap_err();
+        assert_eq!(
+            error,
+            crate::AxVmError::InvalidConfig {
+                detail: format!(
+                    "passthrough selector {endpoint} is below PCI host bridge {bridge}, which the \
+                     root baseline strips: list {bridge} explicitly so the endpoint and its \
+                     bridge stay assigned, or drop the selector"
+                ),
+            }
+        );
+        // The rejected configuration must not leave the first bridge stripped
+        // behind: the failure happens before any exclusion is applied.
+        assert_eq!(vm_cfg.excluded_devices(), exclusions_before.as_slice());
+    }
+
+    #[test]
+    fn virtualized_guest_maps_no_physical_device_for_an_empty_or_root_selector() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+        let base = axvmconfig::VMBaseConfig {
+            phys_cpu_ids: Some(vec![0]),
+            guest_type: GuestType::Virtualized,
+            ..Default::default()
+        };
+
+        // A virtualized guest starts from no physical devices, so neither an
+        // empty selector list nor a runtime root selector may widen it. The
+        // axvmconfig boundary rejects "/" for a virtualized guest in TOML, but
+        // GuestConfig can also be built directly, so the parser keeps its own
+        // guard: only a passthrough guest carries the root baseline.
+        for selectors in [
+            Vec::new(),
+            vec![PhysicalDeviceRef {
+                path: "/".to_string(),
+            }],
+        ] {
+            let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+                id: 0,
+                name: "test".to_string(),
+                phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+                pass_through_devices: selectors
+                    .iter()
+                    .map(PhysicalDeviceRef::unresolved_assignment)
+                    .collect(),
+                ..Default::default()
+            });
+            let crate_cfg = GuestConfig {
+                base: base.clone(),
+                devices: GuestDevices {
+                    passthrough: selectors.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let guest_dtb = setup_guest_fdt_from_vmm(&dtb, &mut vm_cfg, &crate_cfg).unwrap();
+            let guest = Fdt::from_bytes(&guest_dtb).unwrap();
+
+            assert!(
+                guest.get_by_path_id("/soc/virtio_mmio@10001000").is_none(),
+                "selector list {selectors:?} handed a physical device to a virtualized guest"
+            );
+            assert!(guest.get_by_path_id("/soc/pci@30000000").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_pci_passthrough_is_published() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/soc/pci@30000000".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(vec![0]),
+                guest_type: GuestType::Passthrough,
+                ..Default::default()
+            },
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/soc/pci@30000000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let guest_dtb = setup_guest_fdt_from_vmm(&dtb, &mut vm_cfg, &crate_cfg).unwrap();
+        let guest = Fdt::from_bytes(&guest_dtb).unwrap();
+
+        assert!(guest.get_by_path_id("/soc/pci@30000000").is_some());
+        assert!(guest.get_by_path_id("/soc/pci@30000000/nvme@0").is_some());
+    }
+
+    #[test]
+    fn explicitly_selected_non_console_uart_receives_mmio_and_interrupt() {
+        let dtb = fdt_with_console_and_assignable_serial();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/serial@10001000".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/serial@10001000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert_eq!(vm_cfg.pass_through_devices().len(), 1);
+        let uart = &vm_cfg.pass_through_devices()[0];
+        assert_eq!(uart.name, "/serial@10001000");
+        assert_eq!(uart.base_gpa, 0x1000_1000);
+        assert_eq!(uart.base_hpa, 0x1000_1000);
+        assert_eq!(uart.length, 0x100);
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .any(|interrupt| interrupt.source == 11)
+        );
+        assert!(
+            vm_cfg
+                .excluded_devices()
+                .iter()
+                .flatten()
+                .all(|path| path != "/serial@10001000")
+        );
+    }
+
+    #[test]
+    fn selected_uart_sharing_host_owned_irq_is_rejected() {
+        let dtb = fdt_with_console_and_assignable_serial_irq(10);
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/serial@10001000".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/serial@10001000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        let error = parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap_err();
+        let expected_detail =
+            "passthrough device /serial@10001000 shares host-owned interrupt source 0xa";
+
+        assert_eq!(
+            error,
+            crate::AxVmError::InvalidConfig {
+                detail: expected_detail.to_string(),
+            }
+        );
+        assert!(vm_cfg.pass_through_irqs().is_empty());
+    }
+
+    #[test]
+    fn explicitly_selected_console_uart_remains_host_owned() {
+        let dtb = fdt_with_console_and_assignable_serial();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/serial@10000000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap_err();
+
+        assert_eq!(
+            error,
+            crate::AxVmError::HostOwnedDevice {
+                path: "/serial@10000000".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parent_selector_assigns_non_console_uart_descendant_only() {
+        let dtb = fdt_with_nested_console_and_assignable_serial();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/peripherals".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/peripherals".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert_eq!(vm_cfg.pass_through_devices().len(), 1);
+        let uart = &vm_cfg.pass_through_devices()[0];
+        assert_eq!(uart.name, "/peripherals/serial@10001000");
+        assert_eq!(uart.base_gpa, 0x1000_1000);
+        assert_eq!(uart.base_hpa, 0x1000_1000);
+        assert_eq!(uart.length, 0x100);
+        assert_eq!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .map(|interrupt| interrupt.source)
+                .collect::<Vec<_>>(),
+            [11]
+        );
+
+        let mut generated_vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/peripherals".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut generated_crate_cfg = crate_cfg.clone();
+        generated_crate_cfg.base.phys_cpu_ids = Some(vec![]);
+        let guest_dtb =
+            setup_guest_fdt_from_vmm(&dtb, &mut generated_vm_cfg, &generated_crate_cfg).unwrap();
+        let guest_fdt = Fdt::from_bytes(&guest_dtb).unwrap();
+        assert!(
+            guest_fdt
+                .get_by_path("/peripherals/serial@10001000")
+                .is_some()
+        );
+        assert!(
+            guest_fdt
+                .get_by_path("/console-bus/serial@10000000")
+                .is_none()
+        );
+        assert!(
+            guest_fdt
+                .get_by_path("/peripherals-extra/serial@10002000")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parent_selector_covering_console_uart_is_rejected() {
+        let dtb = fdt_with_nested_console_and_assignable_serial();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/console-bus".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/console-bus".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap_err();
+
+        assert_eq!(
+            error,
+            crate::AxVmError::HostOwnedDevice {
+                path: "/console-bus".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn virtualized_guest_maps_only_the_explicit_physical_device() {
+        let dtb = fdt_with_selectable_and_machine_owned_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 2,
+            name: "virtualized".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/ethernet@10001000".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Virtualized,
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/ethernet@10001000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert_eq!(vm_cfg.pass_through_devices().len(), 1);
+        assert_eq!(vm_cfg.pass_through_devices()[0].base_gpa, 0x1000_1000);
+    }
+
+    #[test]
+    fn passthrough_guest_reserves_the_machine_interrupt_controller() {
+        let dtb = fdt_with_selectable_and_machine_owned_devices();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 3,
+            name: "passthrough".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+        let mut crate_cfg = GuestConfig::default();
+        crate_cfg.base.guest_type = GuestType::Passthrough;
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert!(
+            vm_cfg
+                .pass_through_devices()
+                .iter()
+                .all(|device| device.base_gpa != 0x0c00_0000)
+        );
+        assert!(
+            vm_cfg
+                .reserved_address_ranges()
+                .iter()
+                .any(|range| range.base_gpa == 0x0c00_0000 && range.length == 0x40_0000)
+        );
+    }
+
+    #[test]
+    fn passthrough_guest_reserves_platform_timers_owned_by_the_machine() {
+        let dtb = fdt_with_platform_timer_and_device_interrupts();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 4,
+            name: "passthrough".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+        let mut crate_cfg = GuestConfig::default();
+        crate_cfg.base.guest_type = GuestType::Passthrough;
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_passthrough_devices_address(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert!(
+            vm_cfg
+                .excluded_devices()
+                .iter()
+                .flatten()
+                .any(|path| path == "/timer@10002000")
+        );
+        assert!(
+            vm_cfg
+                .reserved_address_ranges()
+                .iter()
+                .any(|range| range.base_gpa == 0x1000_2000 && range.length == 0x1000)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_devices()
+                .iter()
+                .all(|device| device.base_gpa != 0x1000_2000)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .all(|interrupt| interrupt.source != 12)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .any(|interrupt| interrupt.source == 11)
+        );
+    }
+
+    #[test]
+    fn physical_uart_interrupt_is_not_added_to_passthrough_routes() {
+        let dtb = fdt_with_serial_and_device_interrupts();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 1,
+            name: "test".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/virtio_mmio@10001000".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig {
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/virtio_mmio@10001000".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert_eq!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .map(|interrupt| interrupt.source)
+                .collect::<Vec<_>>(),
+            [11]
+        );
+    }
+
+    #[test]
+    fn excluded_passthrough_device_interrupt_is_not_added_to_routes() {
+        let dtb = fdt_with_platform_timer_and_device_interrupts();
+        let mut vm_cfg = AxVMConfig::new(AxVMConfigParams {
+            id: 1,
+            name: "passthrough".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, None, None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            excluded_devices: vec![vec!["/virtio_mmio@10001000".to_string()]],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+        let crate_cfg = GuestConfig::default();
+
+        reserve_excluded_device_ranges(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+        parse_vm_interrupt(&mut vm_cfg, &crate_cfg, &dtb).unwrap();
+
+        assert!(vm_cfg.excluded_passthrough_irq_sources().contains(&11));
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .all(|interrupt| interrupt.source != 11)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .all(|interrupt| interrupt.source != 12)
+        );
+        assert!(
+            vm_cfg
+                .pass_through_irqs()
+                .iter()
+                .any(|interrupt| interrupt.source == 13)
+        );
+    }
+
+    #[test]
+    fn root_baseline_matches_an_empty_passthrough_list() {
+        let dtb = fdt_with_pci_hosts_and_endpoint();
+
+        // An empty passthrough list takes the baseline implicitly, and the host
+        // resolves that to the same runtime root selector "/" it installs for an
+        // explicit "/". Both spellings therefore reach the parser with the root
+        // selector already on the AxVM config, and must produce the same guest
+        // tree.
+        let empty_cfg = GuestConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(vec![0]),
+                guest_type: GuestType::Passthrough,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let root_cfg = GuestConfig {
+            base: axvmconfig::VMBaseConfig {
+                phys_cpu_ids: Some(vec![0]),
+                guest_type: GuestType::Passthrough,
+                ..Default::default()
+            },
+            devices: GuestDevices {
+                passthrough: vec![PhysicalDeviceRef {
+                    path: "/".to_string(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut empty_vm = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "empty".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+        let mut root_vm = AxVMConfig::new(AxVMConfigParams {
+            id: 0,
+            name: "root".to_string(),
+            phys_cpu_ls: PhysCpuList::new(1, Some(vec![0]), None),
+            pass_through_devices: vec![HostDeviceAssignment {
+                name: "/".to_string(),
+                ..Default::default()
+            }],
+            address_space_policy: AddressSpacePolicy::Passthrough,
+            ..Default::default()
+        });
+
+        let empty_dtb = setup_guest_fdt_from_vmm(&dtb, &mut empty_vm, &empty_cfg).unwrap();
+        let root_dtb = setup_guest_fdt_from_vmm(&dtb, &mut root_vm, &root_cfg).unwrap();
+        assert_eq!(empty_dtb, root_dtb);
+
+        let guest = Fdt::from_bytes(&root_dtb).unwrap();
+        // Both spellings keep the guest-assignable devices and strip the PCI
+        // host bridges the baseline never keeps.
+        assert!(guest.get_by_path_id("/soc/virtio_mmio@10001000").is_some());
+        assert!(guest.get_by_path_id("/soc/pci@30000000").is_none());
+        assert!(guest.get_by_path_id("/soc/pci@60000000").is_none());
     }
 }

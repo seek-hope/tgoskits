@@ -1,14 +1,22 @@
+use ax_lazyinit::OnceLock;
 use ax_plat::mem::{
-    DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, PhysAddr, RawRange, VirtAddr,
+    CpuSharedMemoryModel, DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, PhysAddr,
+    RawRange, StageOneTlbDomain, VirtAddr, VirtAddrRange, VirtualAddressSpaceError,
+    VirtualAddressSpaceLayout,
 };
 use heapless::Vec;
 use someboot::ArchTrait;
 use somehal::mem::MemoryType;
-use spin::Once;
 
-static FREE_LIST: Once<Vec<RawRange, 32>> = Once::new();
-static RESERVED_LIST: Once<Vec<RawRange, 32>> = Once::new();
-static MMIO_LIST: Once<Vec<RawRange, 16>> = Once::new();
+// Resource/live-object clipping can create more fragments than a firmware-only
+// map. Every platform list must accept the complete inherited map budget.
+const MAX_BOOT_REGIONS: usize = someboot::handoff::protocol::MAX_REGIONS;
+static RAM_LIST: OnceLock<Vec<RawRange, MAX_BOOT_REGIONS>> = OnceLock::new();
+static RESERVED_LIST: OnceLock<Vec<RawRange, MAX_BOOT_REGIONS>> = OnceLock::new();
+static MMIO_LIST: OnceLock<Vec<RawRange, MAX_BOOT_REGIONS>> = OnceLock::new();
+static VIRTUAL_ADDRESS_SPACE: OnceLock<
+    Result<VirtualAddressSpaceLayout, VirtualAddressSpaceError>,
+> = OnceLock::new();
 
 #[cfg(target_arch = "x86_64")]
 const X86_FIXED_MMIO_RANGES: &[RawRange] = &[
@@ -69,13 +77,58 @@ fn push_non_overlapping<const N: usize>(list: &mut Vec<RawRange, N>, range: RawR
 
 #[impl_plat_interface]
 impl MemIf for MemIfImpl {
+    fn cpu_shared_memory_model() -> CpuSharedMemoryModel {
+        // All architectures supported by the dynamic platform require their
+        // firmware/interconnect to establish coherent cacheable RAM before
+        // secondary CPUs enter the generic runtime.
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "loongarch64",
+            target_arch = "riscv64",
+            target_arch = "x86_64"
+        ))]
+        {
+            CpuSharedMemoryModel::Coherent
+        }
+
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            target_arch = "loongarch64",
+            target_arch = "riscv64",
+            target_arch = "x86_64"
+        )))]
+        {
+            CpuSharedMemoryModel::Unsupported
+        }
+    }
+
+    fn stage_one_tlb_domain() -> StageOneTlbDomain {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Linux-compatible AArch64 SMP boot requires all CPUs that may run
+            // the kernel to receive maintenance in one coherent domain. Ports
+            // must also place shared stage-one users in one Inner Shareable domain.
+            StageOneTlbDomain::InnerShareable
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            StageOneTlbDomain::Unavailable
+        }
+    }
+
     fn phys_ram_ranges() -> &'static [RawRange] {
-        FREE_LIST.call_once(|| {
+        RAM_LIST.call_once(|| {
             let mut list = Vec::new();
             for r in somehal::mem::memory_map() {
                 if matches!(r.memory_type, MemoryType::Free) {
                     list.push((r.physical_start, r.size_in_bytes)).unwrap();
                 }
+            }
+            if let Some(archive) = somehal::initramfs_range().filter(|range| range.reclaimable) {
+                // The archive is RAM, but the reserved list still excludes it
+                // from the boot allocator until unpacking has finished.
+                push_non_overlapping(&mut list, (archive.start, archive.end - archive.start));
             }
             list
         })
@@ -87,7 +140,11 @@ impl MemIf for MemIfImpl {
             for r in somehal::mem::memory_map() {
                 if matches!(
                     r.memory_type,
-                    MemoryType::Reserved | MemoryType::KImage | MemoryType::PerCpuData
+                    MemoryType::Reserved
+                        | MemoryType::KImage
+                        | MemoryType::PerCpuData
+                        | MemoryType::BootData
+                        | MemoryType::BootReclaimable
                 ) {
                     push_non_overlapping(&mut list, (r.physical_start, r.size_in_bytes));
                 }
@@ -97,8 +154,10 @@ impl MemIf for MemIfImpl {
                 push_non_overlapping(&mut list, range);
             }
             #[cfg(target_arch = "loongarch64")]
-            for &range in LOONGARCH_RESERVED_RAM_RANGES {
-                push_non_overlapping(&mut list, range);
+            if !someboot::handoff::takeover_completed() {
+                for &range in LOONGARCH_RESERVED_RAM_RANGES {
+                    push_non_overlapping(&mut list, range);
+                }
             }
             list
         })
@@ -148,9 +207,25 @@ impl MemIf for MemIfImpl {
         somehal::mem::virt_to_phys(vaddr.as_ptr()).into()
     }
 
-    fn kernel_aspace() -> (VirtAddr, usize) {
-        let range = somehal::mem::kernel_space();
-        (range.start.into(), range.len())
+    fn virtual_address_space() -> Result<VirtualAddressSpaceLayout, VirtualAddressSpaceError> {
+        *VIRTUAL_ADDRESS_SPACE.call_once(|| {
+            let source = somehal::mem::virtual_address_space().map_err(|error| match error {
+                someboot::mem::VirtualAddressSpaceError::InvalidRange => {
+                    VirtualAddressSpaceError::InvalidRange
+                }
+                someboot::mem::VirtualAddressSpaceError::OverlappingRanges => {
+                    VirtualAddressSpaceError::OverlappingRanges
+                }
+                someboot::mem::VirtualAddressSpaceError::UnsupportedAddressWidth { valen } => {
+                    VirtualAddressSpaceError::UnsupportedAddressWidth { valen }
+                }
+            })?;
+            let user = VirtAddrRange::try_from(source.user())
+                .map_err(|()| VirtualAddressSpaceError::InvalidRange)?;
+            let kernel = VirtAddrRange::try_from(source.kernel())
+                .map_err(|()| VirtualAddressSpaceError::InvalidRange)?;
+            VirtualAddressSpaceLayout::try_new(user, kernel)
+        })
     }
 
     fn user_aspace_needs_kernel_mappings() -> bool {
@@ -161,12 +236,12 @@ impl MemIf for MemIfImpl {
         somehal::cache::dcache_range(to_somehal_dcache_op(op), addr.as_usize() as *const u8, size);
     }
 
-    fn dma_coherent_before_make_uncached(addr: VirtAddr, size: usize) {
-        somehal::cache::dma_coherent_before_make_uncached(addr.as_usize() as *const u8, size);
+    fn dma_coherent_before_map_uncached(addr: VirtAddr, size: usize) {
+        somehal::cache::dma_coherent_before_map_uncached(addr.as_usize() as *const u8, size);
     }
 
-    fn dma_coherent_before_restore_cached(addr: VirtAddr, size: usize) {
-        somehal::cache::dma_coherent_before_restore_cached(addr.as_usize() as *const u8, size);
+    fn dma_coherent_before_unmap_uncached(addr: VirtAddr, size: usize) {
+        somehal::cache::dma_coherent_before_unmap_uncached(addr.as_usize() as *const u8, size);
     }
 
     fn dma_coherent_after_mapping_update() {
@@ -180,9 +255,4 @@ fn to_somehal_dcache_op(op: DCacheOp) -> somehal::cache::DCacheOp {
         DCacheOp::Invalidate => somehal::cache::DCacheOp::Invalidate,
         DCacheOp::CleanInvalidate => somehal::cache::DCacheOp::CleanInvalidate,
     }
-}
-
-#[unsafe(no_mangle)]
-fn _percpu_base_ptr(idx: usize) -> *mut u8 {
-    somehal::smp::percpu_data_ptr(idx).unwrap_or_default()
 }

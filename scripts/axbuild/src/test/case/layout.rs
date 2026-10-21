@@ -7,27 +7,48 @@ use std::{
 use anyhow::Context;
 
 use super::types::{
-    CASE_APK_CACHE_DIR_NAME, CASE_BUILD_DIR_NAME, CASE_CACHE_DIR_NAME,
-    CASE_CMAKE_TOOLCHAIN_FILE_NAME, CASE_COMMAND_WRAPPER_DIR_NAME, CASE_CROSS_BIN_DIR_NAME,
-    CASE_OVERLAY_DIR_NAME, CASE_ROOTFS_CACHE_DIR_NAME, CASE_ROOTFS_COPY_NAME, CASE_RUNS_DIR_NAME,
-    CASE_STAGING_DIR_NAME, CASE_WORK_ROOT_NAME, CaseAssetLayout,
+    BOARD_CASE_UPLOAD_DIR_NAME, BOARD_CASE_WORK_ROOT_NAME, CASE_APK_CACHE_DIR_NAME,
+    CASE_BUILD_DIR_NAME, CASE_CACHE_DIR_NAME, CASE_CMAKE_TOOLCHAIN_FILE_NAME,
+    CASE_COMMAND_WRAPPER_DIR_NAME, CASE_CROSS_BIN_DIR_NAME, CASE_OVERLAY_DIR_NAME,
+    CASE_ROOTFS_CACHE_DIR_NAME, CASE_ROOTFS_COPY_NAME, CASE_RUNS_DIR_NAME, CASE_STAGING_DIR_NAME,
+    CASE_WORK_ROOT_NAME, CaseAssetLayout,
 };
 
 static CASE_RUN_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Resolves the workspace target directory used for a test build target.
-pub(crate) fn resolve_target_dir(workspace_root: &Path, target: &str) -> anyhow::Result<PathBuf> {
-    Ok(workspace_root.join("target").join(target))
+/// Resolves the Cargo target directory used for a test build target.
+pub(crate) fn resolve_target_dir(target_dir: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    Ok(target_dir.join(target))
 }
 
 /// Builds the working directory layout used for a QEMU case asset run.
 pub(crate) fn case_asset_layout(
-    workspace_root: &Path,
+    target_dir: &Path,
     target: &str,
     case_name: &str,
 ) -> anyhow::Result<CaseAssetLayout> {
-    let target_dir = resolve_target_dir(workspace_root, target)?;
-    let work_dir = target_dir.join(CASE_WORK_ROOT_NAME).join(case_name);
+    asset_layout(target_dir, target, CASE_WORK_ROOT_NAME, case_name)
+}
+
+/// Builds the working directory layout used for a board case asset run.
+pub(crate) fn board_case_asset_layout(
+    target_dir: &Path,
+    target: &str,
+    case_name: &str,
+) -> anyhow::Result<CaseAssetLayout> {
+    let mut layout = asset_layout(target_dir, target, BOARD_CASE_WORK_ROOT_NAME, case_name)?;
+    layout.overlay_dir = layout.run_dir.join(BOARD_CASE_UPLOAD_DIR_NAME);
+    Ok(layout)
+}
+
+fn asset_layout(
+    cargo_target_dir: &Path,
+    target: &str,
+    work_root_name: &str,
+    case_name: &str,
+) -> anyhow::Result<CaseAssetLayout> {
+    let target_dir = resolve_target_dir(cargo_target_dir, target)?;
+    let work_dir = target_dir.join(work_root_name).join(case_name);
     let run_dir = work_dir.join(CASE_RUNS_DIR_NAME).join(next_case_run_id());
     let cache_dir = work_dir.join(CASE_CACHE_DIR_NAME);
 

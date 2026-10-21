@@ -1,0 +1,93 @@
+url='${sessionFile:usr/bin/block-rw-bench}'
+program="${BLOCK_RW_BENCH_PROGRAM:-/tmp/block-rw-bench}"
+download="${program}.part"
+helper_log="${program}.log"
+staged_program="${BLOCK_RW_BENCH_STAGED_PROGRAM:-/usr/local/libexec/block-rw-bench}"
+workdir="${BLOCK_RW_BENCH_WORKDIR:-/root/block-rw-bench}"
+download_attempts="${BLOCK_RW_BENCH_DOWNLOAD_ATTEMPTS:-6}"
+download_retry_seconds="${BLOCK_RW_BENCH_DOWNLOAD_RETRY_SECONDS:-5}"
+helper_program=
+helper_ready=0
+helper_passed=0
+
+export BLOCK_RW_BENCH_ROOT_DEVICE="${BLOCK_RW_BENCH_ROOT_DEVICE:-}"
+export BLOCK_RW_BENCH_CONTROLLER="${BLOCK_RW_BENCH_CONTROLLER:-}"
+export BLOCK_RW_BENCH_SUCCESS_MARKER="${BLOCK_RW_BENCH_SUCCESS_MARKER:-BLOCK_RW_BENCH_PASSED}"
+export BLOCK_RW_BENCH_MAX_TRANSFER_BYTES="${BLOCK_RW_BENCH_MAX_TRANSFER_BYTES:-}"
+marker="${BLOCK_RW_BENCH_SUCCESS_MARKER%_PASSED}_SESSION"
+echo "block-rw-bench: root_device=$BLOCK_RW_BENCH_ROOT_DEVICE controller=$BLOCK_RW_BENCH_CONTROLLER"
+request_bytes="${BLOCK_RW_BENCH_REQUEST_BYTES:-none}"
+max_transfer_bytes="${BLOCK_RW_BENCH_MAX_TRANSFER_BYTES:-default}"
+boundary_coverage=full
+case "${BLOCK_RW_BENCH_SKIP_BOUNDARY_CASES:-false}" in
+  1|true|yes) boundary_coverage=partial ;;
+esac
+echo "block-rw-bench: io_model=buffered-file write_scope=write-syscalls fsync=${BLOCK_RW_BENCH_FSYNC:-true} request_bytes=${request_bytes} max_transfer_bytes=${max_transfer_bytes} boundary_coverage=${boundary_coverage} drop_caches=${BLOCK_RW_BENCH_DROP_CACHES:+true} boundary=full-file-stack-not-raw-request-latency"
+rm -f "$download" "$helper_log"
+if [ "$program" != "$staged_program" ]; then
+  rm -f "$program"
+fi
+
+case "$download_attempts" in
+  ''|*[!0-9]*|0) download_attempts=0 ;;
+esac
+case "$download_retry_seconds" in
+  ''|*[!0-9]*) download_retry_seconds=0 ;;
+esac
+
+attempt=1
+while [ "$attempt" -le "$download_attempts" ]; do
+  rm -f "$download"
+  if command -v curl >/dev/null 2>&1; then
+    curl --connect-timeout 10 --max-time 30 -fsSL "$url" -o "$download" || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -T 30 -O "$download" "$url" || true
+  else
+    break
+  fi
+  if [ -s "$download" ]; then
+    helper_ready=1
+    echo "block-rw-bench: helper=session-http attempt=$attempt"
+    break
+  fi
+  attempt=$(( attempt + 1 ))
+  if [ "$attempt" -le "$download_attempts" ] && [ "$download_retry_seconds" -gt 0 ]; then
+    sleep "$download_retry_seconds"
+  fi
+done
+if [ "$helper_ready" = "1" ] &&
+  mv "$download" "$program" &&
+  chmod +x "$program"; then
+  helper_program="$program"
+else
+  helper_ready=0
+fi
+if [ "$helper_ready" = "0" ] && [ -s "$staged_program" ]; then
+  helper_program="$staged_program"
+  helper_ready=1
+  echo "block-rw-bench: helper=linux-staged-fallback"
+fi
+
+if [ "$helper_ready" = "1" ] &&
+  mkdir -p "$workdir"; then
+  export BLOCK_RW_BENCH_WORKDIR="$workdir"
+  if "$helper_program" >"$helper_log" 2>&1; then
+    cat "$helper_log"
+    if grep -Fqx "$BLOCK_RW_BENCH_SUCCESS_MARKER" "$helper_log" && sync; then
+      helper_passed=1
+    fi
+  else
+    cat "$helper_log"
+  fi
+fi
+
+# End the board session on one explicit verdict line, on both paths. The
+# success marker is only repeated after the helper exited zero and its own log
+# held that exact marker line, so the wrapper never turns a failed run into a
+# pass. The verdict is carried by the marker, not by the exit status.
+if [ "$helper_passed" = "1" ]; then
+  sync
+  printf '\n%s\n' "$BLOCK_RW_BENCH_SUCCESS_MARKER"
+else
+  printf '\n%s\n' "${marker}_FAILED"
+fi

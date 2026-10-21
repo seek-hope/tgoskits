@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 
 use super::{
     ARCEOS_SNAPSHOT_FILE, AppContext, ArceosCommandSnapshot, ArceosQemuSnapshot,
@@ -10,6 +10,7 @@ use super::{
     StarryQemuSnapshot, StarryUbootSnapshot, resolve_arceos_arch_and_target,
     resolve_axvisor_arch_and_target, resolve_starry_arch_and_target,
 };
+use crate::arceos::cbuild::AX_LIBC_PACKAGE;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResolvedCommandPaths {
@@ -39,7 +40,7 @@ impl AppContext {
         uboot_config: Option<PathBuf>,
         resolve_build_info_path: impl FnOnce(&str, &str, Option<PathBuf>) -> anyhow::Result<PathBuf>,
     ) -> anyhow::Result<(ResolvedBuildRequest, ArceosCommandSnapshot)> {
-        let snapshot = ArceosCommandSnapshot::load(&self.root)?;
+        let snapshot = ArceosCommandSnapshot::load(self.workspace_root())?;
         let inherit_snapshot_config = cli.package.is_none()
             && cli.arch.is_none()
             && cli.target.is_none()
@@ -62,23 +63,34 @@ impl AppContext {
             resolved_config.filter(|path| path.exists())
         };
 
-        let package = cli
-            .package
-            .clone()
-            .or(config_selectors.package)
-            .or_else(|| {
-                if config_selectors.uses_app_c {
-                    Some("ax-libc".to_string())
-                } else {
-                    snapshot.package.clone()
+        // A C source app is linked against ax-libc, not an arbitrary workspace
+        // package. Reject conflicts here so command execution never rewrites the
+        // request selected by the user or build configuration.
+        let package = if config_selectors.uses_app_c {
+            for package in [&cli.package, &config_selectors.package]
+                .into_iter()
+                .flatten()
+            {
+                if package != AX_LIBC_PACKAGE {
+                    bail!(
+                        "ArceOS build config with `app-c` must use package `{AX_LIBC_PACKAGE}`; \
+                         remove the conflicting package selector `{package}`"
+                    );
                 }
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "missing ArceOS package; pass `--package` or set `package` in {}",
-                    ARCEOS_SNAPSHOT_FILE
-                )
-            })?;
+            }
+            AX_LIBC_PACKAGE.to_string()
+        } else {
+            cli.package
+                .clone()
+                .or(config_selectors.package)
+                .or(snapshot.package.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing ArceOS package; pass `--package` or set `package` in {}",
+                        ARCEOS_SNAPSHOT_FILE
+                    )
+                })?
+        };
         let config_target = config_selectors.target;
         let effective_arch = cli.arch.clone().or_else(|| {
             if cli.target.is_some() || config_target.is_some() {
@@ -134,18 +146,18 @@ impl AppContext {
             arch: Some(arch),
             target: Some(target),
             smp,
-            config: Some(snapshot_path_value(&self.root, &build_info_path)),
+            config: Some(snapshot_path_value(self.workspace_root(), &build_info_path)),
             qemu: ArceosQemuSnapshot {
                 qemu_config: runtime_paths
                     .qemu_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
             uboot: ArceosUbootSnapshot {
                 uboot_config: runtime_paths
                     .uboot_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
         };
 
@@ -156,7 +168,7 @@ impl AppContext {
         &self,
         snapshot: &ArceosCommandSnapshot,
     ) -> anyhow::Result<PathBuf> {
-        snapshot.store(&self.root)
+        snapshot.store(self.workspace_root())
     }
 
     pub(crate) fn prepare_starry_request(
@@ -166,7 +178,7 @@ impl AppContext {
         uboot_config: Option<PathBuf>,
         resolve_build_info_path: impl FnOnce(&Path, &str, Option<PathBuf>) -> anyhow::Result<PathBuf>,
     ) -> anyhow::Result<(ResolvedStarryRequest, StarryCommandSnapshot)> {
-        let snapshot = StarryCommandSnapshot::load(&self.root)?;
+        let snapshot = StarryCommandSnapshot::load(self.workspace_root())?;
         let inherit_snapshot_config =
             cli.config.is_none() && cli.arch.is_none() && cli.target.is_none();
         let resolved_config = self.resolve_command_path(
@@ -196,8 +208,11 @@ impl AppContext {
             }
         });
         let (arch, target) = resolve_starry_arch_and_target(effective_arch, effective_target)?;
-        let smp = cli.smp.or(snapshot.smp);
-        let inherit_snapshot_runtime = cli.arch.is_none() && cli.target.is_none();
+        let inherit_snapshot_runtime =
+            cli.config.is_none() && cli.arch.is_none() && cli.target.is_none();
+        let smp = cli
+            .smp
+            .or_else(|| inherit_snapshot_runtime.then_some(snapshot.smp).flatten());
         let runtime_paths = self.resolve_runtime_paths(
             qemu_config,
             if inherit_snapshot_runtime {
@@ -212,7 +227,8 @@ impl AppContext {
                 None
             },
         );
-        let build_info_path = resolve_build_info_path(&self.root, &target, resolved_config)?;
+        let build_info_path =
+            resolve_build_info_path(self.workspace_root(), &target, resolved_config)?;
 
         let request = ResolvedStarryRequest {
             package: STARRY_PACKAGE.to_string(),
@@ -230,18 +246,18 @@ impl AppContext {
             arch: Some(arch),
             target: Some(target),
             smp,
-            config: Some(snapshot_path_value(&self.root, &build_info_path)),
+            config: Some(snapshot_path_value(self.workspace_root(), &build_info_path)),
             qemu: StarryQemuSnapshot {
                 qemu_config: runtime_paths
                     .qemu_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
             uboot: StarryUbootSnapshot {
                 uboot_config: runtime_paths
                     .uboot_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
         };
 
@@ -252,7 +268,7 @@ impl AppContext {
         &self,
         snapshot: &StarryCommandSnapshot,
     ) -> anyhow::Result<PathBuf> {
-        snapshot.store(&self.root)
+        snapshot.store(self.workspace_root())
     }
 
     pub(crate) fn prepare_axvisor_request(
@@ -271,7 +287,7 @@ impl AppContext {
             load_config_target,
             resolve_build_info_path,
         } = paths;
-        let snapshot = AxvisorCommandSnapshot::load(&self.root)?;
+        let snapshot = AxvisorCommandSnapshot::load(self.workspace_root())?;
         let inherit_snapshot_config =
             cli.config.is_none() && cli.arch.is_none() && cli.target.is_none();
         let resolved_config = self.resolve_command_path(
@@ -351,22 +367,22 @@ impl AppContext {
             arch: Some(arch),
             target: Some(target),
             smp,
-            config: Some(snapshot_path_value(&self.root, &build_info_path)),
+            config: Some(snapshot_path_value(self.workspace_root(), &build_info_path)),
             vmconfigs: vmconfigs
                 .iter()
-                .map(|path| snapshot_path_value(&self.root, path))
+                .map(|path| snapshot_path_value(self.workspace_root(), path))
                 .collect(),
             qemu: AxvisorQemuSnapshot {
                 qemu_config: runtime_paths
                     .qemu_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
             uboot: AxvisorUbootSnapshot {
                 uboot_config: runtime_paths
                     .uboot_config
                     .as_ref()
-                    .map(|path| snapshot_path_value(&self.root, path)),
+                    .map(|path| snapshot_path_value(self.workspace_root(), path)),
             },
         };
 
@@ -377,7 +393,7 @@ impl AppContext {
         &self,
         snapshot: &AxvisorCommandSnapshot,
     ) -> anyhow::Result<PathBuf> {
-        snapshot.store(&self.root)
+        snapshot.store(self.workspace_root())
     }
 
     fn resolve_runtime_paths(
@@ -398,7 +414,7 @@ impl AppContext {
         explicit_path: Option<PathBuf>,
         snapshot_path: Option<&PathBuf>,
     ) -> Option<PathBuf> {
-        explicit_path.or_else(|| resolve_snapshot_path(&self.root, snapshot_path))
+        explicit_path.or_else(|| resolve_snapshot_path(self.workspace_root(), snapshot_path))
     }
 
     fn resolve_workspace_paths<'a>(
@@ -415,7 +431,7 @@ impl AppContext {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.root.join(path)
+            self.workspace_root().join(path)
         }
     }
 }

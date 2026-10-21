@@ -46,7 +46,6 @@ AxVisor 支持多种操作系统作为客户机运行，从轻量级微内核到
 |-----------|---------|---------|---------|
 | [ArceOS](https://github.com/arceos-org/arceos) | Unikernel | ARM64, x86_64, RISC-V | 基于Rust的组件化操作系统，轻量级、高性能 |
 | [Starry-OS](https://github.com/Starry-OS) | 宏内核操作系统 | ARM64, x86_64 | 面向嵌入式场景的实时操作系统 |
-| [NimbOS](https://github.com/equation314/nimbos) | RTOS 系统 | ARM64, x86_64, RISC-V | 简洁的类Unix系统，支持POSIX接口 |
 | Linux | 宏内核操作系统 | ARM64, x86_64, RISC-V | 成熟稳定的通用操作系统，丰富的软件生态 |
 
 # 构建
@@ -55,7 +54,7 @@ AxVisor 基于 Rust 生态系统构建，通过扩展的 xtask 工具链提供�
 
 ## 构建环境
 
-> **快速开始**：如果你只想在 QEMU 上快速跑起来，请直接参见 [QEMU 快速上手指南](doc/qemu-quickstart_cn.md)，其中包含了从环境搭建到运行客户机的完整步骤。
+> **快速开始**：在工作区根目录运行 `cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case smoke`。
 
 首先，在 Linux 环境下，需要安装 `libssl-dev gcc libudev-dev pkg-config` 等基本开发工具包。
 
@@ -79,25 +78,33 @@ Board 运行配置位于 `configs/board/` 目录下，每个配置文件都对�
 
 客户机配置按平台优先组织。QEMU 配置位于 `configs/vms/qemu/<arch>/`，实体板卡配置位于 `configs/vms/<board>/`。文件名只保留客户机系统和变体，例如 `configs/vms/qemu/aarch64/arceos-smp1.toml` 或 `configs/vms/roc-rk3568-pc/linux-smp1.toml`。
 
+## 管理 Shell 语法
+
+AxVisor 管理 Shell 使用 `shlex` 的 POSIX 风格规则拆分命令行。单双引号可以组合参数，反斜杠按 `shlex` 规则转义，`""` 或 `''` 会产生空参数。未闭合引号和末尾孤立反斜杠属于语法错误。只有 ASCII shell 空白字符用于分隔参数。
+
+分词不提供变量展开、glob、管道、通用重定向或 job control。命令查找、选项校验和 handler 行为仍由 AxVisor 自身实现。
+
+串口管理 Shell 的 `shell::console_init` 支持方向键浏览历史和移动光标、Delete 删除光标处字符、Home/End 或 Ctrl+A/E 移到行首/行尾。Ctrl+W 删除前一个词，Ctrl+U 清空当前行，Ctrl+K 删除光标到行尾，Ctrl+C 取消尚未执行的输入。SGR 鼠标报告等未支持的 CSI 序列会完整消费，不会混入命令。
+
+串口管理 Shell 的 `history` 内建命令由 `handle_builtin_commands` 分派，并操作 `CommandHistory` 保存的当前会话记录。列表按保留窗口从 1 开始编号，并显示 `history` 自身；`history -c` 清空包括自身在内的全部记录，之后方向键不会带回旧命令。`history -N` 显示最后 N 条，N 为正十进制整数，计数包含当前命令自身，输出沿用完整历史中的原始编号。
+
+`history | grep PATTERN` 对命令文本做区分大小写的字面子串匹配（不是正则），PATTERN 必须恰好一个；`history -N | grep PATTERN` 先取最后 N 条再过滤。只接受单个 `grep PATTERN` 过滤阶段，其他管道组合、grep 选项和多余参数都会报错且不会清空已有记录；非法命令自身仍按既有规则加入历史。历史仅存在于当前串口管理 Shell 会话，不持久化；浏览器 network shell 不保留历史，执行 `history` 会明确提示不可用。
+
+Tab 通过 `shell::completion::complete_line` 补全命令和子命令；启用文件系统支持时还补全路径。唯一候选会补齐，目录追加 `/`；多个候选先补公共前缀，再按 Tab 列出候选。补全只在词尾处理未加引号、未转义的输入，文件名限 ASCII 字母、数字、`_`、`-` 和 `.`。这些按键针对串口管理 Shell；客户机控制台仍由客户机处理输入，Ctrl+X 后按 h 返回管理 Shell。
+
+使用 QEMU `-nographic` 时，连续按两次 Ctrl+A 才会向管理 Shell 发送一个 Ctrl+A；Ctrl+A 后按 x 由 QEMU 自身处理并退出模拟器。维护中的 Linux smoke 镜像以 `sh` 作为 PID 1，关机使用 `poweroff -f`；AxVisor 收到 PSCI 关机请求后停止客户机并返回管理 Shell，再执行 `exit` 关闭宿主。
+
 ## 编译
 
-AxVisor 使用 xtask 工具进行构建管理，支持多种硬件平台和配置选项。快速构建及运行 AxVisor，请参见配置套文档中的[快速上手](https://arceos-hypervisor.github.io/axvisorbook/docs/category/quickstart)章节。
+AxVisor 使用 xtask 工具进行构建管理，支持多种硬件平台和配置选项。快速构建及运行 AxVisor，请参见配置套文档中的[快速上手](https://arceos-hypervisor.github.io/axvisorbook/docs/quickstart)章节。
 
-1. **查看可用板级配置**：使用 `cargo xtask config ls` 查看 `configs/board/` 目录下可用的板级配置名。
+1. **查看可用板级配置**：使用 `cargo xtask axvisor config ls` 查看 `configs/board/` 目录下可用的板级配置名。
 
-2. **生成配置**：使用 `cargo xtask defconfig <board_name>` 选择目标硬件平台配置。此命令会将对应板级配置复制为 `.build.toml`。
+2. **生成配置**：使用 `cargo xtask axvisor defconfig <board_name>` 选择目标硬件平台配置。此命令会将对应板级配置复制为 `.build.toml`。
 
-3. **执行构建**：使用 `cargo xtask build` 根据 `.build.toml` 编译 AxVisor。若不想依赖 `.build.toml`，也可以直接指定配置文件，例如：`cargo xtask build --config configs/board/<board_name>.toml`。
+3. **执行构建**：使用 `cargo xtask axvisor build` 根据 `.build.toml` 编译 AxVisor。若不想依赖 `.build.toml`，也可以直接指定配置文件，例如：`cargo xtask axvisor build --config configs/board/<board_name>.toml`。
 
-4. **运行 QEMU 或开发板**：
-   - QEMU：`cargo xtask qemu --config configs/board/qemu-aarch64.toml --qemu-config .github/workflows/qemu-aarch64.toml --vmconfigs configs/vms/qemu/aarch64/arceos-smp1.toml`
-   - U-Boot 开发板流程：`cargo xtask uboot --config configs/board/roc-rk3568-pc.toml --uboot-config .github/workflows/uboot.toml --vmconfigs configs/vms/roc-rk3568-pc/arceos-smp1.toml`
-
-如果是本地快速验证，也可以直接使用 `./scripts/quick-start.sh` 启动当前脚本支持的 QEMU 和开发板平台。具体示例见 [QEMU 快速上手指南](doc/qemu-quickstart_cn.md)。
-
-## QEMU 快速运行
-
-如需在 QEMU 上快速运行 AxVisor 并启动客户机系统（ArceOS / Linux / NimbOS），请参见 [QEMU 快速上手指南](doc/qemu-quickstart_cn.md)。
+4. **运行 QEMU**：在工作区根目录使用 `cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case smoke` 运行维护中的 smoke 用例。
 
 # 贡献
 

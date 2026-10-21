@@ -1,0 +1,288 @@
+name: Reusable Check Matrix
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Immutable revision to test; defaults to the triggering commit.
+        required: false
+        type: string
+        default: ""
+      matrix_json:
+        description: JSON matrix emitted by scripts/test/ci_plan.py.
+        required: true
+        type: string
+      fail_fast:
+        description: Cancel sibling matrix entries after a failure.
+        required: false
+        type: boolean
+        default: true
+      max_parallel:
+        description: Maximum number of matrix entries that may run concurrently.
+        required: false
+        type: number
+        default: 256
+      save_cache:
+        description: Allow rust-cache to save updated entries.
+        required: false
+        type: boolean
+        default: false
+      since_ref:
+        description: Base revision exposed to incremental check commands.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CLAW_API_KEY:
+        required: false
+      STARRY_WIFI_SSID:
+        required: false
+      STARRY_WIFI_PASSWORD:
+        required: false
+
+jobs:
+  run:
+    name: ${{ matrix.name }}
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'pull_request'
+    strategy:
+      fail-fast: ${{ inputs.fail_fast }}
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix: ${{ fromJSON(inputs.matrix_json) }}
+    # Give every matrix entry its own concurrency group. The board runner pool
+    # can therefore dispatch entries with the same resource_group to different
+    # idle physical boards.
+    concurrency:
+      group: ci-resource-${{ format('run-{0}-{1}', github.run_id, matrix.id) }}
+      queue: max
+      cancel-in-progress: false
+    runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          !(github.repository == 'rcore-os/tgoskits' &&
+            github.event.pull_request.head.repo.full_name &&
+            matrix.allow_fork_pull_request &&
+            contains(matrix.runs_on, 'self-hosted') &&
+            contains(matrix.runs_on, 'board') &&
+            !matrix.wifi_secrets) &&
+          'ubuntu-latest' || matrix.runs_on }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    container:
+      image: ${{ matrix.container_image }}
+      credentials:
+        # Public GHCR images need no login. Keep a nonempty username to prevent
+        # the runner from injecting GITHUB_TOKEN when both credentials are absent;
+        # an omitted password makes ContainerRegistryLogin skip docker login.
+        username: anonymous
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: ${{ matrix.fetch_depth }}
+
+      - name: Preflight self-hosted host runner
+        if: contains(toJSON(matrix.runs_on), 'self-hosted')
+        env:
+          REQUIRE_KVM: ${{ matrix.require_kvm }}
+        run: |
+          set -euo pipefail
+          command -v rustc
+          command -v cargo
+          rustc -vV
+          cargo -V
+          if [ "${REQUIRE_KVM}" = "true" ]; then
+            test -r /dev/kvm && test -w /dev/kvm
+          fi
+
+      # Some Starry board builds pack a uImage from a companion `.its` file.
+      # Those checks set `requires_mkimage`; FIT conversion also needs `dtc`.
+      # Check both tools here so a missing host dependency fails before the
+      # board build with an actionable message.
+      - name: Preflight mkimage
+        if: matrix.requires_mkimage
+        run: |
+          set -euo pipefail
+          if command -v mkimage >/dev/null 2>&1 && command -v dtc >/dev/null 2>&1; then
+            echo "mkimage: $(command -v mkimage)"
+            echo "dtc: $(command -v dtc)"
+            exit 0
+          fi
+
+          distro_ids=""
+          if [ -r /etc/os-release ]; then
+            distro_ids="$(. /etc/os-release && printf '%s %s' "${ID:-}" "${ID_LIKE:-}")"
+          fi
+          if ! command -v apt-get >/dev/null 2>&1 ||
+            ! printf '%s' "${distro_ids}" | grep -Eqi '(^| )(debian|ubuntu)( |$)'; then
+            echo "::error::mkimage (u-boot-tools) and dtc (device-tree-compiler) are required by this check, but this runner does not look like a Debian or Ubuntu host" >&2
+            echo "install u-boot-tools and device-tree-compiler on the runner or move this check to a runner that provides both tools" >&2
+            exit 1
+          fi
+
+          apt_get=(apt-get)
+          if [ "$(id -u)" != "0" ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::error::mkimage or dtc is missing and sudo is unavailable to install u-boot-tools and device-tree-compiler" >&2
+              exit 1
+            fi
+            apt_get=(sudo apt-get)
+          fi
+          "${apt_get[@]}" update
+          DEBIAN_FRONTEND=noninteractive "${apt_get[@]}" install -y --no-install-recommends u-boot-tools device-tree-compiler
+          command -v mkimage
+          command -v dtc
+
+      - name: Preflight container
+        if: matrix.container_preflight != 'none'
+        env:
+          CONTAINER_PREFLIGHT: ${{ matrix.container_preflight }}
+        run: |
+          set -euo pipefail
+          command -v git
+          git -c safe.directory="${GITHUB_WORKSPACE}" rev-parse --is-inside-work-tree
+          for emulator in \
+            qemu-aarch64-static \
+            qemu-riscv64-static \
+            qemu-loongarch64-static \
+            qemu-x86_64-static
+          do
+            command -v "${emulator}"
+          done
+          if [ "${CONTAINER_PREFLIGHT}" = "full" ]; then
+            for arch in aarch64 riscv64 x86_64 loongarch64; do
+              command -v "${arch}-linux-musl-cc"
+            done
+          fi
+
+      - name: Restore Rust cache
+        if: matrix.cache_key != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.cache_key }}
+          save-if: ${{ inputs.save_cache }}
+
+      - name: Download tg-xtask binary artifact
+        if: matrix.download_xtask_bin_artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.xtask_bin_artifact_name }}
+          path: ${{ runner.temp }}/xtask-bin
+
+      - name: Restore tg-xtask binary artifact
+        if: matrix.download_xtask_bin_artifact
+        run: |
+          set -euo pipefail
+          artifact_path="${RUNNER_TEMP}/xtask-bin/tg-xtask-bin.tar"
+          xtask_path="${GITHUB_WORKSPACE}/target/debug/tg-xtask"
+          tar -xf "${artifact_path}" -C "${GITHUB_WORKSPACE}"
+          test -f "${xtask_path}"
+          chmod +x "${xtask_path}"
+          test -x "${xtask_path}"
+
+      - name: Set up Node
+        if: matrix.node_version != ''
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node_version }}
+
+      - name: Show Rust version
+        run: rustc --version
+
+      - name: Run command
+        env:
+          STARRY_APK_REGION: ${{ matrix.apk_region }}
+          STARRY_APK_MIRROR: ${{ matrix.apk_mirror }}
+          ALPINE_CDN: ${{ matrix.apk_mirror }}
+          ALPINE_MIRROR: ${{ matrix.apk_mirror }}
+          DNSMASQ_APK_MIRROR: ${{ matrix.apk_mirror }}
+          DROPBEAR_APK_MIRROR: ${{ matrix.apk_mirror }}
+          STARRYWRT_APK_MIRROR: ${{ matrix.apk_mirror }}
+          VISUAL_ALPINE_MIRROR: ${{ matrix.apk_mirror }}
+          SINCE_REF: ${{ inputs.since_ref }}
+          CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
+          STARRY_WIFI_SSID: ${{ matrix.wifi_secrets && secrets.STARRY_WIFI_SSID || '' }}
+          STARRY_WIFI_PASSWORD: ${{ matrix.wifi_secrets && secrets.STARRY_WIFI_PASSWORD || '' }}
+          WIFI_SECRETS: ${{ matrix.wifi_secrets }}
+          PERFORMANCE_REPORT: ${{ matrix.performance_report }}
+          REUSABLE_COMMAND: ${{ matrix.command }}
+          USE_XTASK_BIN: ${{ matrix.download_xtask_bin_artifact }}
+        run: |
+          set -eo pipefail
+
+          if [ "${WIFI_SECRETS}" != "true" ]; then
+            unset STARRY_WIFI_SSID STARRY_WIFI_PASSWORD
+          fi
+
+          command_text="${REUSABLE_COMMAND}"
+          if [ "${USE_XTASK_BIN}" = "true" ] && [[ "${command_text}" != *$'\n'* ]]; then
+            if [[ "${command_text}" == "cargo xtask" || "${command_text}" == cargo\ xtask\ * ]]; then
+              command_text="target/debug/tg-xtask${command_text#cargo xtask}"
+            fi
+          fi
+
+          command_file="${RUNNER_TEMP}/reusable-command.sh"
+          printf '%s\n' "${command_text}" > "${command_file}"
+          if [ "${PERFORMANCE_REPORT}" = "true" ]; then
+            command_log="${RUNNER_TEMP}/reusable-command.log"
+            log_command=(tee "${command_log}")
+          else
+            log_command=(cat)
+          fi
+          set +e
+          bash -e -o pipefail "${command_file}" 2>&1 | "${log_command[@]}"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "${status}" = 0 ]; then
+            :
+          else
+            echo "Command failed; resolved command:"
+            sed 's/^/+ /' "${command_file}"
+            exit "${status}"
+          fi
+
+      - name: Render performance report
+        if: success() && matrix.performance_report
+        env:
+          CHECK_ID: ${{ matrix.id }}
+          CHECK_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/test/ci_perf_report.py \
+            --check-id "${CHECK_ID}" \
+            --check-name "${CHECK_NAME}" \
+            --log "${RUNNER_TEMP}/reusable-command.log" \
+            --output "${RUNNER_TEMP}/performance-report/${CHECK_ID}.md" \
+            --json-output "${RUNNER_TEMP}/performance-report/${CHECK_ID}.json"
+          cat "${RUNNER_TEMP}/performance-report/${CHECK_ID}.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload performance report
+        if: success() && matrix.performance_report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.performance_artifact_prefix }}-${{ matrix.id }}
+          path: ${{ runner.temp }}/performance-report/${{ matrix.id }}.*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Package tg-xtask binary artifact
+        if: success() && matrix.upload_xtask_bin_artifact
+        run: |
+          set -euo pipefail
+          test -x target/debug/tg-xtask
+          tar -cf "${RUNNER_TEMP}/tg-xtask-bin.tar" target/debug/tg-xtask
+
+      - name: Upload tg-xtask binary artifact
+        if: success() && matrix.upload_xtask_bin_artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.xtask_bin_artifact_name }}
+          path: ${{ runner.temp }}/tg-xtask-bin.tar
+          if-no-files-found: error
+          retention-days: 1

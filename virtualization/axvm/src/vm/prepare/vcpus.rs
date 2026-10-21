@@ -1,10 +1,10 @@
 //! Architecture-neutral vCPU collection construction and setup.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use std::{boxed::Box, vec::Vec};
 
 use axvm_types::VmArchVcpuOps;
 
-use super::super::{AxVCpuRef, AxVMResources, VCpu};
+use super::super::{AxVMResources, VCpu};
 use crate::AxVmResult;
 
 #[derive(Clone, Copy, Debug)]
@@ -15,7 +15,7 @@ pub(crate) struct VcpuPlacement {
 }
 
 pub(crate) struct PreparedVcpus {
-    vcpus: Vec<AxVCpuRef>,
+    vcpus: Vec<VCpu>,
 }
 
 impl PreparedVcpus {
@@ -25,7 +25,7 @@ impl PreparedVcpus {
         mut build_config: impl FnMut(
             VcpuPlacement,
         ) -> AxVmResult<
-            <crate::arch::ArchVCpu as VmArchVcpuOps>::CreateConfig,
+            <crate::arch::current::ArchVCpu as VmArchVcpuOps>::CreateConfig,
         >,
     ) -> AxVmResult<Self> {
         debug!("id: {vm_id}, vCPU placements: {placements:#x?}");
@@ -38,60 +38,70 @@ impl PreparedVcpus {
             );
             let arch_config = build_config(placement)?;
 
-            // FIXME: VCpu is neither `Send` nor `Sync` by design, check whether
-            // 1. we should make it `Send` and `Sync`, or
-            // 2. we can guarantee that no cross-thread access is performed
-            #[allow(clippy::arc_with_non_send_sync)]
-            vcpus.push(Arc::new(VCpu::new(
+            vcpus.push(VCpu::new(
                 vm_id,
                 placement.id,
                 placement.phys_cpu_set,
                 arch_config,
-            )?));
+            )?);
         }
 
         Ok(Self { vcpus })
     }
 
     pub(crate) fn setup(
-        &self,
+        &mut self,
         resources: &AxVMResources,
+        config: &crate::config::AxVMConfig,
         mut build_config: impl FnMut(
             &crate::config::AxVMConfig,
             &[crate::vm::VMMemoryRegion],
         ) -> AxVmResult<
-            <crate::arch::ArchVCpu as VmArchVcpuOps>::SetupConfig,
+            <crate::arch::current::ArchVCpu as VmArchVcpuOps>::SetupConfig,
         >,
     ) -> AxVmResult {
-        for vcpu in &self.vcpus {
-            let setup_config = build_config(&resources.config, &resources.memory_regions)?;
+        for vcpu in &mut self.vcpus {
             let entry = if vcpu.id() == 0 {
-                resources.config.bsp_entry()
+                config.bsp_entry()
             } else {
-                resources.config.ap_entry()
+                config.ap_entry()
             };
 
             debug!("Setting up vCPU[{}] entry at {:#x}", vcpu.id(), entry);
-            vcpu.setup(entry, resources.nested_paging, setup_config)?;
+            vcpu.setup(
+                entry,
+                resources.nested_paging,
+                build_config(config, &resources.memory_regions)?,
+            )?;
         }
         Ok(())
     }
 
-    pub(crate) fn into_boxed_slice(self) -> Box<[AxVCpuRef]> {
+    pub(crate) fn into_boxed_slice(self) -> Box<[VCpu]> {
         self.vcpus.into_boxed_slice()
     }
 }
 
-pub(crate) fn vcpu_placements(resources: &AxVMResources) -> Vec<VcpuPlacement> {
-    resources
-        .config
-        .phys_cpu_ls
-        .get_vcpu_affinities_pcpu_ids()
-        .into_iter()
-        .map(|(id, phys_cpu_set, phys_cpu_id)| VcpuPlacement {
-            id,
-            phys_cpu_set,
-            phys_cpu_id,
-        })
-        .collect()
+impl<'a> IntoIterator for &'a mut PreparedVcpus {
+    type Item = &'a mut VCpu;
+    type IntoIter = std::slice::IterMut<'a, VCpu>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vcpus.iter_mut()
+    }
+}
+
+impl AxVMResources {
+    pub(crate) fn vcpu_placements(&self, config: &crate::config::AxVMConfig) -> Vec<VcpuPlacement> {
+        config
+            .phys_cpu_ls
+            .get_vcpu_affinities_pcpu_ids()
+            .into_iter()
+            .map(|(id, phys_cpu_set, phys_cpu_id)| VcpuPlacement {
+                id,
+                phys_cpu_set,
+                phys_cpu_id,
+            })
+            .collect()
+    }
 }

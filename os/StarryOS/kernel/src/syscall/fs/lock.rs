@@ -29,25 +29,30 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::ffi::c_int;
+use core::{
+    ffi::c_int,
+    ops::Deref,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use ax_errno::{AxError, AxResult, LinuxError};
-use ax_kspin::SpinRwLock as RwLock;
-use ax_task::current;
+#[cfg(feature = "qperf-metrics")]
+mod metrics;
 use linux_raw_sys::general::{
     F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW, F_RDLCK, F_SETLK, F_SETLKW, F_UNLCK, F_WRLCK,
     LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, SEEK_CUR, SEEK_END,
     SEEK_SET, flock64,
 };
-use starry_process::Pid;
+#[cfg(feature = "qperf-metrics")]
+pub(crate) use metrics::render_file_lock_metrics;
 
 use crate::{
-    file::{File, FileLike, get_file_like},
+    Errno, StarryError, StarryResult,
+    file::{File, FileLike, InodeKey, Pipe, get_file_like},
     mm::UserPtr,
-    task::{AsThread, futex::WaitQueue},
+    sync::RawSpinRwLock,
+    task::{PidIdentityId, PidNamespaceId, PidSnapshot, futex::WaitQueue},
 };
 
-type InodeKey = (u64, u64); // (device, inode_no)
 type OfdAddr = usize;
 
 /// Linux convention: `F_OFD_GETLK` reports `l_pid = -1` for an OFD owner.
@@ -60,10 +65,10 @@ enum LockKind {
 }
 
 /// Owner of an entry in the fcntl POSIX/OFD lock table.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum FOwner {
     Posix {
-        pid: Pid,
+        owner: PidSnapshot,
     },
     Ofd {
         addr: OfdAddr,
@@ -76,16 +81,20 @@ impl FOwner {
     /// the same lock holder, so they merge / don't conflict".
     fn same_as(&self, other: &FOwner) -> bool {
         match (self, other) {
-            (FOwner::Posix { pid: a }, FOwner::Posix { pid: b }) => a == b,
+            (FOwner::Posix { owner: a }, FOwner::Posix { owner: b }) => {
+                a.identity_id() == b.identity_id()
+            }
             (FOwner::Ofd { addr: a, .. }, FOwner::Ofd { addr: b, .. }) => a == b,
             _ => false,
         }
     }
 
     /// pid value to report back via `F_GETLK`.
-    fn report_pid(&self) -> i32 {
+    fn report_pid(&self, observer: PidNamespaceId) -> i32 {
         match self {
-            FOwner::Posix { pid } => *pid as i32,
+            FOwner::Posix { owner } => owner
+                .visible_number(observer)
+                .map_or(0, |number| number.get() as i32),
             FOwner::Ofd { .. } => OFD_PID_REPORTED,
         }
     }
@@ -110,20 +119,247 @@ struct FLockEntry {
     owner: FOwner,
 }
 
+struct LockState<T> {
+    entries: RawSpinRwLock<Vec<T>>,
+    pin_state: AtomicUsize,
+}
+
+impl<T> LockState<T> {
+    fn new() -> Self {
+        Self {
+            entries: RawSpinRwLock::new(Vec::new()),
+            pin_state: AtomicUsize::new(0),
+        }
+    }
+
+    fn clear_deferred_reap(&self) {
+        // Only index writers change this bit; pin updates preserve it.
+        if self.pin_state.load(Ordering::Acquire) & DEFERRED_REAP_BIT != 0 {
+            self.pin_state
+                .fetch_and(!DEFERRED_REAP_BIT, Ordering::AcqRel);
+        }
+    }
+}
+
+// The low bit marks deferred reaping; the remaining bits count pins in units
+// of two. Marking and releasing a pin share one atomic modification order.
+const DEFERRED_REAP_BIT: usize = 1;
+const PIN_UNIT: usize = 2;
+
+// Pin acquisition is serialized with index removal. A deferred state is
+// checked again when its final pin is released, even if no new inode appears.
+struct StatePin<'a, K: Copy + Ord, T> {
+    key: K,
+    state: Arc<LockState<T>>,
+    index: &'a RawSpinRwLock<LockIndex<K, T>>,
+}
+
+impl<K: Copy + Ord, T> Deref for StatePin<'_, K, T> {
+    type Target = RawSpinRwLock<Vec<T>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.entries
+    }
+}
+
+impl<K: Copy + Ord, T> Drop for StatePin<'_, K, T> {
+    fn drop(&mut self) {
+        let previous = self.state.pin_state.fetch_sub(PIN_UNIT, Ordering::AcqRel);
+        debug_assert!(previous >= PIN_UNIT);
+        if previous == (PIN_UNIT | DEFERRED_REAP_BIT) {
+            self.index.write().reclaim_deferred(self.key);
+        }
+    }
+}
+
+struct LockIndex<K: Copy + Ord, T> {
+    states: BTreeMap<K, Arc<LockState<T>>>,
+    idle: Vec<K>,
+    idle_limit: usize,
+    cached_capacity_limit: usize,
+}
+
+impl<K: Copy + Ord, T> LockIndex<K, T> {
+    const fn new(idle_limit: usize, cached_capacity_limit: usize) -> Self {
+        Self {
+            states: BTreeMap::new(),
+            idle: Vec::new(),
+            idle_limit,
+            cached_capacity_limit,
+        }
+    }
+
+    fn pin<'a>(&self, key: K, index: &'a RawSpinRwLock<Self>) -> Option<StatePin<'a, K, T>> {
+        let state = self.states.get(&key)?;
+        state.pin_state.fetch_add(PIN_UNIT, Ordering::Relaxed);
+        Some(StatePin {
+            key,
+            state: state.clone(),
+            index,
+        })
+    }
+
+    fn reclaim_idle(&mut self) {
+        let mut cursor = 0;
+        while cursor < self.idle.len() {
+            if !self.reclaim_idle_at(cursor) {
+                cursor += 1;
+            }
+        }
+    }
+
+    fn reclaim_deferred(&mut self, key: K) {
+        if let Some(cursor) = self.idle.iter().position(|candidate| *candidate == key) {
+            self.reclaim_idle_at(cursor);
+        }
+    }
+
+    // Returns true when the candidate is removed from the idle queue.
+    fn reclaim_idle_at(&mut self, cursor: usize) -> bool {
+        let key = self.idle[cursor];
+        let Some(state) = self.states.get(&key) else {
+            self.idle.remove(cursor);
+            return true;
+        };
+        let entries = state.entries.read();
+        let empty = entries.is_empty();
+        let oversized = entries.capacity() > self.cached_capacity_limit;
+        drop(entries);
+        if !empty {
+            state.clear_deferred_reap();
+            self.idle.remove(cursor);
+            true
+        } else if oversized || self.idle.len() > self.idle_limit {
+            let previous = state
+                .pin_state
+                .fetch_or(DEFERRED_REAP_BIT, Ordering::AcqRel);
+            if previous & !DEFERRED_REAP_BIT == 0 {
+                self.states.remove(&key);
+                self.idle.remove(cursor);
+                true
+            } else {
+                false
+            }
+        } else {
+            state.clear_deferred_reap();
+            false
+        }
+    }
+
+    fn reap_empty(&mut self, key: K, pin: &StatePin<'_, K, T>) {
+        let entries = pin.read();
+        if !entries.is_empty() {
+            return;
+        }
+        let cacheable = entries.capacity() <= self.cached_capacity_limit;
+        drop(entries);
+        if !cacheable
+            && pin.state.pin_state.load(Ordering::Acquire) & !DEFERRED_REAP_BIT == PIN_UNIT
+        {
+            pin.state.clear_deferred_reap();
+            self.states.remove(&key);
+            self.idle.retain(|candidate| *candidate != key);
+        } else {
+            if !self.idle.contains(&key) {
+                self.idle.push(key);
+            }
+            if self.idle.len() > self.idle_limit || !cacheable {
+                self.reclaim_idle();
+            }
+        }
+    }
+}
+
 /// fcntl POSIX + OFD locks share one space.
-static FCNTL_LOCKS: RwLock<BTreeMap<InodeKey, Vec<FLockEntry>>> = RwLock::new(BTreeMap::new());
+type FcntlLockState = StatePin<'static, InodeKey, FLockEntry>;
+type FcntlIndex = LockIndex<InodeKey, FLockEntry>;
+
+// Index locks protect lookup, publication and empty-state removal. Blocking
+// waiters use a separately persistent inode wait queue and retry lookup.
+// Lock order: wait queue -> graph -> index -> inode state. A graph writer may
+// also hold POSIX_LOCK_WAITS while reading index and inode states.
+const FCNTL_IDLE_LIMIT: usize = 32;
+const FCNTL_CACHED_CAPACITY_LIMIT: usize = 8;
+static FCNTL_LOCKS: RawSpinRwLock<FcntlIndex> = RawSpinRwLock::new(FcntlIndex::new(
+    FCNTL_IDLE_LIMIT,
+    FCNTL_CACHED_CAPACITY_LIMIT,
+));
+
+// Readers permit independent inode updates; a writer freezes all record-lock
+// mutations while deadlock detection walks the wait-for graph.
+static POSIX_LOCK_GRAPH: RawSpinRwLock<()> = RawSpinRwLock::new(());
+
+fn fcntl_state(key: InodeKey) -> FcntlLockState {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let index = FCNTL_LOCKS.read();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    let found = index.pin(key, &FCNTL_LOCKS);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FCNTL_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    if let Some(state) = found {
+        return state;
+    }
+
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut index = FCNTL_LOCKS.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    index.reclaim_idle();
+    index
+        .states
+        .entry(key)
+        .or_insert_with(|| Arc::new(LockState::new()));
+    let state = index.pin(key, &FCNTL_LOCKS).unwrap();
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FCNTL_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    state
+}
+
+fn existing_fcntl_state(key: InodeKey) -> Option<FcntlLockState> {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let index = FCNTL_LOCKS.read();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    let found = index.pin(key, &FCNTL_LOCKS);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FCNTL_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    found
+}
+
+// An empty state may be removed only when no other operation or waiter has
+// acquired it. Index write exclusion prevents publishing a second state.
+fn reap_fcntl_state(key: InodeKey, state: &FcntlLockState) {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut index = FCNTL_LOCKS.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    index.reap_empty(key, state);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FCNTL_REAP.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+}
 
 /// Per-inode waiters parked by `F_SETLKW`/`F_OFD_SETLKW` until a
 /// conflicting lock is released. Wakers are called from every code path
 /// that may shrink an inode's `FCNTL_LOCKS` entries (explicit `F_UNLCK`,
 /// process exit, close-eats-locks, OFD release on last close).
-static LOCK_WAITERS: RwLock<BTreeMap<InodeKey, Arc<WaitQueue>>> = RwLock::new(BTreeMap::new());
+static LOCK_WAITERS: RawSpinRwLock<BTreeMap<InodeKey, Arc<WaitQueue>>> =
+    RawSpinRwLock::new(BTreeMap::new());
 
 /// POSIX `F_SETLKW` requests that are actually parked on a wait queue.
 /// These entries form the dynamic wait-for graph used for Linux-compatible
 /// `EDEADLK` detection. OFD waits are excluded because they are not owned by
 /// a process pid.
-static POSIX_LOCK_WAITS: RwLock<BTreeMap<Pid, Vec<WaitingLock>>> = RwLock::new(BTreeMap::new());
+static POSIX_LOCK_WAITS: RawSpinRwLock<BTreeMap<PidIdentityId, Vec<WaitingLock>>> =
+    RawSpinRwLock::new(BTreeMap::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WaitingLock {
@@ -132,49 +368,66 @@ struct WaitingLock {
     end: i64,
     kind: LockKind,
 }
-type PosixLockWaitTable = BTreeMap<Pid, Vec<WaitingLock>>;
+type PosixLockWaitTable = BTreeMap<PidIdentityId, Vec<WaitingLock>>;
 
 struct PosixLockWaitGuard {
-    pid: Pid,
+    owner: PidIdentityId,
     request: WaitingLock,
 }
 
 impl PosixLockWaitGuard {
-    fn try_new(pid: Pid, request: WaitingLock, owner: &FOwner) -> Result<Option<Self>, LinuxError> {
-        let mut table = FCNTL_LOCKS.write();
-        let Some(entries) = table.get_mut(&request.key) else {
+    fn try_new(
+        waiter: PidIdentityId,
+        request: WaitingLock,
+        owner: &FOwner,
+    ) -> Result<Option<Self>, Errno> {
+        let _graph = POSIX_LOCK_GRAPH.write();
+        let Some(state) = existing_fcntl_state(request.key) else {
             return Ok(None);
         };
+        let mut entries = state.write();
         entries.retain(|e| !e.owner.is_dead());
-        let still_blocked =
-            find_conflict(entries, owner, request.start, request.end, request.kind).is_some();
-        if entries.is_empty() {
-            table.remove(&request.key);
-        }
+        let still_blocked = find_conflict(
+            &mut entries,
+            owner,
+            request.start,
+            request.end,
+            request.kind,
+        )
+        .is_some();
         if !still_blocked {
+            let empty = entries.is_empty();
+            drop(entries);
+            if empty {
+                reap_fcntl_state(request.key, &state);
+            }
             return Ok(None);
         }
+        drop(entries);
 
         let mut waits = POSIX_LOCK_WAITS.write();
-        if posix_lock_deadlock_would_occur(&table, &waits, pid, request) {
-            return Err(LinuxError::EDEADLK);
+        if posix_lock_deadlock_would_occur(&waits, waiter, request) {
+            return Err(Errno::EDEADLK);
         }
-        waits.entry(pid).or_default().push(request);
-        Ok(Some(Self { pid, request }))
+        waits.entry(waiter).or_default().push(request);
+        Ok(Some(Self {
+            owner: waiter,
+            request,
+        }))
     }
 }
 
 impl Drop for PosixLockWaitGuard {
     fn drop(&mut self) {
         let mut waits = POSIX_LOCK_WAITS.write();
-        let Some(requests) = waits.get_mut(&self.pid) else {
+        let Some(requests) = waits.get_mut(&self.owner) else {
             return;
         };
         if let Some(index) = requests.iter().position(|request| *request == self.request) {
             requests.swap_remove(index);
         }
         if requests.is_empty() {
-            waits.remove(&self.pid);
+            waits.remove(&self.owner);
         }
     }
 }
@@ -186,11 +439,78 @@ struct FlockEntry {
     /// pid that created this entry. Used to detect and prune stale
     /// same-pid entries whose OFD is dead (weak.strong_count() <= 1)
     /// but a residual fd-table reference masks the release.
-    owner_pid: Pid,
+    owner: PidIdentityId,
 }
 
 /// flock(2) entries: at most one entry per (inode, OFD).
-static FLOCK_LOCKS: RwLock<BTreeMap<InodeKey, Vec<FlockEntry>>> = RwLock::new(BTreeMap::new());
+type FlockLockState = StatePin<'static, InodeKey, FlockEntry>;
+type FlockIndex = LockIndex<InodeKey, FlockEntry>;
+
+// A small cache avoids allocating a new state on every uncontended LOCK_SH /
+// LOCK_UN pair. Large vectors are not cached after their last reference;
+// temporarily pinned empty states are revisited after their last pin drops.
+const FLOCK_IDLE_LIMIT: usize = 32;
+const FLOCK_CACHED_CAPACITY_LIMIT: usize = 8;
+static FLOCK_LOCKS: RawSpinRwLock<FlockIndex> = RawSpinRwLock::new(FlockIndex::new(
+    FLOCK_IDLE_LIMIT,
+    FLOCK_CACHED_CAPACITY_LIMIT,
+));
+
+fn flock_state(key: InodeKey) -> FlockLockState {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let index = FLOCK_LOCKS.read();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    let found = index.pin(key, &FLOCK_LOCKS);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FLOCK_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    if let Some(state) = found {
+        return state;
+    }
+
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut index = FLOCK_LOCKS.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    index.reclaim_idle();
+    index
+        .states
+        .entry(key)
+        .or_insert_with(|| Arc::new(LockState::new()));
+    let state = index.pin(key, &FLOCK_LOCKS).unwrap();
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FLOCK_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    state
+}
+
+fn existing_flock_state(key: InodeKey) -> Option<FlockLockState> {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let index = FLOCK_LOCKS.read();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    let found = index.pin(key, &FLOCK_LOCKS);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FLOCK_INDEX.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    found
+}
+
+fn reap_flock_state(key: InodeKey, state: &FlockLockState) {
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut index = FLOCK_LOCKS.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
+    index.reap_empty(key, state);
+    drop(index);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FLOCK_REAP.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+}
 
 /// Per-inode waiters parked by blocking `flock(LOCK_SH/LOCK_EX)` (without
 /// `LOCK_NB`) until a conflicting OFD-level entry is released. Independent
@@ -198,7 +518,8 @@ static FLOCK_LOCKS: RwLock<BTreeMap<InodeKey, Vec<FlockEntry>>> = RwLock::new(BT
 /// separate conflict spaces (Linux `fs/locks.c`: `FL_POSIX` vs `FL_FLOCK`).
 /// Wakers fire from every path that shrinks [`FLOCK_LOCKS`] — explicit
 /// `LOCK_UN`, downgrades, and OFD release on last close.
-static FLOCK_WAITERS: RwLock<BTreeMap<InodeKey, Arc<WaitQueue>>> = RwLock::new(BTreeMap::new());
+static FLOCK_WAITERS: RawSpinRwLock<BTreeMap<InodeKey, Arc<WaitQueue>>> =
+    RawSpinRwLock::new(BTreeMap::new());
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
@@ -206,16 +527,19 @@ fn ofd_addr(arc: &Arc<dyn FileLike>) -> OfdAddr {
     Arc::as_ptr(arc) as *const () as usize
 }
 
-fn current_pid() -> Pid {
-    current().as_thread().proc_data.proc.pid()
+fn current_process_identity_id(current: &crate::task::UserTaskRef) -> PidIdentityId {
+    current.as_thread().proc_data.identity().id()
 }
 
-/// Resolve `fd` to an inode-keyed lockable file. Returns `EBADF` for fds
-/// that have no inode (pipes, sockets, epoll, ...), matching Linux's
-/// behavior of rejecting flock/fcntl-locks on non-files.
-fn lockable(fd: c_int) -> AxResult<(InodeKey, Arc<dyn FileLike>)> {
+fn current_process_pid_snapshot(current: &crate::task::UserTaskRef) -> PidSnapshot {
+    current.as_thread().proc_data.identity().snapshot()
+}
+
+/// Resolve `fd` to an inode-keyed lockable file. Returns `EBADF` when the
+/// file description does not expose a lock identity.
+fn lockable(fd: c_int) -> StarryResult<(InodeKey, Arc<dyn FileLike>)> {
     let f = get_file_like(fd)?;
-    let key = f.inode_key().ok_or(AxError::BadFileDescriptor)?;
+    let key = f.inode_key().ok_or(StarryError::BadFileDescriptor)?;
     Ok((key, f))
 }
 
@@ -225,31 +549,44 @@ fn lockable(fd: c_int) -> AxResult<(InodeKey, Arc<dyn FileLike>)> {
 ///   * `SEEK_CUR` — relative to the fd's current read/write cursor.
 ///   * `SEEK_END` — relative to the file's current size.
 ///
-/// `SEEK_CUR` / `SEEK_END` are only meaningful for regular files; on a
-/// directory fd (no cursor / size in the byte-offset sense) they return
-/// `EINVAL`. Overflow returns `EINVAL`.
-fn resolve_l_start(file: &Arc<dyn FileLike>, l_whence: i16, l_start: i64) -> AxResult<i64> {
+/// A named FIFO retains a zero file cursor; buffered bytes do not contribute
+/// to either its cursor or its inode size. Other descriptions without a
+/// supported backing file return `EINVAL`. Overflow returns `EINVAL`.
+fn resolve_l_start(file: &Arc<dyn FileLike>, l_whence: i16, l_start: i64) -> StarryResult<i64> {
     let whence = l_whence as u32;
     if whence == SEEK_SET {
         return Ok(l_start);
     }
     if whence != SEEK_CUR && whence != SEEK_END {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
-    let regular = file.downcast_ref::<File>().ok_or(AxError::InvalidInput)?;
+    let fifo = file.downcast_ref::<Pipe>().and_then(Pipe::named_file);
+    let backing = fifo
+        .map(Arc::as_ref)
+        .or_else(|| file.downcast_ref::<File>())
+        .ok_or(StarryError::InvalidInput)?;
     let base = if whence == SEEK_CUR {
-        regular.inner().position().ok_or(AxError::InvalidInput)?
+        if fifo.is_some() {
+            0
+        } else {
+            backing
+                .inner()
+                .position()
+                .ok_or(StarryError::InvalidInput)?
+        }
     } else {
-        regular
+        backing
             .inner()
             .location()
             .len()
-            .map_err(|_| AxError::InvalidInput)?
+            .map_err(|_| StarryError::InvalidInput)?
     };
     // Linux uses i_size / cursor as i64-relative arithmetic; reject anything
     // that does not fit in i64.
-    let base_i64 = i64::try_from(base).map_err(|_| AxError::InvalidInput)?;
-    base_i64.checked_add(l_start).ok_or(AxError::InvalidInput)
+    let base_i64 = i64::try_from(base).map_err(|_| StarryError::InvalidInput)?;
+    base_i64
+        .checked_add(l_start)
+        .ok_or(StarryError::InvalidInput)
 }
 
 /// Translate a half-open `[l_start, l_start + l_len)` description (where
@@ -262,22 +599,26 @@ fn resolve_l_start(file: &Arc<dyn FileLike>, l_whence: i16, l_start: i64) -> AxR
 ///     resolved start must be non-negative).
 ///
 /// Any overflow or a resolved start < 0 returns `EINVAL`.
-fn flock_range(l_start: i64, l_len: i64) -> AxResult<(i64, i64)> {
+fn flock_range(l_start: i64, l_len: i64) -> StarryResult<(i64, i64)> {
     if l_len == 0 {
         if l_start < 0 {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         return Ok((l_start, i64::MAX));
     }
     let (start, end) = if l_len > 0 {
-        let end = l_start.checked_add(l_len).ok_or(AxError::InvalidInput)?;
+        let end = l_start
+            .checked_add(l_len)
+            .ok_or(StarryError::InvalidInput)?;
         (l_start, end)
     } else {
-        let start = l_start.checked_add(l_len).ok_or(AxError::InvalidInput)?;
+        let start = l_start
+            .checked_add(l_len)
+            .ok_or(StarryError::InvalidInput)?;
         (start, l_start)
     };
     if start < 0 {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     Ok((start, end))
 }
@@ -326,15 +667,7 @@ fn clear_owner_overlap(
         }
         changed = true;
         let (es, ee, ek) = (e.start, e.end, e.kind);
-        // Snapshot owner via the per-arm clone — Posix is trivially Copy
-        // semantics, OFD must clone its Weak.
-        let snap_owner = match &e.owner {
-            FOwner::Posix { pid } => FOwner::Posix { pid: *pid },
-            FOwner::Ofd { addr, weak } => FOwner::Ofd {
-                addr: *addr,
-                weak: weak.clone(),
-            },
-        };
+        let snap_owner = e.owner.clone();
         entries.swap_remove(i);
         // Re-insert the head fragment [es, start) if any.
         if es < start {
@@ -342,13 +675,7 @@ fn clear_owner_overlap(
                 start: es,
                 end: start,
                 kind: ek,
-                owner: match &snap_owner {
-                    FOwner::Posix { pid } => FOwner::Posix { pid: *pid },
-                    FOwner::Ofd { addr, weak } => FOwner::Ofd {
-                        addr: *addr,
-                        weak: weak.clone(),
-                    },
-                },
+                owner: snap_owner.clone(),
             });
         }
         // Re-insert the tail fragment [end, ee) if any.
@@ -385,39 +712,39 @@ fn find_conflict<'a>(
 
 fn push_posix_conflict_pids(
     entries: &[FLockEntry],
-    requester: Pid,
+    requester: PidIdentityId,
     start: i64,
     end: i64,
     kind: LockKind,
-    out: &mut Vec<Pid>,
+    out: &mut Vec<PidIdentityId>,
 ) {
     for entry in entries {
         if !ranges_overlap(entry.start, entry.end, start, end) || !kinds_conflict(entry.kind, kind)
         {
             continue;
         }
-        let FOwner::Posix { pid } = &entry.owner else {
+        let FOwner::Posix { owner } = &entry.owner else {
             continue;
         };
-        let pid = *pid;
-        if pid != requester && !out.contains(&pid) {
-            out.push(pid);
+        let blocker = owner.identity_id();
+        if blocker != requester && !out.contains(&blocker) {
+            out.push(blocker);
         }
     }
 }
 
 fn posix_lock_deadlock_would_occur(
-    table: &BTreeMap<InodeKey, Vec<FLockEntry>>,
     waits: &PosixLockWaitTable,
-    requester: Pid,
+    requester: PidIdentityId,
     request: WaitingLock,
 ) -> bool {
     let mut stack = Vec::new();
     let mut seen = Vec::new();
 
-    if let Some(entries) = table.get(&request.key) {
+    if let Some(state) = existing_fcntl_state(request.key) {
+        let entries = state.read();
         push_posix_conflict_pids(
-            entries,
+            &entries,
             requester,
             request.start,
             request.end,
@@ -439,9 +766,10 @@ fn posix_lock_deadlock_would_occur(
             continue;
         };
         for blocked_request in blocker_waits {
-            if let Some(entries) = table.get(&blocked_request.key) {
+            if let Some(state) = existing_fcntl_state(blocked_request.key) {
+                let entries = state.read();
                 push_posix_conflict_pids(
-                    entries,
+                    &entries,
                     blocker,
                     blocked_request.start,
                     blocked_request.end,
@@ -469,11 +797,9 @@ fn lock_waiters(key: InodeKey) -> Arc<WaitQueue> {
         .clone()
 }
 
-/// Wake every task parked on `key`. MUST be called without `FCNTL_LOCKS`
-/// held to keep the lock order `WaitQueue → FCNTL_LOCKS`: waiters take
-/// the wait-queue mutex first and the table lock second from inside
-/// `wait_if`'s condition closure, so a waker that already held the
-/// table lock would invert that order and deadlock.
+/// Wake every task parked on `key`. MUST be called after releasing the
+/// graph and inode locks: waiters take the wait-queue mutex before those
+/// locks in `wait_if`'s condition closure.
 pub fn wake_lock_waiters(key: InodeKey) {
     let wq = LOCK_WAITERS.read().get(&key).cloned();
     if let Some(wq) = wq {
@@ -508,20 +834,21 @@ pub fn wake_flock_waiters(key: InodeKey) {
 /// inside the F_SETLKW retry loop because OFD owners snapshot the
 /// `Weak<dyn FileLike>` and Posix owners need the *current* pid (which
 /// won't change for a single thread, but cloning is trivial).
-fn make_owner(ofd: bool, file: &Arc<dyn FileLike>) -> FOwner {
+fn make_owner(current: &crate::task::UserTaskRef, ofd: bool, file: &Arc<dyn FileLike>) -> FOwner {
     if ofd {
         FOwner::Ofd {
             addr: ofd_addr(file),
             weak: Arc::downgrade(file),
         }
     } else {
-        FOwner::Posix { pid: current_pid() }
+        FOwner::Posix {
+            owner: current_process_pid_snapshot(current),
+        }
     }
 }
 
-/// Result of one attempt to install / clear a record lock. Carried out
-/// of the FCNTL_LOCKS critical section so any wakeups happen with the
-/// table lock released.
+/// Result of one attempt to install / clear a record lock. Wakeups happen
+/// after releasing the graph and inode locks.
 enum SetlkAttempt {
     Done { woke_others: bool },
     Conflict,
@@ -534,20 +861,37 @@ fn try_setlk_once(
     end: i64,
     kind: Option<LockKind>,
 ) -> SetlkAttempt {
-    let mut table = FCNTL_LOCKS.write();
-    let entries = table.entry(key).or_default();
+    let _graph = matches!(&owner, FOwner::Posix { .. }).then(|| POSIX_LOCK_GRAPH.read());
+    let state = if kind.is_some() {
+        fcntl_state(key)
+    } else if let Some(state) = existing_fcntl_state(key) {
+        state
+    } else {
+        return SetlkAttempt::Done { woke_others: false };
+    };
+    #[cfg(feature = "qperf-metrics")]
+    let timing = if matches!(&owner, FOwner::Posix { .. }) {
+        &metrics::POSIX_SET
+    } else {
+        &metrics::OFD_SET
+    };
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut entries = state.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
     entries.retain(|e| !e.owner.is_dead());
 
     let attempt = match kind {
         None => {
-            let woke_others = clear_owner_overlap(entries, &owner, start, end);
+            let woke_others = clear_owner_overlap(&mut entries, &owner, start, end);
             SetlkAttempt::Done { woke_others }
         }
         Some(k) => {
-            if find_conflict(entries, &owner, start, end, k).is_some() {
+            if find_conflict(&mut entries, &owner, start, end, k).is_some() {
                 SetlkAttempt::Conflict
             } else {
-                let woke_others = clear_owner_overlap(entries, &owner, start, end);
+                let woke_others = clear_owner_overlap(&mut entries, &owner, start, end);
                 entries.push(FLockEntry {
                     start,
                     end,
@@ -558,8 +902,12 @@ fn try_setlk_once(
             }
         }
     };
-    if entries.is_empty() {
-        table.remove(&key);
+    let empty = entries.is_empty();
+    drop(entries);
+    #[cfg(feature = "qperf-metrics")]
+    timing.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    if empty {
+        reap_fcntl_state(key, &state);
     }
     attempt
 }
@@ -569,11 +917,19 @@ fn try_setlk_once(
 /// per-inode wait queue until the conflict clears or a signal arrives
 /// (returning `EINTR` per POSIX). When `wait` is false, conflicts return
 /// `EAGAIN` immediately.
-pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isize> {
-    let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
+pub fn fcntl_setlk(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    arg: usize,
+    ofd: bool,
+    wait: bool,
+) -> crate::StarryResult<isize> {
+    // SAFETY: `flock64` contains only integer ABI fields, so every copied bit
+    // pattern is a valid Rust value before semantic validation below.
+    let fl = unsafe { UserPtr::<flock64>::from(arg).read_abi(current)? };
     // POSIX.1-2024 / Linux: F_OFD_SETLK{,W} require l_pid to be 0.
     if ofd && fl.l_pid != 0 {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let (key, file) = lockable(fd)?;
     let abs_start = resolve_l_start(&file, fl.l_whence, fl.l_start)?;
@@ -583,7 +939,7 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
         F_UNLCK => None,
         F_RDLCK => Some(LockKind::Read),
         F_WRLCK => Some(LockKind::Write),
-        _ => return Err(AxError::InvalidInput),
+        _ => return Err(StarryError::InvalidInput),
     };
 
     // Linux: installing a record lock requires the fd to be open for the
@@ -591,11 +947,11 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
     if let Some(k) = kind
         && !fd_supports_kind(&file, k)
     {
-        return Err(AxError::BadFileDescriptor);
+        return Err(StarryError::BadFileDescriptor);
     }
 
     loop {
-        let owner = make_owner(ofd, &file);
+        let owner = make_owner(current, ofd, &file);
         match try_setlk_once(key, owner, start, end, kind) {
             SetlkAttempt::Done { woke_others } => {
                 if woke_others {
@@ -605,7 +961,7 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
             }
             SetlkAttempt::Conflict => {
                 if !wait {
-                    return Err(AxError::WouldBlock);
+                    return Err(StarryError::WouldBlock);
                 }
                 let want = kind.unwrap();
                 let waiting = WaitingLock {
@@ -614,41 +970,37 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
                     end,
                     kind: want,
                 };
-                let waiter_pid = (!ofd).then(current_pid);
+                let waiter = (!ofd).then(|| current_process_identity_id(current));
                 let mut wait_guard = None;
                 let mut deadlock = false;
 
                 // Park on the inode's wait queue. The condition re-checks
-                // conflict while holding only the wq mutex (which itself
-                // takes FCNTL_LOCKS internally) so there is no chance of
+                // conflict while holding the wq mutex so there is no chance of
                 // missing a wakeup that lands between our outer attempt
                 // and the sleep. POSIX waiters are registered only after
                 // this re-check says they will really sleep, avoiding stale
                 // graph edges for conflicts that already cleared.
                 let wq = lock_waiters(key);
-                wq.wait_if(!0u32, None, || {
-                    let owner = make_owner(ofd, &file);
-                    if let Some(pid) = waiter_pid {
-                        match PosixLockWaitGuard::try_new(pid, waiting, &owner) {
+                wq.wait_if(current, !0u32, None, || {
+                    let owner = make_owner(current, ofd, &file);
+                    if let Some(waiter) = waiter {
+                        match PosixLockWaitGuard::try_new(waiter, waiting, &owner) {
                             Ok(Some(guard)) => wait_guard = Some(guard),
                             Ok(None) => return false,
-                            Err(LinuxError::EDEADLK) => {
+                            Err(Errno::EDEADLK) => {
                                 deadlock = true;
                                 return false;
                             }
                             Err(_) => unreachable!("try_new only reports EDEADLK"),
                         }
                     } else {
-                        let mut table = FCNTL_LOCKS.write();
-                        let Some(entries) = table.get_mut(&key) else {
+                        let Some(state) = existing_fcntl_state(key) else {
                             return false;
                         };
+                        let mut entries = state.write();
                         entries.retain(|e| !e.owner.is_dead());
                         let still_blocked =
-                            find_conflict(entries, &owner, start, end, want).is_some();
-                        if entries.is_empty() {
-                            table.remove(&key);
-                        }
+                            find_conflict(&mut entries, &owner, start, end, want).is_some();
                         if !still_blocked {
                             return false;
                         }
@@ -657,7 +1009,7 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
                 })?;
                 drop(wait_guard);
                 if deadlock {
-                    return Err(AxError::from(LinuxError::EDEADLK));
+                    return Err(StarryError::from(Errno::EDEADLK));
                 }
                 // Loop and retry.
             }
@@ -668,16 +1020,24 @@ pub fn fcntl_setlk(fd: c_int, arg: usize, ofd: bool, wait: bool) -> AxResult<isi
 /// Common impl for `F_GETLK` (POSIX) and `F_OFD_GETLK` (OFD). Reports the
 /// first conflicting lock, or sets `l_type = F_UNLCK` if the requested
 /// range is free.
-pub fn fcntl_getlk(fd: c_int, arg: usize, ofd: bool) -> AxResult<isize> {
-    let fl = UserPtr::<flock64>::from(arg).get_as_mut()?;
+pub fn fcntl_getlk(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    arg: usize,
+    ofd: bool,
+) -> crate::StarryResult<isize> {
+    let user_fl = UserPtr::<flock64>::from(arg);
+    // SAFETY: `flock64` contains only integer ABI fields, so every copied bit
+    // pattern is a valid Rust value before semantic validation below.
+    let mut fl = unsafe { user_fl.read_abi(current)? };
     // POSIX.1-2024 / Linux: F_OFD_GETLK requires l_pid to be 0.
     if ofd && fl.l_pid != 0 {
-        return Err(AxError::InvalidInput);
+        return Err(StarryError::InvalidInput);
     }
     let req_kind = match fl.l_type as u32 {
         F_RDLCK => LockKind::Read,
         F_WRLCK => LockKind::Write,
-        _ => return Err(AxError::InvalidInput),
+        _ => return Err(StarryError::InvalidInput),
     };
     let (key, file) = lockable(fd)?;
     let abs_start = resolve_l_start(&file, fl.l_whence, fl.l_start)?;
@@ -689,31 +1049,71 @@ pub fn fcntl_getlk(fd: c_int, arg: usize, ofd: bool) -> AxResult<isize> {
             weak: Arc::downgrade(&file),
         }
     } else {
-        FOwner::Posix { pid: current_pid() }
+        FOwner::Posix {
+            owner: current_process_pid_snapshot(current),
+        }
     };
 
-    let mut table = FCNTL_LOCKS.write();
-    let (report, empty_after) = {
-        let entries = table.entry(key).or_default();
-        let report = find_conflict(entries, &requester, start, end, req_kind).map(|e| {
-            (
-                e.kind,
-                e.owner.report_pid(),
-                e.start,
-                if e.end == i64::MAX {
-                    0
-                } else {
-                    e.end - e.start
-                },
-            )
-        });
-        (report, entries.is_empty())
-    };
-    if empty_after {
-        table.remove(&key);
-    }
+    let observer = current.as_thread().active_pid_namespace().id();
 
-    if let Some((kind, pid, l_start, l_len)) = report {
+    let report = {
+        existing_fcntl_state(key).and_then(|state| {
+            #[cfg(feature = "qperf-metrics")]
+            let requested = ax_runtime::hal::time::monotonic_time();
+            let entries = state.read();
+            #[cfg(feature = "qperf-metrics")]
+            let acquired = ax_runtime::hal::time::monotonic_time();
+            let mut stale = false;
+            let mut report = None;
+            for entry in entries.iter() {
+                if entry.owner.is_dead() {
+                    stale = true;
+                    continue;
+                }
+                if report.is_none()
+                    && !entry.owner.same_as(&requester)
+                    && ranges_overlap(entry.start, entry.end, start, end)
+                    && kinds_conflict(entry.kind, req_kind)
+                {
+                    report = Some((
+                        entry.kind,
+                        entry.owner.report_pid(observer),
+                        entry.start,
+                        if entry.end == i64::MAX {
+                            0
+                        } else {
+                            entry.end - entry.start
+                        },
+                    ));
+                }
+            }
+            drop(entries);
+            #[cfg(feature = "qperf-metrics")]
+            metrics::GETLK.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+            if stale {
+                #[cfg(feature = "qperf-metrics")]
+                let requested = ax_runtime::hal::time::monotonic_time();
+                let mut entries = state.write();
+                #[cfg(feature = "qperf-metrics")]
+                let acquired = ax_runtime::hal::time::monotonic_time();
+                entries.retain(|entry| !entry.owner.is_dead());
+                let empty = entries.is_empty();
+                drop(entries);
+                #[cfg(feature = "qperf-metrics")]
+                metrics::GETLK_CLEANUP.record(
+                    requested,
+                    acquired,
+                    ax_runtime::hal::time::monotonic_time(),
+                );
+                if empty {
+                    reap_fcntl_state(key, &state);
+                }
+            }
+            report
+        })
+    };
+
+    if let Some((kind, owner, l_start, l_len)) = report {
         fl.l_type = (if kind == LockKind::Read {
             F_RDLCK
         } else {
@@ -722,25 +1122,47 @@ pub fn fcntl_getlk(fd: c_int, arg: usize, ofd: bool) -> AxResult<isize> {
         fl.l_whence = SEEK_SET as i16;
         fl.l_start = l_start;
         fl.l_len = l_len;
-        fl.l_pid = pid;
+        fl.l_pid = owner;
     } else {
         fl.l_type = F_UNLCK as i16;
     }
+    write_flock64_outputs(current, user_fl, &fl)?;
     Ok(0)
+}
+
+fn write_flock64_outputs(
+    current: &crate::task::UserTaskRef,
+    user_fl: UserPtr<flock64>,
+    fl: &flock64,
+) -> crate::StarryResult<()> {
+    let base = user_fl.address().as_usize();
+    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_type))
+        .write(current, fl.l_type)?;
+    UserPtr::<i16>::from(base + core::mem::offset_of!(flock64, l_whence))
+        .write(current, fl.l_whence)?;
+    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_start))
+        .write(current, fl.l_start)?;
+    UserPtr::<i64>::from(base + core::mem::offset_of!(flock64, l_len)).write(current, fl.l_len)?;
+    UserPtr::<i32>::from(base + core::mem::offset_of!(flock64, l_pid)).write(current, fl.l_pid)
 }
 
 /// Top-level dispatch from `sys_fcntl`. Returns `Some(result)` if `cmd`
 /// is one of the lock commands; otherwise `None` so the caller can fall
 /// through to other fcntl handling.
-pub fn dispatch_fcntl(fd: c_int, cmd: c_int, arg: usize) -> Option<AxResult<isize>> {
+pub fn dispatch_fcntl(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    cmd: c_int,
+    arg: usize,
+) -> Option<crate::StarryResult<isize>> {
     let cmd = cmd as u32;
     Some(match cmd {
-        F_SETLK => fcntl_setlk(fd, arg, false, false),
-        F_SETLKW => fcntl_setlk(fd, arg, false, true),
-        F_OFD_SETLK => fcntl_setlk(fd, arg, true, false),
-        F_OFD_SETLKW => fcntl_setlk(fd, arg, true, true),
-        F_GETLK => fcntl_getlk(fd, arg, false),
-        F_OFD_GETLK => fcntl_getlk(fd, arg, true),
+        F_SETLK => fcntl_setlk(current, fd, arg, false, false),
+        F_SETLKW => fcntl_setlk(current, fd, arg, false, true),
+        F_OFD_SETLK => fcntl_setlk(current, fd, arg, true, false),
+        F_OFD_SETLKW => fcntl_setlk(current, fd, arg, true, true),
+        F_GETLK => fcntl_getlk(current, fd, arg, false),
+        F_OFD_GETLK => fcntl_getlk(current, fd, arg, true),
         _ => return None,
     })
 }
@@ -751,23 +1173,36 @@ pub fn dispatch_fcntl(fd: c_int, cmd: c_int, arg: usize) -> Option<AxResult<isiz
 /// `FCNTL_LOCKS`. OFD entries are untouched: their owner is the open
 /// file description, which is already cleaned up by `close_all_fds`
 /// dropping the underlying `Arc<dyn FileLike>`.
-pub fn release_pid_locks(pid: Pid) {
+pub fn release_pid_locks(owner: PidIdentityId) {
     let mut affected: Vec<InodeKey> = Vec::new();
     {
-        let mut table = FCNTL_LOCKS.write();
-        table.retain(|inode, entries| {
+        let _graph = POSIX_LOCK_GRAPH.read();
+        let states: Vec<_> = {
+            let index = FCNTL_LOCKS.read();
+            index
+                .states
+                .keys()
+                .filter_map(|key| index.pin(*key, &FCNTL_LOCKS).map(|pin| (*key, pin)))
+                .collect()
+        };
+        for (inode, state) in states {
+            let mut entries = state.write();
             let before = entries.len();
             entries.retain(|e| match &e.owner {
-                FOwner::Posix { pid: p } => *p != pid,
+                FOwner::Posix { owner: candidate } => candidate.identity_id() != owner,
                 FOwner::Ofd { .. } => true,
             });
             if entries.len() != before {
-                affected.push(*inode);
+                affected.push(inode);
             }
-            !entries.is_empty()
-        });
+            let empty = entries.is_empty();
+            drop(entries);
+            if empty {
+                reap_fcntl_state(inode, &state);
+            }
+        }
     }
-    // Wake outside the table-lock critical section to keep lock order.
+    // Wake outside the graph and inode critical sections to keep lock order.
     for key in affected {
         wake_lock_waiters(key);
     }
@@ -783,20 +1218,23 @@ pub fn release_pid_locks(pid: Pid) {
 /// OFD entries are owned by the open file description, not the pid, so
 /// they are deliberately left in place — they age out via
 /// `Weak::strong_count` once the underlying `Arc<dyn FileLike>` is gone.
-pub fn release_inode_posix_locks(pid: Pid, key: (u64, u64)) {
+pub fn release_inode_posix_locks(owner: PidIdentityId, key: InodeKey) {
     let woke_someone = {
-        let mut table = FCNTL_LOCKS.write();
-        let Some(entries) = table.get_mut(&key) else {
+        let _graph = POSIX_LOCK_GRAPH.read();
+        let Some(state) = existing_fcntl_state(key) else {
             return;
         };
+        let mut entries = state.write();
         let before = entries.len();
         entries.retain(|e| match &e.owner {
-            FOwner::Posix { pid: p } => *p != pid,
+            FOwner::Posix { owner: candidate } => candidate.identity_id() != owner,
             FOwner::Ofd { .. } => true,
         });
         let changed = entries.len() != before;
-        if entries.is_empty() {
-            table.remove(&key);
+        let empty = entries.is_empty();
+        drop(entries);
+        if empty {
+            reap_fcntl_state(key, &state);
         }
         changed
     };
@@ -825,13 +1263,24 @@ enum FlockAttempt {
 /// held if the only remaining `Arc` reference to the file is the one backing
 /// the `Weak` inside the entry itself.
 fn try_flock_once(
+    current: &crate::task::UserTaskRef,
     key: InodeKey,
     addr: OfdAddr,
     file: &Arc<dyn FileLike>,
     kind: Option<LockKind>,
 ) -> (FlockAttempt, bool) {
-    let mut table = FLOCK_LOCKS.write();
-    let entries = table.entry(key).or_default();
+    let state = if kind.is_some() {
+        flock_state(key)
+    } else if let Some(state) = existing_flock_state(key) {
+        state
+    } else {
+        return (FlockAttempt::Done, false);
+    };
+    #[cfg(feature = "qperf-metrics")]
+    let requested = ax_runtime::hal::time::monotonic_time();
+    let mut entries = state.write();
+    #[cfg(feature = "qperf-metrics")]
+    let acquired = ax_runtime::hal::time::monotonic_time();
     let before = entries.len();
     entries.retain(|e| e.weak.strong_count() != 0);
 
@@ -841,8 +1290,8 @@ fn try_flock_once(
     // Cross-pid entries are NOT pruned — only the owning pid can declare
     // its own entry stale, to avoid a racy process freeing another
     // process's still-valid lock.
-    let pid = current_pid();
-    entries.retain(|e| !(e.owner_pid == pid && e.weak.strong_count() < 1));
+    let owner = current_process_identity_id(current);
+    entries.retain(|entry| !(entry.owner == owner && entry.weak.strong_count() < 1));
     let outcome = match kind {
         None => {
             // LOCK_UN: drop any entry held by this OFD.
@@ -864,15 +1313,19 @@ fn try_flock_once(
                     addr,
                     weak: Arc::downgrade(file),
                     kind: want,
-                    owner_pid: current_pid(),
+                    owner: current_process_identity_id(current),
                 });
                 FlockAttempt::Done
             }
         }
     };
     let mutated = entries.len() != before;
-    if entries.is_empty() {
-        table.remove(&key);
+    let empty = entries.is_empty();
+    drop(entries);
+    #[cfg(feature = "qperf-metrics")]
+    metrics::FLOCK.record(requested, acquired, ax_runtime::hal::time::monotonic_time());
+    if empty {
+        reap_flock_state(key, &state);
     }
     (outcome, mutated)
 }
@@ -886,15 +1339,17 @@ fn try_flock_once(
 pub fn release_flock_lock(key: InodeKey, file: &Arc<dyn FileLike>) {
     let addr = ofd_addr(file);
     let mutated = {
-        let mut table = FLOCK_LOCKS.write();
-        let Some(entries) = table.get_mut(&key) else {
+        let Some(state) = existing_flock_state(key) else {
             return;
         };
+        let mut entries = state.write();
         let before = entries.len();
         entries.retain(|e| e.addr != addr);
         let changed = entries.len() != before;
-        if entries.is_empty() {
-            table.remove(&key);
+        let empty = entries.is_empty();
+        drop(entries);
+        if empty {
+            reap_flock_state(key, &state);
         }
         changed
     };
@@ -908,18 +1363,30 @@ pub fn release_flock_lock(key: InodeKey, file: &Arc<dyn FileLike>) {
 /// A process that exits without explicit `LOCK_UN` must not leave its flock
 /// entries pinned in [`FLOCK_LOCKS`], because those entries would block
 /// future lock attempts by other processes (or by the same pid reused).
-pub fn release_pid_flock_locks(pid: Pid) {
+pub fn release_pid_flock_locks(owner: PidIdentityId) {
     let mut affected: Vec<InodeKey> = Vec::new();
     {
-        let mut table = FLOCK_LOCKS.write();
-        table.retain(|inode, entries| {
+        let states: Vec<_> = {
+            let index = FLOCK_LOCKS.read();
+            index
+                .states
+                .keys()
+                .filter_map(|key| index.pin(*key, &FLOCK_LOCKS).map(|pin| (*key, pin)))
+                .collect()
+        };
+        for (inode, state) in states {
+            let mut entries = state.write();
             let before = entries.len();
-            entries.retain(|e| e.owner_pid != pid);
+            entries.retain(|entry| entry.owner != owner);
             if entries.len() != before {
-                affected.push(*inode);
+                affected.push(inode);
             }
-            !entries.is_empty()
-        });
+            let empty = entries.is_empty();
+            drop(entries);
+            if empty {
+                reap_flock_state(inode, &state);
+            }
+        }
     }
     for key in affected {
         wake_flock_waiters(key);
@@ -931,21 +1398,25 @@ pub fn release_pid_flock_locks(pid: Pid) {
 /// on the per-inode flock wait queue until the conflict clears or a signal
 /// arrives (returning `EINTR`). With `LOCK_NB`, conflicts return
 /// `EWOULDBLOCK` immediately.
-pub fn flock_op(fd: c_int, operation: c_int) -> AxResult<isize> {
+pub fn flock_op(
+    current: &crate::task::UserTaskRef,
+    fd: c_int,
+    operation: c_int,
+) -> crate::StarryResult<isize> {
     let op = operation as u32;
     let nonblock = op & LOCK_NB != 0;
     let kind = match op & !LOCK_NB {
         LOCK_SH => Some(LockKind::Read),
         LOCK_EX => Some(LockKind::Write),
         LOCK_UN => None,
-        _ => return Err(AxError::InvalidInput),
+        _ => return Err(StarryError::InvalidInput),
     };
 
     let (key, file) = lockable(fd)?;
     let addr = ofd_addr(&file);
 
     loop {
-        let (outcome, mutated) = try_flock_once(key, addr, &file, kind);
+        let (outcome, mutated) = try_flock_once(current, key, addr, &file, kind);
         if mutated {
             wake_flock_waiters(key);
         }
@@ -953,7 +1424,7 @@ pub fn flock_op(fd: c_int, operation: c_int) -> AxResult<isize> {
             FlockAttempt::Done => return Ok(0),
             FlockAttempt::Conflict => {
                 if nonblock {
-                    return Err(AxError::WouldBlock);
+                    return Err(StarryError::WouldBlock);
                 }
                 // Park on the inode's flock wait queue. Condition re-checks
                 // conflict from inside the wq mutex (which itself takes
@@ -961,11 +1432,11 @@ pub fn flock_op(fd: c_int, operation: c_int) -> AxResult<isize> {
                 // attempt and the sleep is not lost.
                 let want = kind.unwrap();
                 let wq = flock_waiters(key);
-                wq.wait_if(!0u32, None, || {
-                    let table = FLOCK_LOCKS.read();
-                    let Some(entries) = table.get(&key) else {
+                wq.wait_if(current, !0u32, None, || {
+                    let Some(state) = existing_flock_state(key) else {
                         return false;
                     };
+                    let entries = state.read();
                     entries.iter().any(|e| {
                         e.weak.strong_count() != 0 && e.addr != addr && kinds_conflict(e.kind, want)
                     })
@@ -973,5 +1444,99 @@ pub fn flock_op(fd: c_int, operation: c_int) -> AxResult<isize> {
                 // Loop and retry.
             }
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "none")))]
+mod tests {
+    use alloc::sync::Arc;
+
+    use loom::{
+        sync::{
+            Arc as LoomArc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
+
+    use super::{DEFERRED_REAP_BIT, LockIndex, LockState, PIN_UNIT, RawSpinRwLock};
+
+    #[test]
+    fn deferred_reap_and_last_pin_cannot_both_miss() {
+        loom::model(|| {
+            let pin_state = LoomArc::new(AtomicUsize::new(PIN_UNIT));
+            let scanner = {
+                let pin_state = pin_state.clone();
+                thread::spawn(move || {
+                    let previous = pin_state.fetch_or(DEFERRED_REAP_BIT, Ordering::AcqRel);
+                    previous & !DEFERRED_REAP_BIT == 0
+                })
+            };
+            let last_pin = thread::spawn(move || {
+                let previous = pin_state.fetch_sub(PIN_UNIT, Ordering::AcqRel);
+                previous == (PIN_UNIT | DEFERRED_REAP_BIT)
+            });
+
+            let scanner_reaped = scanner.join().unwrap();
+            let last_pin_reaped = last_pin.join().unwrap();
+            assert!(
+                scanner_reaped || last_pin_reaped,
+                "empty state was not reaped after its last pin was released"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_empty_state_reclaims_after_last_pin_without_new_inode() {
+        for (idle_limit, records) in [(1, 32), (0, 0)] {
+            let index = RawSpinRwLock::new(LockIndex::<u64, u8>::new(idle_limit, 8));
+            let state = Arc::new(LockState::new());
+            state.entries.write().extend(0..records);
+            index.write().states.insert(7, state);
+
+            let first = index.read().pin(7, &index).unwrap();
+            let last = index.read().pin(7, &index).unwrap();
+            first.write().clear();
+            index.write().reap_empty(7, &first);
+            assert!(index.read().states.contains_key(&7));
+
+            drop(first);
+            assert!(index.read().states.contains_key(&7));
+            drop(last);
+            assert!(!index.read().states.contains_key(&7));
+        }
+
+        let index = RawSpinRwLock::new(LockIndex::<u64, u8>::new(1, 8));
+        index.write().states.insert(7, Arc::new(LockState::new()));
+        let cached = index.read().pin(7, &index).unwrap();
+        index.write().reap_empty(7, &cached);
+
+        index.write().states.insert(8, Arc::new(LockState::new()));
+        let next = index.read().pin(8, &index).unwrap();
+        index.write().reap_empty(8, &next);
+        assert!(index.read().states.contains_key(&7));
+
+        drop(cached);
+        assert!(!index.read().states.contains_key(&7));
+        drop(next);
+    }
+
+    #[test]
+    fn reactivated_deferred_state_keeps_its_records() {
+        let index = RawSpinRwLock::new(LockIndex::<u64, u8>::new(1, 8));
+        let state = Arc::new(LockState::new());
+        state.entries.write().extend(0..32);
+        index.write().states.insert(7, state);
+
+        let first = index.read().pin(7, &index).unwrap();
+        let last = index.read().pin(7, &index).unwrap();
+        first.write().clear();
+        index.write().reap_empty(7, &first);
+        last.write().push(42);
+        drop(first);
+        drop(last);
+
+        let active = index.read().pin(7, &index).unwrap();
+        assert_eq!(active.read().as_slice(), &[42]);
     }
 }

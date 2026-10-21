@@ -25,6 +25,7 @@ pub(crate) struct StarryBoardTestGroup {
     pub(crate) target: String,
     pub(crate) build_config_path: PathBuf,
     pub(crate) board_test_config_path: PathBuf,
+    pub(crate) required_env: Vec<String>,
 }
 
 impl board_test::BoardTestGroupInfo for StarryBoardTestGroup {
@@ -67,6 +68,7 @@ pub(crate) struct PreparedStarryQemuCase {
     pub(crate) build_config_path: PathBuf,
     pub(crate) rootfs_path: PathBuf,
     pub(crate) requirements: StarryQemuCaseRequirements,
+    pub(crate) diskless_host_initramfs: bool,
 }
 
 impl qemu_test::BuildConfigRef for PreparedStarryQemuCase {

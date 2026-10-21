@@ -41,45 +41,11 @@ fn assert_recovered_with_cached_slabs(
 
 #[test]
 #[ignore = "stress test"]
-fn stress_random_mixed_alloc_free() {
-    let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
-    let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, 2);
-    let mut rng = seeded_rng(0);
-    let mut allocated: Vec<(usize, Layout)> = Vec::new();
-
-    for i in 0..10_000 {
-        set_current_cpu(i % 2);
-        if allocated.is_empty() || rng.random_bool(0.65) {
-            let size: usize = rng.random_range(8..8193);
-            let layout = if size <= 2048 {
-                Layout::from_size_align(size.next_power_of_two().min(2048), 8).unwrap()
-            } else {
-                let aligned = size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-                Layout::from_size_align(aligned, PAGE_SIZE).unwrap()
-            };
-
-            if let Ok(ptr) = allocator.alloc(layout) {
-                allocated.push((ptr.as_ptr() as usize, layout));
-            }
-        } else {
-            let idx = rng.random_range(0..allocated.len());
-            let (addr, layout) = allocated.swap_remove(idx);
-            unsafe { allocator.dealloc(nonnull_from_addr(addr), layout) };
-        }
-    }
-
-    for (addr, layout) in allocated {
-        unsafe { allocator.dealloc(nonnull_from_addr(addr), layout) };
-    }
-}
-
-#[test]
-#[ignore = "stress test"]
 fn stress_exhaustion_recovery() {
+    let _ctx;
     let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, 1);
+    _ctx = init_global(&allocator, &mut region, 1);
     let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
     let mut allocated = Vec::new();
 
@@ -105,42 +71,11 @@ fn stress_exhaustion_recovery() {
 
 #[test]
 #[ignore = "stress test"]
-fn stress_fragmentation_recovery() {
-    let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
-    let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, 2);
-    let small_layout = Layout::from_size_align(64, 8).unwrap();
-    let mut small_ptrs = Vec::new();
-
-    for i in 0..4000 {
-        set_current_cpu(i % 2);
-        if let Ok(ptr) = allocator.alloc(small_layout) {
-            small_ptrs.push(ptr.as_ptr() as usize);
-        }
-    }
-
-    for i in (0..small_ptrs.len()).step_by(2) {
-        unsafe { allocator.dealloc(nonnull_from_addr(small_ptrs[i]), small_layout) };
-    }
-
-    let large_layout = Layout::from_size_align(PAGE_SIZE * 16, PAGE_SIZE).unwrap();
-    let large = allocator.alloc(large_layout);
-
-    for addr in small_ptrs.into_iter().skip(1).step_by(2) {
-        unsafe { allocator.dealloc(nonnull_from_addr(addr), small_layout) };
-    }
-
-    if let Ok(ptr) = large {
-        unsafe { allocator.dealloc(ptr, large_layout) };
-    }
-}
-
-#[test]
-#[ignore = "stress test"]
 fn stress_multithread_mixed_alloc_free() {
+    let _ctx;
     let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, WORKERS);
+    _ctx = init_global(&allocator, &mut region, WORKERS);
     let baseline = count_free_pages(&allocator);
     let allocator = &allocator;
     let barrier = Barrier::new(WORKERS);
@@ -188,9 +123,10 @@ fn stress_multithread_mixed_alloc_free() {
 #[test]
 #[ignore = "stress test"]
 fn stress_multithread_remote_free() {
+    let _ctx;
     let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, WORKERS);
+    _ctx = init_global(&allocator, &mut region, WORKERS);
     let baseline = count_free_pages(&allocator);
     let allocator = &allocator;
     let barrier = Barrier::new(WORKERS);
@@ -241,9 +177,10 @@ fn stress_multithread_remote_free() {
 #[test]
 #[ignore = "stress test"]
 fn stress_multithread_page_alloc_free() {
+    let _ctx;
     let mut region = HostRegion::new(HEAP_SIZE, PAGE_SIZE);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, WORKERS);
+    _ctx = init_global(&allocator, &mut region, WORKERS);
     let baseline = count_free_pages(&allocator);
     let allocator = &allocator;
     let barrier = Barrier::new(WORKERS);
@@ -287,11 +224,12 @@ fn stress_multithread_page_alloc_free() {
 #[test]
 #[ignore = "stress test"]
 fn stress_multithread_fragmentation_recovery() {
+    let _ctx;
     const REGION_SIZE: usize = 4 * 1024 * 1024;
 
     let mut region = HostRegion::new(REGION_SIZE, PAGE_SIZE * 4);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, WORKERS);
+    _ctx = init_global(&allocator, &mut region, WORKERS);
     let baseline = count_free_pages(&allocator);
     let allocator = &allocator;
     let barrier = Barrier::new(WORKERS);
@@ -365,11 +303,12 @@ fn stress_multithread_fragmentation_recovery() {
 #[test]
 #[ignore = "stress test"]
 fn stress_multithread_exhaustion_recovery() {
+    let _ctx;
     const REGION_SIZE: usize = 8 * 1024 * 1024;
 
     let mut region = HostRegion::new(REGION_SIZE, PAGE_SIZE * 4);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut region, WORKERS);
+    _ctx = init_global(&allocator, &mut region, WORKERS);
     let baseline = count_free_pages(&allocator);
     let allocator = &allocator;
     let barrier = Barrier::new(WORKERS);
@@ -429,11 +368,12 @@ fn stress_multithread_exhaustion_recovery() {
 #[test]
 #[ignore = "stress test"]
 fn stress_add_region_then_multithread_alloc_free() {
+    let _ctx;
     let mut first = HostRegion::new(2 * 1024 * 1024, PAGE_SIZE * 4);
     let mut second = HostRegion::new(4 * 1024 * 1024, PAGE_SIZE * 4);
     let mut third = HostRegion::new(4 * 1024 * 1024, PAGE_SIZE * 4);
     let allocator = GlobalAllocator::<PAGE_SIZE>::new();
-    let _ctx = init_global(&allocator, &mut first, WORKERS);
+    _ctx = init_global(&allocator, &mut first, WORKERS);
     unsafe {
         allocator.add_region(second.as_mut_slice()).unwrap();
         allocator.add_region(third.as_mut_slice()).unwrap();

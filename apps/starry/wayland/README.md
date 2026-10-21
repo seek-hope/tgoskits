@@ -59,7 +59,7 @@ The automated test exercises these kernel paths:
 
 ## Manual Reproduction with VNC
 
-The manual flow intentionally avoids the app test's `shell_init_cmd`; it boots
+The manual flow intentionally avoids the app test's `shell_cmd`; it boots
 the same kernel and Alpine rootfs directly so you can type commands at the
 StarryOS shell and interact with GTK through VNC. The guest-side Weston and GTK
 commands are the same for the direct riscv64 and x86_64 flows. Only the
@@ -86,7 +86,7 @@ rootfs used by the app runner.
 
 ```bash
 mkdir -p tmp/wayland-manual
-cp "tmp/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
+cp "target/axbuild/rootfs/rootfs-${ARCH}-alpine.img" "tmp/wayland-manual/${ARCH}.img"
 ```
 
 ### Step 3: Start QEMU with a VNC Display
@@ -114,7 +114,7 @@ qemu-system-riscv64 \
   -device virtio-gpu-pci \
   -device virtio-keyboard-pci \
   -device virtio-mouse-pci \
-  -device virtio-blk-pci,drive=disk0 \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
   -drive id=disk0,if=none,format=raw,file=tmp/wayland-manual/riscv64.img
 ```
 
@@ -133,7 +133,7 @@ args = [
   "-device", "virtio-gpu-pci",
   "-device", "virtio-keyboard-pci",
   "-device", "virtio-mouse-pci",
-  "-device", "virtio-blk-pci,drive=disk0",
+  "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/wayland-manual/x86_64.img",
 ]
 uefi = true
@@ -286,7 +286,7 @@ STARRY_VNC=9 ./apps/starry/wayland/run-hvf.sh --no-build --vnc-only
 ```
 
 Use `--reprovision` to discard and recreate
-`tmp/axbuild/rootfs/rootfs-aarch64-wayland.img`. Set
+`target/axbuild/rootfs/rootfs-aarch64-wayland.img`. Set
 `STARRY_WAYLAND_ROOTFS_MB` if the default 4096 MiB manual image is not suitable.
 The helper requires host `debugfs`, `e2fsck`, `resize2fs`, `python3`, and
 `qemu-system-aarch64`; on macOS with Homebrew, the script adds the usual
@@ -307,7 +307,7 @@ This app requires:
 - `memfd_create` and file-descriptor passing over Unix sockets for Wayland SHM.
 - `eventfd` for the compositor event loop.
 - udev seed data under `/run/udev/data/` for libinput device discovery.
-- `starry-kernel/input` and `ax-runtime/display` in the app build config.
+- `ax-runtime/display` in the app build config.
 
 The optional manual package-install flow additionally needs a kernel/QEMU launch
 with working guest networking if the packages are not already present in the

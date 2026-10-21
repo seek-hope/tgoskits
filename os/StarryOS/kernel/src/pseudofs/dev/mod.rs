@@ -1,67 +1,81 @@
 //! Special devices
 
-mod card0;
+mod axivc;
+pub(crate) mod card0;
 #[cfg(feature = "rknpu")]
-mod card1;
-// The real contiguous coherent dma-heap is shared by every accelerator that
-// exchanges buffers (JPU / NPU; RGA when its node lands).
-#[cfg(any(feature = "jpeg", feature = "rknpu"))]
+pub(crate) mod card1;
+// The coherent dma-heap is shared by GPUs and other DMA devices.
 mod dmaheap;
 mod drm;
-#[cfg(feature = "input")]
+mod vblank;
 pub mod event;
 mod fb;
+#[cfg(feature = "sg2002")]
+pub mod ion;
+mod irq_service;
 mod kmsg;
 #[cfg(feature = "k230-kpu")]
 mod kpu;
 #[cfg(feature = "dev-log")]
 mod log;
-mod r#loop;
-#[cfg(feature = "ext4")]
-mod loop_block;
-#[cfg(feature = "jpeg")]
-mod mpp_service;
-#[cfg(feature = "ext4")]
-pub use r#loop::LoopDevice;
-#[cfg(feature = "sg2002")]
-pub mod ion;
+pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
+#[cfg(feature = "jpeg")]
+mod mpp_service;
+mod net;
 #[cfg(feature = "sg2002")]
 mod pinmux;
-#[cfg(any(feature = "sg2002", feature = "rk3588-pwm"))]
 pub(super) mod pwm;
+#[cfg(feature = "rga")]
+pub(crate) mod rga;
 mod rtc;
+mod sync_file;
 #[cfg(feature = "sg2002")]
 pub mod tpu;
 pub mod tty;
 
 #[cfg(feature = "sg2002-cvi-usb-camera")]
+mod cvi_jpu;
+
+#[cfg(feature = "sg2002-cvi-usb-camera")]
 mod cvi_usb_camera;
 
-use alloc::{format, sync::Arc};
+#[cfg(feature = "sg2002-cvi-usb-camera")]
+mod cvi_vdec;
+#[cfg(feature = "uvc")]
+mod uvc_camera;
+#[cfg(feature = "uvc")]
+pub(crate) mod video;
+#[cfg(feature = "uvc")]
+mod video_allocator;
+#[cfg(feature = "uvc")]
+mod video_dir;
+
+use alloc::{format, string::ToString, sync::Arc};
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ax_errno::AxError;
-use ax_sync::Mutex;
-use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
-#[cfg(feature = "sg2002")]
-use spin::Once;
+use ax_lazyinit::OnceLock;
+use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsError, VfsResult};
+
+use crate::sync::Mutex;
 
 #[cfg(feature = "sg2002")]
-pub static ION_DEVICE: Once<Arc<ion::IonDevice>> = Once::new();
+pub static ION_DEVICE: OnceLock<Arc<ion::IonDevice>> = OnceLock::new();
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::ChaCha20Rng};
 
-use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
+use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFile, SimpleFs};
 
 const RANDOM_SEED_STEP: u64 = 0x9e37_79b9_7f4a_7c15;
 
 static RANDOM_SEED_COUNTER: AtomicU64 = AtomicU64::new(0xa076_1d64_78bd_642f);
+
+static INITIAL_PTS_INSTANCE: OnceLock<Arc<tty::PtsInstance>> = OnceLock::new();
 
 #[cfg(any(feature = "sg2002", feature = "k230-kpu"))]
 pub(super) struct IrqRegistration {
@@ -100,8 +114,32 @@ pub(super) fn request_shared_disabled(
     ax_runtime::hal::irq::request_irq(irq, request).map(IrqRegistration::new)
 }
 
-pub(crate) fn new_devfs() -> Filesystem {
-    SimpleFs::new_with("devfs".into(), 0x01021994, builder)
+pub(crate) fn new_devfs(root_mount_device: u64) -> Filesystem {
+    SimpleFs::new_with("devfs".into(), 0x01021994, move |fs| {
+        builder(fs, root_mount_device)
+    })
+}
+
+pub(crate) fn new_devptsfs(mount: tty::DevPtsMount) -> Filesystem {
+    SimpleFs::new_with("devpts".into(), 0x00001cd1, move |fs| {
+        devpts_builder(fs, mount)
+    })
+}
+
+fn devpts_builder(fs: Arc<SimpleFs>, mount: tty::DevPtsMount) -> DirMaker {
+    let instance = match mount {
+        tty::DevPtsMount::Legacy(options) => initial_pts_instance(options),
+        tty::DevPtsMount::NewInstance(options) => tty::PtsInstance::new(options),
+    };
+    SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir::new(fs, instance)))
+}
+
+fn initial_pts_instance(options: tty::DevPtsOptions) -> Arc<tty::PtsInstance> {
+    let instance = INITIAL_PTS_INSTANCE
+        .call_once(|| tty::PtsInstance::new(options))
+        .clone();
+    instance.update_options(options);
+    instance
 }
 
 struct Null;
@@ -120,7 +158,7 @@ impl DeviceOps for Null {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
+        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM | NodeFlags::BLOCKING
     }
 }
 
@@ -132,13 +170,34 @@ impl DeviceOps for Null {
 /// masquerades as a working disk for `dd`/`blkid`/`fsck`.
 struct RootBlk;
 
-impl DeviceOps for RootBlk {
+/// Mountable physical block device. Raw device I/O is not implemented here.
+pub(crate) struct PhysicalBlock(pub ax_fs_ng::root::BlockDeviceNode);
+
+impl DeviceOps for PhysicalBlock {
+    fn len(&self) -> VfsResult<u64> {
+        Ok(self.0.region.num_blocks() * self.0.handle.device_info().logical_block_size as u64)
+    }
+
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::Io)
+        Err(VfsError::Io)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::Io)
+        Err(VfsError::Io)
+    }
+
+    fn as_any(&self) -> &dyn Any { self }
+
+    fn flags(&self) -> NodeFlags { NodeFlags::NON_CACHEABLE }
+}
+
+impl DeviceOps for RootBlk {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::Io)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        Err(VfsError::Io)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -182,7 +241,7 @@ impl Random {
         }
     }
 
-    #[cfg(any(test, axtest))]
+    #[cfg(all(test, axtest))]
     fn new_with_seed_for_test(seed: [u8; 32]) -> Self {
         Self {
             state: Mutex::new(RandomState::new(seed)),
@@ -208,13 +267,17 @@ impl RandomState {
     }
 
     fn mix_entropy(&mut self, entropy: &[u8]) {
+        self.mix_entropy_at(entropy, time_entropy());
+    }
+
+    fn mix_entropy_at(&mut self, entropy: &[u8], time_entropy: u64) {
         let mut seed = [0; 32];
         self.rng.fill_bytes(&mut seed);
 
         self.reseed_count = self.reseed_count.wrapping_add(1);
         fold_seed_word(&mut seed, entropy.len() as u64);
         fold_seed_word(&mut seed, self.reseed_count);
-        fold_seed_word(&mut seed, time_entropy());
+        fold_seed_word(&mut seed, time_entropy);
 
         for (idx, byte) in entropy.iter().copied().enumerate() {
             let seed_idx = idx % seed.len();
@@ -253,7 +316,7 @@ fn random_seed() -> [u8; 32] {
     let mut state = time_entropy() ^ counter ^ stack_addr.rotate_left(17);
     let mut seed = [0; 32];
 
-    for chunk in seed.chunks_exact_mut(core::mem::size_of::<u64>()) {
+    for chunk in seed.as_chunks_mut::<{ core::mem::size_of::<u64>() }>().0 {
         state = splitmix64(state.wrapping_add(RANDOM_SEED_STEP));
         chunk.copy_from_slice(&state.to_le_bytes());
     }
@@ -279,8 +342,8 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-#[cfg(axtest)]
-pub(crate) fn random_write_mixes_entropy_for_test() -> bool {
+#[cfg(all(test, axtest))]
+fn random_write_mixes_entropy_for_test() -> bool {
     let seed = *b"0123456789abcdef0123456789abcdef";
     let baseline = Random::new_with_seed_for_test(seed);
     let mixed = Random::new_with_seed_for_test(seed);
@@ -305,6 +368,46 @@ pub(crate) fn random_write_mixes_entropy_for_test() -> bool {
     }
 
     baseline_next != mixed_next
+        && splitmix64_determinism_rules_hold()
+        && fold_seed_word_xors_into_byte_indices()
+}
+
+#[cfg(test)]
+fn splitmix64_determinism_rules_hold() -> bool {
+    // splitmix64 is a pure bijection: the same input always yields the same
+    // 64-bit output (deterministic PRNG), and distinct inputs yield distinct
+    // outputs (no fixed-point within a small sample).
+    let a = splitmix64(0);
+    let b = splitmix64(1);
+    let c = splitmix64(0xffff_ffff_ffff_ffff);
+    a == splitmix64(0)
+        && b == splitmix64(1)
+        && c == splitmix64(0xffff_ffff_ffff_ffff)
+        && a != b
+        && b != c
+        && a != c
+}
+
+#[cfg(test)]
+fn fold_seed_word_xors_into_byte_indices() -> bool {
+    // fold_seed_word XORs splitmix64(word) into seed[idx*4 % 32]. Repeatedly
+    // folding the same word twice must cancel out (XOR is its own inverse).
+    let mut seed = [0u8; 32];
+    let snapshot_before = seed;
+    fold_seed_word(&mut seed, 0x1234_5678_9abc_def0);
+    let mutated = seed;
+    // Folding again with the same word must restore the original bytes.
+    fold_seed_word(&mut seed, 0x1234_5678_9abc_def0);
+    let cancelled = seed == snapshot_before;
+    // The mutated seed must be different from the all-zero baseline at least at
+    // one byte (proves fold_seed_word actually wrote something).
+    let mutated_differs_from_zero = mutated.iter().any(|byte| *byte != 0);
+    // Folding word 0 affects byte indices {0, 4, 8, 12, 16, 20, 24, 28}.
+    let affected_indices = [0, 4, 8, 12, 16, 20, 24, 28];
+    let affected_bytes_differ = affected_indices
+        .iter()
+        .any(|&idx| mutated.get(idx).copied() != snapshot_before.get(idx).copied());
+    cancelled && mutated_differs_from_zero && affected_bytes_differ
 }
 
 struct Full;
@@ -316,7 +419,7 @@ impl DeviceOps for Full {
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::StorageFull)
+        Err(VfsError::StorageFull)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -332,7 +435,7 @@ struct CpuDmaLatency;
 
 impl DeviceOps for CpuDmaLatency {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
+        Err(VfsError::InvalidInput)
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
@@ -348,8 +451,18 @@ impl DeviceOps for CpuDmaLatency {
     }
 }
 
-fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+fn builder(fs: Arc<SimpleFs>, root_mount_device: u64) -> DirMaker {
     let mut root = DirMapping::new();
+    let pts_instance = initial_pts_instance(tty::DevPtsOptions::root());
+
+    // Linux environments conventionally expose descriptor paths through
+    // these links into procfs (proc_pid_fd(5)). Bash process substitution and
+    // the generated NixOS stage-2 initializer rely on the dynamic /dev/fd/N
+    // form before systemd can perform any additional /dev setup.
+    root.add("fd", descriptor_symlink(fs.clone(), "/proc/self/fd"));
+    root.add("stdin", descriptor_symlink(fs.clone(), "/proc/self/fd/0"));
+    root.add("stdout", descriptor_symlink(fs.clone(), "/proc/self/fd/1"));
+    root.add("stderr", descriptor_symlink(fs.clone(), "/proc/self/fd/2"));
     root.add(
         "null",
         Device::new(
@@ -398,17 +511,27 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     // Root block device node. Its rdev must equal the root filesystem's st_dev
     // so that tools resolving the root device by scanning /dev (e.g. busybox
     // `rdev`, which stats "/" then looks for a block node with a matching
-    // st_rdev) can find it. The root mount is the first mount, so its
-    // `DEVICE_COUNTER` id is 1 (== `DeviceId::new(0, 1).0`).
+    // `st_rdev`) can find it. Disk roots use their Linux device number; a
+    // memory root keeps the synthetic mount device assigned by the VFS.
+    let block_nodes = ax_fs_ng::root::block_device_nodes()
+        .unwrap_or_else(|error| panic!("failed to discover block device nodes: {error:?}"));
+    let root_name = ax_fs_ng::root::root_block_identity().name;
+    if !block_nodes.iter().any(|node| node.path.strip_prefix("/dev/") == Some(root_name)) {
     root.add(
-        "vda",
+        ax_fs_ng::root::root_block_identity().name,
         Device::new(
             fs.clone(),
             NodeType::BlockDevice,
-            DeviceId::new(0, 1),
+            DeviceId(root_mount_device),
             Arc::new(RootBlk),
         ),
     );
+    }
+    for node in block_nodes {
+        let name = node.path.strip_prefix("/dev/").expect("device path").to_string();
+        let device = node.device;
+        root.add(name, Device::new(fs.clone(), NodeType::BlockDevice, device, Arc::new(PhysicalBlock(node))));
+    }
     if ax_display::has_display() {
         root.add(
             "fb0",
@@ -471,12 +594,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(5, 2),
-            Arc::new(tty::Ptmx(fs.clone())),
+            Arc::new(tty::Ptmx::new(fs.clone(), pts_instance.clone())),
         ),
     );
     root.add(
         "pts",
-        SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir)),
+        SimpleDir::new_maker(
+            fs.clone(),
+            Arc::new(tty::PtsDir::new(fs.clone(), pts_instance)),
+        ),
     );
     #[cfg(feature = "dev-log")]
     root.add(
@@ -525,6 +651,8 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         ),
     );
 
+    axivc::register_devices(&mut root, fs.clone());
+
     #[cfg(feature = "k230-kpu")]
     {
         if let Some(kpu_device) = kpu::KpuDevice::probe().map(Arc::new) {
@@ -566,11 +694,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // /dev/dma_heap — the real contiguous, DMA-coherent allocator that the
-    // accelerators share buffers from (zero-copy across JPU / NPU / RGA). Every
-    // heap name maps to the same allocator. Available under any accelerator
-    // feature, not just `jpeg`.
-    #[cfg(any(feature = "jpeg", feature = "rknpu"))]
-    {
+    // accelerators and GPUs share buffers from. Every heap name maps to the
+    // same allocator. GPU PRIME import also accepts these direct-domain pages.
+    if ax_gpu::has_gpu() || cfg!(any(feature = "jpeg", feature = "rknpu", feature = "rga")) {
         let mut dma_heap_dir = DirMapping::new();
         for name in dmaheap::HEAP_NAMES {
             dma_heap_dir.add(
@@ -594,6 +720,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "shm",
         SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
     );
+    // Mount point for mqueuefs; `mount_all` mounts it at `/dev/mqueue`.
+    root.add(
+        "mqueue",
+        SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
+    );
+    root.add(
+        "net",
+        SimpleDir::new_maker(fs.clone(), Arc::new(net::net_dir(fs.clone()))),
+    );
     {
         let mut bus_dir = DirMapping::new();
         bus_dir.add(
@@ -603,27 +738,37 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         root.add("bus", SimpleDir::new_maker(fs.clone(), Arc::new(bus_dir)));
     }
 
-    // /dev/dri/card0 — simpledrm-class DRM character device. Advertised
-    // unconditionally so libdrm/libudev see the DRM node even before
-    // there's a display device behind it.
-    let dri_card0 = card0::Card0::new();
     let mut dri_dir = DirMapping::new();
-    dri_dir.add(
-        "card0",
+    if ax_gpu::has_gpu() {
+        let dri_card0 = card0::Card0::new();
+        dri_dir.add(
+            "card0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(226, 0),
+                dri_card0.clone(),
+            ),
+        );
+        dri_dir.add(
+            "renderD128",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(226, 128),
+                dri_card0,
+            ),
+        );
+    }
+
+    #[cfg(feature = "rga")]
+    root.add(
+        "rga",
         Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            DeviceId::new(226, 0),
-            dri_card0.clone(),
-        ),
-    );
-    dri_dir.add(
-        "renderD128",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(226, 128),
-            dri_card0,
+            DeviceId::new(252, 16), // CONFIRM ON BOARD: real /dev/rga major/minor
+            Arc::new(rga::RgaDevice::new()),
         ),
     );
 
@@ -659,7 +804,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // Input devices
-    #[cfg(feature = "input")]
     root.add(
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
@@ -699,44 +843,60 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             ),
         );
         #[cfg(feature = "sg2002-cvi-usb-camera")]
-        root.add(
-            "cvi-usb-camera0",
-            Device::new(
-                fs.clone(),
-                NodeType::CharacterDevice,
-                DeviceId::new(10, 202),
-                Arc::new(cvi_usb_camera::CviCamera::new()),
-            ),
-        );
+        {
+            let jpu = Arc::new(cvi_jpu::CviJpu::new());
+            root.add(
+                "cvi-usb-camera0",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(10, 202),
+                    Arc::new(cvi_usb_camera::CviCamera::new(jpu.clone())),
+                ),
+            );
+            root.add(
+                "cvi_vc_dec0",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(10, 203),
+                    Arc::new(cvi_vdec::CviVdec::new(jpu)),
+                ),
+            );
+        }
     }
-    SimpleDir::new_maker(fs, Arc::new(root))
+    #[cfg(feature = "uvc")]
+    {
+        SimpleDir::new_maker(fs.clone(), Arc::new(video_dir::UvcDevRoot::new(root, fs)))
+    }
+
+    #[cfg(not(feature = "uvc"))]
+    {
+        SimpleDir::new_maker(fs, Arc::new(root))
+    }
 }
 
-#[cfg(test)]
+fn descriptor_symlink(fs: Arc<SimpleFs>, target: &'static str) -> Arc<SimpleFile> {
+    SimpleFile::new(fs, NodeType::Symlink, move || Ok(target))
+}
+
+#[cfg(all(test, axtest))]
 mod tests {
-    use super::{DeviceOps, Random};
+    #[axtest::axtest]
+    fn random_write_mixes_entropy() {
+        assert!(super::random_write_mixes_entropy_for_test());
+    }
+}
+
+#[cfg(all(test, not(axtest)))]
+mod host_tests {
+    #[test]
+    fn splitmix64_is_deterministic() {
+        assert!(super::splitmix64_determinism_rules_hold());
+    }
 
     #[test]
-    fn random_write_mixes_entropy_into_stream() {
-        let seed = *b"0123456789abcdef0123456789abcdef";
-        let baseline = Random::new_with_seed_for_test(seed);
-        let mixed = Random::new_with_seed_for_test(seed);
-        let mut discarded = [0; 32];
-        let mut baseline_next = [0; 32];
-        let mut mixed_next = [0; 32];
-
-        assert_eq!(
-            baseline.read_at(&mut discarded, 0).unwrap(),
-            discarded.len()
-        );
-        assert_eq!(mixed.read_at(&mut discarded, 0).unwrap(), discarded.len());
-        assert_eq!(mixed.write_at(b"caller entropy", 0).unwrap(), 14);
-        assert_eq!(
-            baseline.read_at(&mut baseline_next, 0).unwrap(),
-            baseline_next.len()
-        );
-        assert_eq!(mixed.read_at(&mut mixed_next, 0).unwrap(), mixed_next.len());
-
-        assert_ne!(baseline_next, mixed_next);
+    fn fold_seed_word_uses_the_expected_byte_indices() {
+        assert!(super::fold_seed_word_xors_into_byte_indices());
     }
 }

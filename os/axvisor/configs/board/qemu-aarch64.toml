@@ -1,7 +1,11 @@
 features = [
-    "ax-driver/virtio-blk",
-    "fs",
+    "ax-driver/nvme",
+
 ]
 log = "Info"
 target = "aarch64-unknown-none-softfloat"
 vm_configs = []
+
+# Set BACKTRACE=y to retain frame pointers for richer target-side traces.
+# [env]
+# BACKTRACE = "y"

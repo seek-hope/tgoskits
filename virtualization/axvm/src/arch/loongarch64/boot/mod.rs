@@ -1,56 +1,19 @@
+mod acpi;
 mod fdt;
-mod probe;
+mod linux;
+pub(super) mod probe;
 mod resources;
 
-use alloc::{boxed::Box, format, vec::Vec};
+use std::{sync::Arc, vec::Vec};
 
-use axdevice::{
-    FwCfgInterruptConfig, FwCfgPciConfig, FwCfgPlatformConfig, FwCfgRamRegion, FwCfgSerialConfig,
-};
-use axvmconfig::{AxVMCrateConfig, EmulatedDeviceType, VMBootProtocol};
-pub use resources::{
-    LoongArchGuestIrqRoute, get_guest_irq_routes, prepare_uefi_fdt_config,
-    prepare_uefi_runtime_config,
-};
+use axdevice::{FwCfgKernelPayload, FwCfgPlatformConfig, FwCfgRamRegion};
+use axdevice_base::InterruptControllerId;
+use axvmconfig::{GuestConfig, VMBootProtocol};
+pub(crate) use resources::{prepare_direct_fdt_config, prepare_uefi_fdt_config};
 
-use crate::{
-    AxVMRef, AxVmResult, GuestPhysAddr,
-    architecture::BootImagePlatform,
-    ax_err, ax_err_type,
-    boot::{
-        BootImageProvider, StaticVmImage,
-        images::{ImageLoaderCore, load_vm_image_from_memory},
-    },
-};
+use crate::{architecture::*, boot::images::*, *};
 
-pub const UEFI_FIRMWARE_FDT_BASE: usize = 0x0010_0000;
-
-pub struct ImageLoader<'a>(ImageLoaderCore<'a>);
-
-impl<'a> ImageLoader<'a> {
-    pub fn new(
-        main_memory: crate::VMMemoryRegion,
-        config: AxVMCrateConfig,
-        vm: AxVMRef,
-        provider: &'a dyn BootImageProvider,
-    ) -> Self {
-        Self(ImageLoaderCore::new(
-            main_memory,
-            config,
-            vm,
-            provider,
-            None,
-        ))
-    }
-
-    pub fn load(&mut self) -> AxVmResult {
-        self.0.load()
-    }
-}
-
-pub fn init() {
-    resources::init();
-}
+pub(crate) const UEFI_FIRMWARE_FDT_BASE: usize = 0x0010_0000;
 
 #[derive(Clone, Debug)]
 pub struct GuestPlatform {
@@ -60,7 +23,8 @@ pub struct GuestPlatform {
     pub interrupt: InterruptTopology,
     pub fw_cfg: MmioRegion,
     pub firmware_devices: FirmwareDevices,
-    pub irq_routes: Vec<probe::GuestIrqRoute>,
+    pub(crate) configured_fdt_devices: Vec<crate::boot::fdt::device::ResolvedFdtDevice>,
+    pub(crate) configured_acpi_devices: Vec<crate::boot::acpi::ResolvedAcpiDevice>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +45,8 @@ pub struct SerialDevice {
     pub irq: u32,
     pub clock_hz: u32,
     pub baud: u32,
+    pub register_shift: u8,
+    pub register_width: axdevice_base::AccessWidth,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +60,7 @@ pub struct PciHost {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterruptTopology {
+    pub controller: InterruptControllerId,
     pub eiointc_irq: u32,
     pub pch_pic: MmioRegion,
     pub pch_pic_gsi_base: u32,
@@ -134,112 +101,448 @@ pub struct GedDevice {
 }
 
 impl GuestPlatform {
-    pub fn discover(vm: &AxVMRef, config: &AxVMCrateConfig) -> Self {
-        probe::GuestPlatformBuilder::new(ram_regions(vm), config)
+    pub fn discover(vm: &AxVM, _config: &GuestConfig) -> AxVmResult<Self> {
+        let serial = resolved_serial(vm)?;
+        let (fdt_firmware, acpi_firmware) = vm.with_planned_device_graph(|graph| {
+            Ok((
+                crate::boot::fdt::device::resolve_fdt_firmware(graph)?,
+                crate::boot::acpi::resolve_acpi_firmware(graph)?,
+            ))
+        })?;
+        let special =
+            resolve_special_firmware(&fdt_firmware.specials, &acpi_firmware.specials, serial)?;
+        let mut platform = probe::GuestPlatformBuilder::new(ram_regions(vm), Some(special.fw_cfg))
+            .with_serial(serial)
             .apply_host_acpi()
-            .build()
+            .build();
+        platform.interrupt.controller = special.controller;
+        platform.interrupt.pch_pic = special.pch_pic;
+        platform.pci.ecam = special.pci_ecam;
+        platform.pci.mmio = special.pci_memory;
+        platform.pci.io_base = special.pci_io.base;
+        platform.pci.io_size = special.pci_io.size;
+        platform.configured_fdt_devices = fdt_firmware.devices;
+        platform.configured_acpi_devices = acpi_firmware.devices;
+        Ok(platform)
     }
 
-    pub fn fw_cfg_platform_config(&self) -> FwCfgPlatformConfig {
-        let ram_regions = leak_fw_cfg_ram_regions(&self.ram_regions);
-        FwCfgPlatformConfig {
-            ram_regions,
+    pub fn fw_cfg_platform_config(&self, cpu_num: u16) -> AxVmResult<FwCfgPlatformConfig> {
+        let ram_regions = fw_cfg_ram_regions(&self.ram_regions);
+        let acpi = acpi::build(cpu_num, self, &ram_regions).map_err(|error| {
+            crate::AxVmError::invalid_config(std::format!(
+                "failed to build LoongArch guest ACPI: {error}"
+            ))
+        })?;
+        Ok(FwCfgPlatformConfig {
+            ram_regions: ram_regions.clone(),
             srat_regions: ram_regions,
-            serial: FwCfgSerialConfig {
-                base: self.serial.mmio.base,
-                size: self.serial.mmio.size,
-                irq: (self.interrupt.acpi_gsi_base + self.serial.irq) as u8,
-                clock_hz: self.serial.clock_hz,
-                baud: self.serial.baud,
-            },
-            pci: FwCfgPciConfig {
-                ecam_base: self.pci.ecam.base,
-                ecam_size: self.pci.ecam.size,
-                mmio_base: self.pci.mmio.base,
-                mmio_size: self.pci.mmio.size,
-                io_base: self.pci.io_base,
-                io_size: self.pci.io_size as u32,
-                intx_base: (self.interrupt.acpi_gsi_base + self.pci.intx_base) as u8,
-            },
-            interrupt: FwCfgInterruptConfig {
-                eiointc_irq: self.interrupt.eiointc_irq as u8,
-                pch_msi_base: self.interrupt.pch_msi.base,
-                pch_msi_start: self.interrupt.acpi_msi_start,
-                pch_msi_count: self.interrupt.acpi_msi_count,
-                pch_pic_base: self.interrupt.pch_pic.base,
-                pch_pic_size: self.interrupt.pch_pic.size as u16,
-                pch_pic_gsi_base: self.interrupt.acpi_gsi_base as u16,
-            },
-        }
+            acpi,
+        })
     }
 }
 
-pub fn load_firmware_fdt(vm: &AxVMRef, config: &AxVMCrateConfig) -> AxVmResult {
-    let platform = GuestPlatform::discover(vm, config);
-    let fdt = fdt::guest_firmware_dtb::build(&platform)?;
+struct LoongArchSpecialFirmware {
+    controller: InterruptControllerId,
+    pch_pic: MmioRegion,
+    pci_ecam: MmioRegion,
+    pci_memory: MmioRegion,
+    pci_io: MmioRegion,
+    fw_cfg: MmioRegion,
+}
+
+fn resolve_special_firmware(
+    fdt: &[crate::boot::fdt::device::ResolvedFdtSpecial],
+    acpi: &[crate::boot::acpi::ResolvedAcpiSpecial],
+    serial: SerialDevice,
+) -> AxVmResult<LoongArchSpecialFirmware> {
+    use crate::boot::{
+        acpi::{ResolvedAcpiProperty, ResolvedAcpiRegister, ResolvedAcpiSpecialKind},
+        fdt::device::{ResolvedFdtProperty, ResolvedFdtSpecialKind},
+    };
+
+    if fdt.len() != 4 || acpi.len() != 4 {
+        return Err(AxVmError::unsupported(
+            "resolve LoongArch firmware topology",
+            std::format!(
+                "expected interrupt-controller, PCI host, console, and fw_cfg contributions in \
+                 both FDT and ACPI; found {} FDT and {} ACPI",
+                fdt.len(),
+                acpi.len()
+            ),
+        ));
+    }
+
+    let fdt_controller = single_fdt_special(
+        fdt,
+        |kind| matches!(kind, ResolvedFdtSpecialKind::InterruptController(_)),
+        "interrupt controller",
+    )?;
+    let ResolvedFdtSpecialKind::InterruptController(controller) = fdt_controller.kind else {
+        unreachable!("the special selector checked the contribution kind")
+    };
+    let acpi_controller = single_acpi_special(
+        acpi,
+        |kind| matches!(kind, ResolvedAcpiSpecialKind::InterruptController(_)),
+        "interrupt controller",
+    )?;
+    if acpi_controller.kind != ResolvedAcpiSpecialKind::InterruptController(controller) {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT and ACPI interrupt-controller identities differ",
+        ));
+    }
+    let [pch_pic] = fdt_controller.registers.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT PCH-PIC contribution must resolve one MMIO window",
+        ));
+    };
+    let [
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_pic_base,
+            size: acpi_pic_size,
+        },
+    ] = acpi_controller.registers.as_slice()
+    else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch ACPI PCH-PIC contribution must resolve one MMIO window",
+        ));
+    };
+    if *pch_pic != (*acpi_pic_base, *acpi_pic_size)
+        || fdt_controller.node_name != "interrupt-controller"
+        || fdt_controller.compatible.len() != 1
+        || fdt_controller
+            .compatible
+            .first()
+            .is_none_or(|compatible| compatible != "loongson,pch-pic-1.0")
+        || !fdt_controller.interrupts.is_empty()
+        || !fdt_controller.properties.is_empty()
+        || acpi_controller.name != "PCH0"
+        || acpi_controller.hid.is_some()
+        || !acpi_controller.interrupts.is_empty()
+        || !acpi_controller.properties.is_empty()
+    {
+        return Err(AxVmError::invalid_config(
+            "LoongArch PCH-PIC FDT and ACPI contributions disagree",
+        ));
+    }
+
+    let fdt_pci = single_fdt_special(
+        fdt,
+        |kind| kind == ResolvedFdtSpecialKind::PciHostBridge,
+        "PCI host bridge",
+    )?;
+    let acpi_pci = single_acpi_special(
+        acpi,
+        |kind| kind == ResolvedAcpiSpecialKind::PciHostBridge,
+        "PCI host bridge",
+    )?;
+    let [pci_ecam, pci_memory, pci_io] = fdt_pci.registers.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT PCI host contribution must resolve ECAM, memory, and I/O windows",
+        ));
+    };
+    let [
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_ecam_base,
+            size: acpi_ecam_size,
+        },
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_memory_base,
+            size: acpi_memory_size,
+        },
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_io_base,
+            size: acpi_io_size,
+        },
+    ] = acpi_pci.registers.as_slice()
+    else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch ACPI PCI host contribution must resolve ECAM, memory, and I/O windows",
+        ));
+    };
+    if *pci_ecam != (*acpi_ecam_base, *acpi_ecam_size)
+        || *pci_memory != (*acpi_memory_base, *acpi_memory_size)
+        || *pci_io != (*acpi_io_base, *acpi_io_size)
+        || fdt_pci.node_name != "pcie"
+        || fdt_pci.compatible.as_slice() != ["pci-host-ecam-generic"]
+        || !fdt_pci.interrupts.is_empty()
+        || !matches!(
+            fdt_pci.properties.as_slice(),
+            [ResolvedFdtProperty::Empty(name)] if name == "dma-coherent"
+        )
+        || acpi_pci.name != "PCI0"
+        || acpi_pci.hid.as_deref() != Some("PNP0A08")
+        || !acpi_pci.interrupts.is_empty()
+        || !acpi_pci.properties.is_empty()
+    {
+        return Err(AxVmError::invalid_config(
+            "LoongArch PCI host FDT and ACPI contributions disagree",
+        ));
+    }
+
+    let fdt_fw_cfg = single_fdt_special(
+        fdt,
+        |kind| kind == ResolvedFdtSpecialKind::FirmwareTransport,
+        "firmware transport",
+    )?;
+    let acpi_fw_cfg = single_acpi_special(
+        acpi,
+        |kind| kind == ResolvedAcpiSpecialKind::FirmwareTransport,
+        "firmware transport",
+    )?;
+    let [fw_cfg] = fdt_fw_cfg.registers.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT fw_cfg contribution must resolve one MMIO window",
+        ));
+    };
+    let [
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_fw_cfg_base,
+            size: acpi_fw_cfg_size,
+        },
+    ] = acpi_fw_cfg.registers.as_slice()
+    else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch ACPI fw_cfg contribution must resolve one MMIO window",
+        ));
+    };
+    if *fw_cfg != (*acpi_fw_cfg_base, *acpi_fw_cfg_size)
+        || fdt_fw_cfg.node_name != "fw_cfg"
+        || fdt_fw_cfg.compatible.len() != 1
+        || fdt_fw_cfg
+            .compatible
+            .first()
+            .is_none_or(|compatible| compatible != "qemu,fw-cfg-mmio")
+        || !fdt_fw_cfg.interrupts.is_empty()
+        || !matches!(
+            fdt_fw_cfg.properties.as_slice(),
+            [ResolvedFdtProperty::Empty(name)] if name == "dma-coherent"
+        )
+        || acpi_fw_cfg.name != "FWCF"
+        || acpi_fw_cfg.hid.as_deref() != Some("QEMU0002")
+        || !acpi_fw_cfg.interrupts.is_empty()
+        || !acpi_fw_cfg.properties.is_empty()
+    {
+        return Err(AxVmError::invalid_config(
+            "LoongArch fw_cfg FDT and ACPI contributions disagree",
+        ));
+    }
+
+    let fdt_console = single_fdt_special(
+        fdt,
+        |kind| kind == ResolvedFdtSpecialKind::Console,
+        "console",
+    )?;
+    let acpi_console = single_acpi_special(
+        acpi,
+        |kind| kind == ResolvedAcpiSpecialKind::Console,
+        "console",
+    )?;
+    let expected_serial = (serial.mmio.base, serial.mmio.size);
+    let [fdt_serial] = fdt_console.registers.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT console contribution must resolve one MMIO window",
+        ));
+    };
+    let [
+        ResolvedAcpiRegister::Mmio {
+            base: acpi_serial_base,
+            size: acpi_serial_size,
+        },
+    ] = acpi_console.registers.as_slice()
+    else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch ACPI console contribution must resolve one MMIO window",
+        ));
+    };
+    let [fdt_console_irq] = fdt_console.interrupts.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch FDT console contribution must resolve one interrupt",
+        ));
+    };
+    let [acpi_console_irq] = acpi_console.interrupts.as_slice() else {
+        return Err(AxVmError::invalid_config(
+            "LoongArch ACPI console contribution must resolve one interrupt",
+        ));
+    };
+    if *fdt_serial != expected_serial
+        || (*acpi_serial_base, *acpi_serial_size) != expected_serial
+        || fdt_console.node_name != "serial"
+        || fdt_console.compatible.len() != 1
+        || fdt_console
+            .compatible
+            .first()
+            .is_none_or(|compatible| compatible != "ns16550a")
+        || fdt_console_irq.controller != controller
+        || acpi_console_irq.controller != controller
+        || fdt_console_irq.input != serial.irq
+        || acpi_console_irq.input != serial.irq
+        || !matches!(
+            fdt_console.properties.as_slice(),
+            [
+                ResolvedFdtProperty::U32(clock_name, clock_hz),
+                ResolvedFdtProperty::U32(shift_name, register_shift),
+                ResolvedFdtProperty::U32(width_name, register_width),
+            ] if clock_name == "clock-frequency"
+                && *clock_hz == serial.clock_hz
+                && shift_name == "reg-shift"
+                && *register_shift == u32::from(serial.register_shift)
+                && width_name == "reg-io-width"
+                && *register_width == u32::try_from(serial.register_width.size())
+                    .expect("a serial access width is at most eight bytes")
+        )
+        || acpi_console.name != "COM0"
+        || acpi_console.hid.as_deref() != Some("PNP0501")
+        || !matches!(
+            acpi_console.properties.as_slice(),
+            [ResolvedAcpiProperty::U32(name, clock_hz)]
+                if name == "clock-frequency" && *clock_hz == serial.clock_hz
+        )
+    {
+        return Err(AxVmError::invalid_config(
+            "LoongArch console FDT, ACPI, and runtime resources disagree",
+        ));
+    }
+
+    Ok(LoongArchSpecialFirmware {
+        controller,
+        pch_pic: MmioRegion {
+            base: pch_pic.0,
+            size: pch_pic.1,
+        },
+        pci_ecam: MmioRegion {
+            base: pci_ecam.0,
+            size: pci_ecam.1,
+        },
+        pci_memory: MmioRegion {
+            base: pci_memory.0,
+            size: pci_memory.1,
+        },
+        pci_io: MmioRegion {
+            base: pci_io.0,
+            size: pci_io.1,
+        },
+        fw_cfg: MmioRegion {
+            base: fw_cfg.0,
+            size: fw_cfg.1,
+        },
+    })
+}
+
+fn single_fdt_special<'a>(
+    specials: &'a [crate::boot::fdt::device::ResolvedFdtSpecial],
+    predicate: impl Fn(crate::boot::fdt::device::ResolvedFdtSpecialKind) -> bool,
+    name: &'static str,
+) -> AxVmResult<&'a crate::boot::fdt::device::ResolvedFdtSpecial> {
+    let mut matches = specials.iter().filter(|special| predicate(special.kind));
+    let special = matches.next().ok_or_else(|| {
+        AxVmError::invalid_config(std::format!("LoongArch FDT has no {name} contribution"))
+    })?;
+    if matches.next().is_some() {
+        return Err(AxVmError::unsupported(
+            "resolve LoongArch FDT topology",
+            std::format!("multiple {name} contributions are not supported"),
+        ));
+    }
+    Ok(special)
+}
+
+fn single_acpi_special<'a>(
+    specials: &'a [crate::boot::acpi::ResolvedAcpiSpecial],
+    predicate: impl Fn(crate::boot::acpi::ResolvedAcpiSpecialKind) -> bool,
+    name: &'static str,
+) -> AxVmResult<&'a crate::boot::acpi::ResolvedAcpiSpecial> {
+    let mut matches = specials.iter().filter(|special| predicate(special.kind));
+    let special = matches.next().ok_or_else(|| {
+        AxVmError::invalid_config(std::format!("LoongArch ACPI has no {name} contribution"))
+    })?;
+    if matches.next().is_some() {
+        return Err(AxVmError::unsupported(
+            "resolve LoongArch ACPI topology",
+            std::format!("multiple {name} contributions are not supported"),
+        ));
+    }
+    Ok(special)
+}
+
+fn resolved_serial(vm: &AxVM) -> AxVmResult<SerialDevice> {
+    vm.with_planned_device_graph(|graph| {
+        let serials = crate::machine::resolved_serial_devices(graph)?;
+        let serial = serials
+            .iter()
+            .find(|serial| serial.id() == "console0")
+            .ok_or_else(|| AxVmError::invalid_config("LoongArch plan has no console0"))?
+            .profile();
+        let crate::machine::GuestSerialTransport::Mmio {
+            base,
+            length,
+            register_shift,
+            register_width,
+        } = serial.transport
+        else {
+            return Err(AxVmError::unsupported(
+                "build LoongArch guest firmware",
+                "LoongArch console0 must use MMIO",
+            ));
+        };
+        Ok(SerialDevice {
+            mmio: MmioRegion {
+                base: base as u64,
+                size: length as u64,
+            },
+            irq: u32::try_from(serial.irq)
+                .map_err(|_| AxVmError::invalid_config("LoongArch console IRQ exceeds u32"))?,
+            clock_hz: serial.clock_hz,
+            baud: 115_200,
+            register_shift,
+            register_width,
+        })
+    })
+}
+
+fn build_firmware_fdt(
+    vm: &AxVM,
+    config: &GuestConfig,
+    cmdline: Option<&str>,
+    initrd: Option<(u64, u64)>,
+) -> AxVmResult<Vec<u8>> {
+    let platform = GuestPlatform::discover(vm, config)?;
+    fdt::guest_firmware_dtb::build(&platform, cmdline, initrd)
+}
+
+fn install_firmware_fdt(vm: &mut AxVM, config: &GuestConfig, fdt: Vec<u8>) -> AxVmResult {
     debug!(
-        "VM[{}] loading LoongArch UEFI firmware FDT: {} bytes at {:#x}",
+        "VM[{}] loading LoongArch guest FDT: {} bytes at {:#x}",
         config.base.id,
         fdt.len(),
         UEFI_FIRMWARE_FDT_BASE
     );
-    vm.with_config(|config| {
-        config.set_dtb_load_gpa(GuestPhysAddr::from(UEFI_FIRMWARE_FDT_BASE));
-    });
-    load_vm_image_from_memory(
-        &fdt,
-        GuestPhysAddr::from(UEFI_FIRMWARE_FDT_BASE),
-        vm.clone(),
-    )?;
+    vm.config_mut()
+        .set_dtb_load_gpa(GuestPhysAddr::from(UEFI_FIRMWARE_FDT_BASE));
+    load_vm_image_from_memory(&fdt, GuestPhysAddr::from(UEFI_FIRMWARE_FDT_BASE), vm)?;
     vm.set_guest_device_tree(GuestPhysAddr::from(UEFI_FIRMWARE_FDT_BASE), fdt)
 }
 
-pub fn fw_cfg_platform_config(vm: &AxVMRef, config: &AxVMCrateConfig) -> FwCfgPlatformConfig {
-    GuestPlatform::discover(vm, config).fw_cfg_platform_config()
-}
-
-pub fn guest_irq_routes(vm: &AxVMRef, config: &AxVMCrateConfig) -> Vec<LoongArchGuestIrqRoute> {
-    GuestPlatform::discover(vm, config)
-        .irq_routes
-        .into_iter()
-        .map(|route| LoongArchGuestIrqRoute {
-            physical_irq: route.physical_irq,
-            guest_vector: route.guest_vector,
-        })
-        .collect()
-}
-
-pub fn emulated_fw_cfg(config: &AxVMCrateConfig) -> AxVmResult<&axvmconfig::EmulatedDeviceConfig> {
-    config
-        .devices
-        .emu_devices
-        .iter()
-        .find(|device| device.emu_type == EmulatedDeviceType::FwCfg)
-        .ok_or_else(|| ax_err_type!(NotFound, "LoongArch UEFI boot requires a fw_cfg device"))
-}
-
 impl BootImagePlatform for super::LoongArch64Arch {
-    fn load_images_from_memory(
-        loader: &mut ImageLoaderCore<'_>,
-        images: StaticVmImage,
-    ) -> AxVmResult {
-        ensure_uefi_boot(loader)?;
-        load_uefi_firmware_dtb(loader)?;
-        add_uefi_fw_cfg(loader, images.kernel, images.ramdisk)?;
-        let firmware = images
-            .bios
-            .or_else(|| provider_firmware_image(loader))
-            .ok_or_else(|| {
-                ax_err_type!(
-                    NotFound,
-                    "LoongArch UEFI boot requires a build-time firmware image"
-                )
-            })?;
-        load_uefi_firmware_image(loader, firmware)
+    fn make_guest_memory_visible(addr: ax_memory_addr::VirtAddr, size: usize) {
+        super::make_guest_memory_visible(addr, size);
     }
 
-    #[cfg(any(feature = "fs", feature = "host-fs"))]
     fn load_images_from_filesystem(loader: &mut ImageLoaderCore<'_>) -> AxVmResult {
+        if loader.config.kernel.effective_boot_protocol() == VMBootProtocol::Direct {
+            let kernel = crate::boot::images::fs::read_full_image(
+                &loader.config.kernel.kernel_path,
+                loader.provider,
+            )?;
+            let ramdisk = if let Some(path) = loader.config.kernel.ramdisk_path.clone() {
+                Some(crate::boot::images::fs::read_full_image(
+                    &path,
+                    loader.provider,
+                )?)
+            } else {
+                None
+            };
+            return load_direct_linux(loader, &kernel, ramdisk.as_deref());
+        }
         ensure_uefi_boot(loader)?;
         load_uefi_firmware_dtb(loader)?;
 
@@ -247,22 +550,20 @@ impl BootImagePlatform for super::LoongArch64Arch {
             &loader.config.kernel.kernel_path,
             loader.provider,
         )?;
-        let kernel: &'static [u8] = Box::leak(kernel.into_boxed_slice());
-        let ramdisk = if let Some(path) = &loader.config.kernel.ramdisk_path {
-            let ramdisk = crate::boot::images::fs::read_full_image(path, loader.provider)?;
-            Some(Box::leak(ramdisk.into_boxed_slice()) as &'static [u8])
+        let kernel = Arc::from(kernel);
+        let ramdisk = if let Some(path) = loader.config.kernel.ramdisk_path.clone() {
+            let ramdisk = crate::boot::images::fs::read_full_image(&path, loader.provider)?;
+            Some(Arc::from(ramdisk))
         } else {
             None
         };
-        add_uefi_fw_cfg(loader, kernel, ramdisk)?;
+        add_fw_cfg(loader, FwCfgKernelPayload::unsplit(kernel), ramdisk)?;
 
-        let firmware = provider_firmware_image(loader).ok_or_else(|| {
-            ax_err_type!(
-                NotFound,
-                "LoongArch UEFI boot requires a build-time firmware image"
-            )
+        let firmware_path = loader.config.kernel.boot_firmware_path().ok_or_else(|| {
+            ax_err_type!(NotFound, "LoongArch UEFI boot requires a firmware file")
         })?;
-        load_uefi_firmware_image(loader, firmware)
+        let firmware = loader.provider.read_file(firmware_path)?;
+        load_uefi_firmware_image(loader, &firmware)
     }
 }
 
@@ -274,38 +575,75 @@ fn ensure_uefi_boot(loader: &ImageLoaderCore<'_>) -> AxVmResult {
     }
 }
 
-fn load_uefi_firmware_dtb(loader: &ImageLoaderCore<'_>) -> AxVmResult {
-    prepare_uefi_runtime_config(&loader.vm, &loader.config);
-    load_firmware_fdt(&loader.vm, &loader.config)
+fn load_uefi_firmware_dtb(loader: &mut ImageLoaderCore<'_>) -> AxVmResult {
+    let fdt = build_firmware_fdt(&*loader.vm, &loader.config, None, None)?;
+    install_firmware_fdt(&mut *loader.vm, &loader.config, fdt)
 }
 
-fn add_uefi_fw_cfg(
-    loader: &ImageLoaderCore<'_>,
-    kernel: &'static [u8],
-    ramdisk: Option<&'static [u8]>,
+fn load_direct_linux(
+    loader: &mut ImageLoaderCore<'_>,
+    kernel: &[u8],
+    ramdisk: Option<&[u8]>,
 ) -> AxVmResult {
-    let fw_cfg = emulated_fw_cfg(&loader.config)?;
+    let initrd = ramdisk
+        .map(|ramdisk| -> AxVmResult<(GuestPhysAddr, usize)> {
+            let load_gpa = loader.ramdisk_load_gpa()?;
+            Ok((load_gpa, ramdisk.len()))
+        })
+        .transpose()?;
+    let initrd_fdt = initrd
+        .map(|(start, size)| -> AxVmResult<(u64, u64)> {
+            let start = start.as_usize() as u64;
+            let end = start.checked_add(size as u64).ok_or_else(|| {
+                ax_err_type!(InvalidData, "LoongArch initramfs address range overflows")
+            })?;
+            Ok((start, end))
+        })
+        .transpose()?;
+    let fdt = build_firmware_fdt(
+        &*loader.vm,
+        &loader.config,
+        loader.config.kernel.cmdline.as_deref(),
+        initrd_fdt,
+    )?;
+    linux::validate_image_layout(kernel, initrd, fdt.len())?;
+
+    linux::load_elf(kernel, loader)?;
+    if let Some(ramdisk) = ramdisk {
+        loader.load_ramdisk_from_memory(ramdisk)?;
+    }
+    linux::load_boot_info(loader)?;
+    add_fw_cfg(loader, FwCfgKernelPayload::empty(), None)?;
+    install_firmware_fdt(&mut *loader.vm, &loader.config, fdt)
+}
+
+pub(super) const fn direct_linux_boot_args() -> [usize; 3] {
+    linux::boot_args()
+}
+
+fn add_fw_cfg(
+    loader: &mut ImageLoaderCore<'_>,
+    kernel: FwCfgKernelPayload,
+    ramdisk: Option<Arc<[u8]>>,
+) -> AxVmResult {
+    let platform = GuestPlatform::discover(&*loader.vm, &loader.config)?;
+    let fw_cfg = platform.fw_cfg;
     loader.vm.add_fw_cfg_device(crate::FwCfgDeviceConfig {
-        base: GuestPhysAddr::from(fw_cfg.base_gpa),
-        size: fw_cfg.length,
+        base: GuestPhysAddr::from(
+            usize::try_from(fw_cfg.base)
+                .map_err(|_| crate::AxVmError::invalid_config("fw_cfg GPA does not fit usize"))?,
+        ),
+        size: usize::try_from(fw_cfg.size)
+            .map_err(|_| crate::AxVmError::invalid_config("fw_cfg size does not fit usize"))?,
         kernel,
         initrd: ramdisk,
         cmdline: loader.config.kernel.cmdline.clone(),
         cpu_num: loader.config.base.cpu_num as u16,
-        platform: fw_cfg_platform_config(&loader.vm, &loader.config),
+        platform: platform.fw_cfg_platform_config(loader.config.base.cpu_num as u16)?,
     })
 }
 
-fn provider_firmware_image(loader: &ImageLoaderCore<'_>) -> Option<&'static [u8]> {
-    loader
-        .provider
-        .static_firmware_images()
-        .iter()
-        .find(|image| image.id == loader.config.base.id)
-        .and_then(|image| image.bios)
-}
-
-fn load_uefi_firmware_image(loader: &ImageLoaderCore<'_>, firmware: &[u8]) -> AxVmResult {
+fn load_uefi_firmware_image(loader: &mut ImageLoaderCore<'_>, firmware: &[u8]) -> AxVmResult {
     let load_gpa = loader
         .bios_load_gpa
         .ok_or_else(|| ax_err_type!(NotFound, "LoongArch UEFI firmware load addr is missed"))?;
@@ -316,31 +654,28 @@ fn load_uefi_firmware_image(loader: &ImageLoaderCore<'_>, firmware: &[u8]) -> Ax
         .iter()
         .find(|region| region.gpa == load_gpa.as_usize())
         .map_or(firmware.len(), |region| region.size);
-    fill_vm_region(load_gpa, flash_len, 0xff, loader.vm.clone())?;
-    load_vm_image_from_memory(firmware, load_gpa, loader.vm.clone())
+    fill_vm_region(load_gpa, flash_len, 0xff, &mut *loader.vm)?;
+    load_vm_image_from_memory(firmware, load_gpa, &mut *loader.vm)
 }
 
-fn fill_vm_region(load_addr: GuestPhysAddr, size: usize, byte: u8, vm: AxVMRef) -> AxVmResult {
-    let regions = vm.get_image_load_region(load_addr, size)?;
-    let mut filled_size = 0;
-    for region in regions {
-        // SAFETY: AxVM returned this writable guest-memory region and the fill
-        // is bounded by its length.
-        unsafe { core::ptr::write_bytes(region.as_mut_ptr(), byte, region.len()) };
-        crate::clean_dcache_range((region.as_ptr() as usize).into(), region.len());
-        filled_size += region.len();
+fn fill_vm_region(load_addr: GuestPhysAddr, size: usize, byte: u8, vm: &mut AxVM) -> AxVmResult {
+    // Bytes written per guest-memory fill step.
+    const FILL_CHUNK_SIZE: usize = 0x40_0000;
+
+    let chunk = std::vec![byte; size.min(FILL_CHUNK_SIZE)];
+    let mut offset = 0;
+    while offset < size {
+        let chunk_len = (size - offset).min(chunk.len());
+        vm.write_to_guest(
+            GuestPhysAddr::from(load_addr.as_usize() + offset),
+            &chunk[..chunk_len],
+        )?;
+        offset += chunk_len;
     }
-    if filled_size == size {
-        Ok(())
-    } else {
-        ax_err!(
-            InvalidData,
-            format!("VM memory was only partially filled: {filled_size}/{size} bytes")
-        )
-    }
+    Ok(())
 }
 
-fn ram_regions(vm: &AxVMRef) -> Vec<MemoryRegion> {
+fn ram_regions(vm: &AxVM) -> Vec<MemoryRegion> {
     let mut regions = vm
         .memory_regions()
         .into_iter()
@@ -369,7 +704,7 @@ fn ram_regions(vm: &AxVMRef) -> Vec<MemoryRegion> {
     regions
 }
 
-fn leak_fw_cfg_ram_regions(regions: &[MemoryRegion]) -> &'static [FwCfgRamRegion] {
+fn fw_cfg_ram_regions(regions: &[MemoryRegion]) -> Arc<[FwCfgRamRegion]> {
     let regions = regions
         .iter()
         .map(|region| FwCfgRamRegion {
@@ -377,5 +712,5 @@ fn leak_fw_cfg_ram_regions(regions: &[MemoryRegion]) -> &'static [FwCfgRamRegion
             size: region.size,
         })
         .collect::<Vec<_>>();
-    Box::leak(regions.into_boxed_slice())
+    regions.into()
 }

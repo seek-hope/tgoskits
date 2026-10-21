@@ -1,9 +1,13 @@
 use std::{
+    collections::BTreeSet,
+    env,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
+use serde::Deserialize;
 
 use crate::test::qemu;
 
@@ -25,6 +29,16 @@ pub(crate) struct BoardCaseBuildInfo {
     pub(crate) board_name: String,
     pub(crate) build_config_path: PathBuf,
     pub(crate) board_test_config_path: PathBuf,
+    pub(crate) required_env: Vec<String>,
+}
+
+const BOARD_TEST_REQUIREMENTS_FILE: &str = "requirements.toml";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardTestRequirements {
+    #[serde(default)]
+    required_env: Vec<String>,
 }
 
 pub(crate) fn labeled_board_cases<T: BoardTestGroupInfo>(groups: Vec<T>) -> Vec<(String, String)> {
@@ -34,10 +48,30 @@ pub(crate) fn labeled_board_cases<T: BoardTestGroupInfo>(groups: Vec<T>) -> Vec<
         .collect()
 }
 
-pub(crate) fn filter_board_test_groups<T: BoardTestGroupInfo>(
-    mut groups: Vec<T>,
-    selected_case: Option<&str>,
+pub(crate) fn filter_board_test_groups_by_names<T: BoardTestGroupInfo>(
+    groups: Vec<T>,
+    selected_cases: &[String],
     selected_board: Option<&str>,
+    suite_name: &str,
+    empty_message: impl FnOnce() -> String,
+) -> anyhow::Result<Vec<T>> {
+    let selected_boards = selected_board
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    filter_board_test_groups_by_board_names(
+        groups,
+        selected_cases,
+        &selected_boards,
+        suite_name,
+        empty_message,
+    )
+}
+
+pub(crate) fn filter_board_test_groups_by_board_names<T: BoardTestGroupInfo>(
+    mut groups: Vec<T>,
+    selected_cases: &[String],
+    selected_boards: &[String],
     suite_name: &str,
     empty_message: impl FnOnce() -> String,
 ) -> anyhow::Result<Vec<T>> {
@@ -47,30 +81,75 @@ pub(crate) fn filter_board_test_groups<T: BoardTestGroupInfo>(
             .then_with(|| left.board_name().cmp(right.board_name()))
     });
 
-    if let Some(case_name) = selected_case {
+    if !selected_cases.is_empty() {
         if groups.is_empty() {
             bail!("{}", empty_message());
         }
-        let available = available_values(groups.iter().map(BoardTestGroupInfo::name));
-        groups.retain(|group| group.name() == case_name);
-        if groups.is_empty() {
+        let available_names = groups
+            .iter()
+            .map(BoardTestGroupInfo::name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let missing = selected_cases
+            .iter()
+            .filter(|case_name| !available_names.contains(case_name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let available = available_names
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !missing.is_empty() {
             return Err(anyhow!(
-                "unsupported {suite_name} board test case `{case_name}`. Supported cases are: \
+                "unsupported {suite_name} board test case(s) `{}`. Supported cases are: \
                  {available}",
+                missing.join(","),
             ));
         }
+        groups.retain(|group| {
+            selected_cases
+                .iter()
+                .any(|case_name| group.name() == case_name)
+        });
     }
 
-    if let Some(board_name) = selected_board {
+    if !selected_boards.is_empty() {
         if groups.is_empty() {
             bail!("{}", empty_message());
         }
         let available = available_values(groups.iter().map(BoardTestGroupInfo::board_name));
-        groups.retain(|group| group.board_name() == board_name);
-        if groups.is_empty() {
+        let missing = selected_boards
+            .iter()
+            .filter(|board_name| !groups.iter().any(|group| group.board_name() == *board_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let noun = if selected_boards.len() == 1 {
+                "board"
+            } else {
+                "boards"
+            };
             return Err(anyhow!(
-                "unsupported {suite_name} board test board `{board_name}`. Supported boards are: \
+                "unsupported {suite_name} board test {noun} `{}`. Supported boards are: \
                  {available}",
+                missing.join(","),
+            ));
+        }
+        groups.retain(|group| {
+            selected_boards
+                .iter()
+                .any(|board_name| group.board_name() == board_name)
+        });
+        if groups.is_empty() {
+            let noun = if selected_boards.len() == 1 {
+                "board"
+            } else {
+                "boards"
+            };
+            return Err(anyhow!(
+                "unsupported {suite_name} board test {noun} `{}`. Supported boards are: \
+                 {available}",
+                selected_boards.join(","),
             ));
         }
     }
@@ -141,10 +220,61 @@ pub(crate) fn discover_board_case_build_infos(
             board_name: config.board_name,
             build_config_path: wrapper.build_config_path,
             board_test_config_path: config.config_path,
+            required_env: load_board_test_required_env(&config.case_dir)?,
         });
     }
 
     Ok(groups)
+}
+
+pub(crate) fn load_board_test_required_env(case_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let path = case_dir.join(BOARD_TEST_REQUIREMENTS_FILE);
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let requirements: BoardTestRequirements =
+        toml::from_str(&source).with_context(|| format!("failed to parse {}", path.display()))?;
+    let mut names = BTreeSet::new();
+    for name in &requirements.required_env {
+        ensure!(
+            valid_environment_name(name),
+            "invalid required environment variable `{name}` in {}",
+            path.display()
+        );
+        ensure!(
+            names.insert(name.as_str()),
+            "duplicate required environment variable `{name}` in {}",
+            path.display()
+        );
+    }
+    Ok(requirements.required_env)
+}
+
+pub(crate) fn missing_required_env(required: &[String]) -> Vec<String> {
+    missing_required_env_with(required, |name| env::var_os(name))
+}
+
+fn missing_required_env_with(
+    required: &[String],
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| lookup(name).is_none_or(|value| value.is_empty()))
+        .cloned()
+        .collect()
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 fn available_values<'a>(values: impl Iterator<Item = &'a str>) -> String {
@@ -160,9 +290,22 @@ fn available_values<'a>(values: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-pub(crate) fn finalize_board_test_run(suite_name: &str, failed: &[String]) -> anyhow::Result<()> {
+pub(crate) fn finalize_board_test_run(
+    suite_name: &str,
+    total: usize,
+    failed: &[String],
+    skipped: &[String],
+) -> anyhow::Result<()> {
     if failed.is_empty() {
-        println!("all {suite_name} board test groups passed");
+        if skipped.is_empty() {
+            println!("all {suite_name} board test groups passed");
+        } else {
+            println!(
+                "all {suite_name} board test groups completed: {} passed, {} skipped",
+                total - skipped.len(),
+                skipped.len()
+            );
+        }
         Ok(())
     } else {
         bail!(
@@ -177,6 +320,7 @@ pub(crate) struct BoardTestRunState<'a> {
     suite_name: &'a str,
     total: usize,
     failed: Vec<String>,
+    skipped: Vec<String>,
 }
 
 impl<'a> BoardTestRunState<'a> {
@@ -185,6 +329,7 @@ impl<'a> BoardTestRunState<'a> {
             suite_name,
             total,
             failed: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 
@@ -209,8 +354,17 @@ impl<'a> BoardTestRunState<'a> {
         self.failed.push(group_label);
     }
 
+    pub(crate) fn skip_group(&mut self, group_label: String, missing_env: &[String]) {
+        println!(
+            "skipped: {} (missing or empty required environment: {})",
+            group_label,
+            missing_env.join(", ")
+        );
+        self.skipped.push(group_label);
+    }
+
     pub(crate) fn finish(self) -> anyhow::Result<()> {
-        finalize_board_test_run(self.suite_name, &self.failed)
+        finalize_board_test_run(self.suite_name, self.total, &self.failed, &self.skipped)
     }
 }
 
@@ -232,45 +386,41 @@ mod tests {
 
         let configs = discover_board_runtime_configs(&root.path().join("normal")).unwrap();
 
-        assert_eq!(
-            configs
-                .iter()
-                .map(|config| config.board_name.as_str())
-                .collect::<Vec<_>>(),
-            ["orangepi-5-plus", "phytiumpi"]
-        );
-        assert_eq!(configs[0].case_dir, case_dir);
-        assert_eq!(configs[1].case_dir, nested_case_dir);
+        let orangepi = configs
+            .iter()
+            .find(|config| config.board_name == "orangepi-5-plus")
+            .expect("orangepi board config should be discovered");
+        let phytiumpi = configs
+            .iter()
+            .find(|config| config.board_name == "phytiumpi")
+            .expect("phytiumpi board config should be discovered");
+        assert_eq!(orangepi.case_dir, case_dir);
+        assert_eq!(phytiumpi.case_dir, nested_case_dir);
     }
 
     #[test]
-    fn filter_selected_board_on_empty_group_reports_empty_group() {
-        let err = filter_board_test_groups(
-            Vec::<TestBoardGroup>::new(),
-            None,
-            Some("orangepi-5-plus"),
-            "Starry",
-            || "no Starry board test groups found under /tmp/stress".to_string(),
-        )
-        .unwrap_err()
-        .to_string();
+    fn required_environment_treats_absent_and_empty_values_as_missing() {
+        let required = vec![
+            "ABSENT".to_string(),
+            "EMPTY".to_string(),
+            "PRESENT".to_string(),
+        ];
+        let missing = missing_required_env_with(&required, |name| match name {
+            "EMPTY" => Some(std::ffi::OsString::new()),
+            "PRESENT" => Some(std::ffi::OsString::from("configured")),
+            _ => None,
+        });
 
-        assert_eq!(err, "no Starry board test groups found under /tmp/stress");
+        assert_eq!(missing, ["ABSENT", "EMPTY"]);
     }
 
-    #[derive(Debug)]
-    struct TestBoardGroup {
-        name: String,
-        board_name: String,
-    }
+    #[test]
+    fn skipped_board_group_does_not_fail_the_run() {
+        let mut run = BoardTestRunState::new("starry", 1);
 
-    impl BoardTestGroupInfo for TestBoardGroup {
-        fn name(&self) -> &str {
-            &self.name
-        }
+        run.skip_group("wifi/board".to_string(), &["STARRY_WIFI_SSID".to_string()]);
 
-        fn board_name(&self) -> &str {
-            &self.board_name
-        }
+        assert_eq!(run.skipped, ["wifi/board"]);
+        assert!(run.finish().is_ok());
     }
 }

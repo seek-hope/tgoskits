@@ -1,0 +1,26 @@
+[package]
+name = "axvirtio-common"
+version = "0.2.7"
+edition.workspace = true
+authors = ["Debin <luodeb@outlook.com>"]
+license.workspace = true
+repository.workspace = true
+description = "Common types, traits, and utilities for VirtIO device implementations"
+keywords = ["virtio", "hypervisor", "no_std", "arceos"]
+categories = ["no-std", "embedded", "hardware-support"]
+
+[dependencies]
+axdevice_base.workspace = true
+ax-memory-addr.workspace = true
+axaddrspace.workspace = true
+axvm-types.workspace = true
+# The transport register/queue state is guarded by a task-sleepable
+# `ax_sync::Mutex` so a blocking backend can run under the queue lease without a
+# non-sleeping IRQ/preemption guard. That type is gated behind `ax-sync/sleep`.
+ax-sync = { workspace = true, features = ["sleep"] }
+log.workspace = true
+mbarrier = "0.1"
+
+[dev-dependencies]
+ax-sync = { path = "../../os/arceos/modules/axsync", features = ["host-test"] }
+ax-crate-interface = { workspace = true }

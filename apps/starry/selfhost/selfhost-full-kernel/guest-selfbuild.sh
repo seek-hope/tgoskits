@@ -2,9 +2,10 @@
 
 set -eu
 
-TOOLCHAIN="nightly-2026-05-28"
+TOOLCHAIN="nightly-2026-09-04"
 HOST_TRIPLE="x86_64-unknown-linux-musl"
-RUSTUP_TOOLCHAIN="starry-selfhost"
+TOOLCHAIN_DIR_NAME="${TOOLCHAIN}-${HOST_TRIPLE}"
+RUSTUP_TOOLCHAIN="starry-selfhost-${TOOLCHAIN#nightly-}-${HOST_TRIPLE}"
 SOURCE_TAR="${SELFHOST_SOURCE_TAR:-/opt/tgoskits-src.tar}"
 SOURCE_META="${SELFHOST_SOURCE_META:-/opt/tgoskits-src.meta}"
 SOURCE_DIR="${SELFHOST_SOURCE_DIR:-/tmp/tgoskits-src}"
@@ -134,7 +135,8 @@ install_rust() {
     # through a pipe and does not deadlock the way `cp -a` from tmpfs does.
     # Once the toolchain is on ext4, reads (rustc, std libs) are fast.
     local toolchain_tar="/opt/rust-toolchain.tar"
-    local toolchain_name="nightly-2026-05-28-x86_64-unknown-linux-musl"
+    local toolchain_name="$TOOLCHAIN_DIR_NAME"
+    local toolchain_dir="/root/.rustup/toolchains/$toolchain_name"
 
     [ -f "$toolchain_tar" ] || fail "rust toolchain tar is missing: $toolchain_tar"
 
@@ -143,16 +145,17 @@ install_rust() {
     tar xf "$toolchain_tar" -C /root/.rustup/toolchains/ \
         || fail "failed to extract toolchain tar to ext4"
     rm -f "$toolchain_tar"
+    [ -x "$toolchain_dir/bin/rustc" ] \
+        || fail "pre-extracted rustc is missing: $toolchain_dir/bin/rustc"
+    [ -x "$toolchain_dir/bin/cargo" ] \
+        || fail "pre-extracted cargo is missing: $toolchain_dir/bin/cargo"
 
-    # Install rustup to tmpfs (rsext4 is too slow for rustup's many small
-    # writes during cargo install of cargo-binutils / ksym).
+    # Install rustup to tmpfs because rsext4 is too slow for rustup's many
+    # small writes during guest toolchain setup.
     local tmp_rustup=/tmp/rustup-home
     local tmp_cargo=/tmp/cargo-home
     mkdir -p "$tmp_rustup" "$tmp_cargo"
-
-    # Prevent rustup-init from finding a stale settings file on ext4 that
-    # would trigger an unwanted toolchain download.
-    rm -f /root/.rustup/settings.toml 2>/dev/null || true
+    rm -f "$tmp_rustup/settings.toml"
 
     export RUSTUP_HOME="$tmp_rustup"
     export CARGO_HOME="$tmp_cargo"
@@ -161,35 +164,22 @@ install_rust() {
     export RUSTUP_MAX_RETRIES="${SELFHOST_RUSTUP_MAX_RETRIES:-5}"
 
     if [ ! -x "$tmp_cargo/bin/rustup" ]; then
-        local rustup_init="/opt/rustup-init.sh"
-        [ -f "$rustup_init" ] || rustup_init="https://sh.rustup.rs"
-        if [ -f "$rustup_init" ]; then
-            sh "$rustup_init" -y --no-modify-path --default-toolchain none \
-                || fail "rustup-init failed"
-        else
-            curl --fail --silent --show-error --location "$rustup_init" \
-                -o /tmp/rustup-init.sh \
-                || fail "rustup-init download failed"
-            sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none \
-                || fail "rustup-init failed"
-        fi
+        curl --fail --silent --show-error --location https://sh.rustup.rs \
+            -o /tmp/rustup-init.sh
+        sh /tmp/rustup-init.sh -y --no-modify-path --default-host "$HOST_TRIPLE" \
+            --default-toolchain none \
+            || fail "rustup-init failed"
     fi
 
-    # Point rustup at the pre-extracted toolchain on ext4.
-    # rustup reserves channel-date-triple names for official toolchains;
-    # custom (linked) toolchains must use a different name.
-    local link_name="starry-selfhost"
-    if [ -d "/root/.rustup/toolchains/$toolchain_name/bin" ]; then
-        rustup toolchain link "$link_name" \
-            "/root/.rustup/toolchains/$toolchain_name" \
-            || fail "rustup toolchain link failed"
-        rustup default "$link_name" \
-            || fail "rustup default failed"
-    else
-        fail "pre-extracted toolchain not found: /root/.rustup/toolchains/$toolchain_name/bin"
-    fi
+    # Official channel-like names are not valid custom toolchain aliases.
+    # Link the pre-extracted directory under a distinct name, then export the
+    # alias so the workspace rust-toolchain.toml cannot trigger a download.
+    rustup toolchain link "$RUSTUP_TOOLCHAIN" "$toolchain_dir" \
+        || fail "rustup toolchain link failed"
+    rustup default "$RUSTUP_TOOLCHAIN" \
+        || fail "rustup default failed"
+    export RUSTUP_TOOLCHAIN
 
-    # Verify the toolchain works before proceeding.
     command -v rustc >/dev/null 2>&1 || fail "rustc not found after install"
     command -v cargo >/dev/null 2>&1 || fail "cargo not found after install"
     rustc --version || fail "rustc --version failed"
@@ -198,21 +188,6 @@ install_rust() {
     echo "[self-compile] Rust toolchain ready."
     echo "[self-compile] $(rustc --version)"
     echo "[self-compile] $(cargo --version)"
-}
-
-install_kallsyms_tools() {
-    # cargo install downloads source + compiles — small enough to tolerate
-    # rsext4 throughput and slirp latency.
-    if ! cargo install --list | grep -q '^cargo-binutils v0.4.0:'; then
-        cargo install cargo-binutils --version 0.4.0 --locked
-    fi
-    if ! cargo install --list | grep -q '^ksym v0.6.0:'; then
-        cargo install ksym --version 0.6.0 --locked
-    fi
-
-    command -v rust-nm >/dev/null 2>&1 || fail "cargo-binutils did not install rust-nm"
-    command -v rust-objcopy >/dev/null 2>&1 || fail "cargo-binutils did not install rust-objcopy"
-    command -v gen_ksym >/dev/null 2>&1 || fail "ksym did not install gen_ksym"
 }
 
 prepare_source_tree() {
@@ -279,7 +254,6 @@ trap handle_exit EXIT
 echo "SELF_COMPILE_START"
 load_run_id
 export CARGO_BUILD_JOBS="${SELFHOST_CARGO_BUILD_JOBS:-2}"
-export AXBUILD_STARRY_KALLSYMS_AUTO_INSTALL=0
 unset CARGO_BUILD_TARGET
 
 mark_phase packages
@@ -290,7 +264,6 @@ mark_phase rust
 configure_musl_toolchain_aliases
 install_rust
 mark_phase tools
-install_kallsyms_tools
 mark_phase source
 prepare_source_tree
 report_build_storage

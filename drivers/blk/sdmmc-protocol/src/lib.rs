@@ -16,8 +16,8 @@
 //!   plus the [`spi::SpiSdmmc`] driver for SPI-mode SD cards. Includes a
 //!   thin [`spi::SpiDeviceWrapper`] adapter for `embedded-hal` 1.0
 //!   `SpiDevice<u8>` implementations.
-//! - [`sdio`] *(feature `sdio`)*: a [`sdio::SdioHost`] trait that abstracts
-//!   a host controller and the [`sdio::SdioSdmmc`] driver that drives it
+//! - [`sdio`] *(feature `sdio`)*: a [`sdio::SdMmcHost`] trait that abstracts
+//!   a host controller and the [`sdio::SdMmcCard`] driver that drives it
 //!   through card initialization, block I/O and bus-speed selection.
 //! - [`rdif`] *(feature `rdif`)*: a [`rdif::BlockDevice`] bridge that exposes
 //!   an SDIO-backed card through `rdif-block` queues.
@@ -75,8 +75,7 @@
 //! | `phytium-mci-host` | Phytium MCI             | SD HS, DMA            | OK     |
 //!
 //! UHS-I / HS200 / HS400 paths exist in the state machine but have not yet
-//! been signed off on a real card + IO regulator combination. See
-//! `drivers/blk/sdmmc-protocol/docs/REVIEW.md` for the remaining roadmap.
+//! been signed off on a real card + IO regulator combination.
 //!
 //! # MSRV
 //!
@@ -104,9 +103,9 @@ pub mod sdio;
 pub mod rdif;
 
 pub use block::{
-    BlockBufferConfig, BlockPoll, BlockRequestId, BlockTransferDirection, BlockTransferMode,
-    BlockTransferState, CommandPoll, CommandResponsePoll, DataCommandDirection, DataCommandPoll,
-    DataCommandState, OperationPoll,
+    BlockBufferConfig, BlockProgress, BlockRequestId, BlockTransferDirection, BlockTransferMode,
+    BlockTransferState, CommandProgress, CommandResponseProgress, DataCommandDirection,
+    DataCommandProgress, DataCommandState, OperationProgress,
 };
 pub use cmd::{Command, DataDirection};
 pub use error::{Error, ErrorContext, Phase};
